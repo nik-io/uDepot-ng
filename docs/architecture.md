@@ -382,5 +382,8 @@ not the persistent format.
     server.
 
 The first milestone is `UDepot<PosixIO>` passing the existing test suite —
-RCU directory, lock-free gets, hopscotch table, sync I/O. Everything after
-that adds backends and protocol support.
+RCU directory, lock-free gets, hopscotch table, sync I/O. **v0 is not
+complete until the perf regression test passes**: uDepot-ng must be strictly
+equal to or faster than uDepot on every operation (put, get, exists, delete),
+measured head-to-head in the same run. Everything after that adds backends and
+protocol support.

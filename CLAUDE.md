@@ -98,3 +98,21 @@ ctest --test-dir build
 - A failing test must fail the build — never silently exit 0
 - SPDK tests require `UDEPOT_BUILD_SPDK=ON` and a configured SPDK environment
 - Non-SPDK tests must always pass
+
+### Performance regression gate
+
+**uDepot-ng must be strictly equal to or faster than uDepot on every
+operation.** This is a v0 completion criterion, not a stretch goal. The perf
+test builds both uDepot (from the submodule in flywheel) and uDepot-ng, runs
+the same workload against each in the same process, and fails if uDepot-ng is
+slower on any operation.
+
+The test runs interleaved (uDepot, uDepot-ng, uDepot, uDepot-ng, …) to cancel
+shared drift, measures median latency per operation (put, get, exists, delete),
+and asserts `median_ng <= median_legacy` for each. A small tolerance (default
+5%) absorbs per-pair noise; a real regression is far larger.
+
+Both sides use the same I/O backend, same grain size, same store size, same
+device (`/dev/shm` for deterministic cache-bound measurement — same rationale as
+uDepot's own zero-copy perf test). The comparison is apples-to-apples: same
+on-disk format, same hash function (CityHash64), same operations.
