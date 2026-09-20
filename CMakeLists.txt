@@ -21,14 +21,14 @@ add_subdirectory(extern/cityhash)
 add_compile_options(-Wall -Wextra -Werror)
 
 add_library(udepot
-    src/rcu.cc
-    src/hash_table.cc
-    src/directory.cc
-    src/store.cc
+    src/udepot/rcu.cc
+    src/udepot/hash_table.cc
+    src/udepot/directory.cc
+    src/udepot/store.cc
 )
 target_include_directories(udepot PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<INSTALL_INTERFACE:src>
 )
 target_compile_features(udepot PUBLIC cxx_std_23)
 target_link_libraries(udepot PUBLIC salsa cityhash)

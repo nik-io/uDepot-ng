@@ -256,36 +256,33 @@ no-copy property end to end.
 uDepot-ng/
 ├── docs/
 │   └── architecture.md          # this document
-├── include/udepot/
+├── src/udepot/
 │   ├── store.h                  # UDepot<IO> — the single KV implementation
+│   ├── store.cc
 │   ├── directory.h              # RCU-protected hash directory
+│   ├── directory.cc
 │   ├── hash_table.h             # hopscotch table (lock-free reads)
+│   ├── hash_table.cc
 │   ├── hash_entry.h             # 8-byte packed hash entry
 │   ├── rcu.h                    # per-thread epoch-based userspace RCU
+│   ├── rcu.cc
 │   ├── buffer.h                 # IoBuffer, allocator tags
 │   ├── coro.h                   # CoroTask (eager start, symmetric transfer)
-│   ├── segment.h                # segment geometry, salsa GC
 │   └── io/
 │       ├── backend.h            # IoBackend concept
 │       ├── posix.h              # pread/pwrite (sync)
 │       ├── o_direct.h           # pread/pwrite with O_DIRECT (sync)
 │       ├── aio.h                # Linux AIO + poller
+│       ├── aio.cc
 │       ├── uring.h              # io_uring + poller
+│       ├── uring.cc
 │       ├── spdk.h               # SPDK/NVMe + poller, DMA buffers
+│       ├── spdk.cc
 │       ├── net.h                # socket I/O (epoll or io_uring)
+│       ├── net.cc
 │       └── poller.h             # shared poller infrastructure
-├── src/
-│   ├── store.cc
-│   ├── directory.cc
-│   ├── rcu.cc
-│   ├── segment.cc
-│   ├── io/
-│   │   ├── aio.cc
-│   │   ├── uring.cc
-│   │   ├── spdk.cc
-│   │   └── net.cc
-│   └── net/
-│       └── memcache.cc          # memcache protocol server
+├── src/net/
+│   └── memcache.cc              # memcache protocol server
 ├── python/
 │   ├── wrapper/
 │   │   ├── pyudepot.h           # C ABI (7 functions)
