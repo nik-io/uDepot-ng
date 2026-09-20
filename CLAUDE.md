@@ -54,6 +54,11 @@ These are foundational constraints. Every change must preserve them.
    overhead beyond what the log-structured allocator needs.
 4. **Enterprise-grade crash recovery only**: Either the recovery path is
    correct and complete, or it does not exist.
+5. **No thread-per-operation**: I/O concurrency comes from the eager-start
+   coroutine model (submit N I/Os, drive the poller, harvest completions),
+   not from spawning threads. A `multi_get` of 100 keys uses one thread
+   and 100 coroutines, not 100 threads. This is what the coroutine rewrite
+   exists to deliver.
 
 ## Style Guide
 

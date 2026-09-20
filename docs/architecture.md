@@ -326,13 +326,35 @@ ccache is picked up automatically when present (same as the original).
 
 ## Python Bindings (pyudepot)
 
-The C ABI stays synchronous for the initial version — each call blocks via
-`run_sync()`. The Python `uDepot` class exposes the same 4-method surface
-flywheel uses today: `get`, `put`, `delete`, `exists`.
+**No thread-per-get.** Flywheel's old `ThreadPoolExecutor.submit(self.get, …)`
+per key in `multi_get` is exactly the overhead this rewrite eliminates. All I/O
+concurrency comes from the eager-start coroutine model — one thread, zero thread
+creation.
 
-An async Python API (asyncio-compatible) is planned as a follow-up. Not
-urgent — flywheel's `ThreadPoolExecutor` with GIL release works well with
-the sync API.
+The C ABI exposes both single-key and batch entry points:
+
+```c
+int udepot_get(udepot_t h, const void* key, uint32_t klen,
+               void* val, uint32_t vlen, uint32_t* val_size);
+
+int udepot_multi_get(udepot_t h, uint32_t n,
+                     const udepot_iov* keys,
+                     udepot_iov* vals,
+                     int* results);
+```
+
+`udepot_multi_get` launches N eager-start coroutines — each submits its I/O
+immediately — then drives the poller until all complete. On an async backend
+(uring, SPDK) this is true I/O concurrency from a single call, single thread.
+On the sync backend (posix) the coroutines never suspend, so it degrades to
+sequential I/O — correct but not concurrent, same as today.
+
+The Python `uDepot` class exposes `get`, `put`, `delete`, `exists`, and
+`multi_get`. `multi_get` is a single ctypes call into `udepot_multi_get`, not a
+Python-side thread pool.
+
+An async Python API (asyncio-compatible, mapping each coroutine to an asyncio
+future) is planned as a follow-up once the async backends are working.
 
 ## On-Disk Format
 
