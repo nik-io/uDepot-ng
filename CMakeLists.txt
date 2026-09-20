@@ -18,6 +18,7 @@ add_library(udepot
     src/rcu.cc
     src/hash_table.cc
     src/directory.cc
+    src/segment.cc
 )
 target_include_directories(udepot PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -47,4 +48,5 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(posix_test      test/io/posix_test.cc)
     udepot_add_test(hash_table_test test/hash_table_test.cc)
     udepot_add_test(directory_test  test/directory_test.cc)
+    udepot_add_test(segment_test    test/segment_test.cc)
 endif()
