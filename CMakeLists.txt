@@ -16,6 +16,7 @@ option(UDEPOT_BUILD_TESTS  "Build test suite"               ON)
 
 add_library(udepot
     src/rcu.cc
+    src/hash_table.cc
 )
 target_include_directories(udepot PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -39,7 +40,9 @@ if(UDEPOT_BUILD_TESTS)
         add_test(NAME ${name} COMMAND ${name})
     endfunction()
 
-    udepot_add_test(coro_test   test/coro_test.cc)
-    udepot_add_test(rcu_test    test/rcu_test.cc)
-    udepot_add_test(buffer_test test/buffer_test.cc)
+    udepot_add_test(coro_test       test/coro_test.cc)
+    udepot_add_test(rcu_test        test/rcu_test.cc)
+    udepot_add_test(buffer_test     test/buffer_test.cc)
+    udepot_add_test(posix_test      test/io/posix_test.cc)
+    udepot_add_test(hash_table_test test/hash_table_test.cc)
 endif()
