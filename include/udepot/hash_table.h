@@ -45,6 +45,15 @@ public:
     uint32_t index_bits() const noexcept { return index_bits_; }
     uint64_t num_buckets() const noexcept { return num_buckets_; }
 
+    // Direct slot access for directory rehash during grow.
+    HashEntry load_slot(uint64_t idx) const noexcept {
+        return HashEntry::load(slots_[idx], std::memory_order_relaxed);
+    }
+
+    uint64_t total_slots() const noexcept {
+        return num_buckets_ + HashEntry::kHopRange;
+    }
+
 private:
     uint32_t index_bits_;
     uint64_t num_buckets_;
