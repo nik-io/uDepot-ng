@@ -1,11 +1,9 @@
 cmake_minimum_required(VERSION 3.25)
-project(udepot-ng VERSION 0.1.0 LANGUAGES CXX)
+project(udepot-ng VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-
-add_compile_options(-Wall -Wextra -Werror)
 
 option(UDEPOT_BUILD_SPDK   "Build SPDK backend"            OFF)
 option(UDEPOT_BUILD_URING  "Build io_uring backend"         ON)
@@ -14,17 +12,24 @@ option(UDEPOT_BUILD_NET    "Build network/memcache server"  ON)
 option(UDEPOT_BUILD_PYTHON "Build pyudepot shared library"  ON)
 option(UDEPOT_BUILD_TESTS  "Build test suite"               ON)
 
+# Vendored salsa — log-structured allocator with GC (unchanged from uDepot).
+# Built before our warning flags are set so -Werror doesn't hit vendored C.
+add_subdirectory(extern/salsa)
+
+# Our own warning flags — apply only to udepot targets, not vendored code.
+add_compile_options(-Wall -Wextra -Werror)
+
 add_library(udepot
     src/rcu.cc
     src/hash_table.cc
     src/directory.cc
-    src/segment.cc
 )
 target_include_directories(udepot PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 target_compile_features(udepot PUBLIC cxx_std_23)
+target_link_libraries(udepot PUBLIC salsa)
 
 if(UDEPOT_BUILD_TESTS)
     enable_testing()
@@ -48,5 +53,4 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(posix_test      test/io/posix_test.cc)
     udepot_add_test(hash_table_test test/hash_table_test.cc)
     udepot_add_test(directory_test  test/directory_test.cc)
-    udepot_add_test(segment_test    test/segment_test.cc)
 endif()
