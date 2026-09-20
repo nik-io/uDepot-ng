@@ -12,9 +12,10 @@ option(UDEPOT_BUILD_NET    "Build network/memcache server"  ON)
 option(UDEPOT_BUILD_PYTHON "Build pyudepot shared library"  ON)
 option(UDEPOT_BUILD_TESTS  "Build test suite"               ON)
 
-# Vendored salsa — log-structured allocator with GC (unchanged from uDepot).
-# Built before our warning flags are set so -Werror doesn't hit vendored C.
+# Vendored dependencies — built before our warning flags so -Werror
+# doesn't hit vendored code.
 add_subdirectory(extern/salsa)
+add_subdirectory(extern/cityhash)
 
 # Our own warning flags — apply only to udepot targets, not vendored code.
 add_compile_options(-Wall -Wextra -Werror)
@@ -23,13 +24,14 @@ add_library(udepot
     src/rcu.cc
     src/hash_table.cc
     src/directory.cc
+    src/store.cc
 )
 target_include_directories(udepot PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 target_compile_features(udepot PUBLIC cxx_std_23)
-target_link_libraries(udepot PUBLIC salsa)
+target_link_libraries(udepot PUBLIC salsa cityhash)
 
 if(UDEPOT_BUILD_TESTS)
     enable_testing()
@@ -53,4 +55,5 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(posix_test      test/io/posix_test.cc)
     udepot_add_test(hash_table_test test/hash_table_test.cc)
     udepot_add_test(directory_test  test/directory_test.cc)
+    udepot_add_test(store_test      test/store_test.cc)
 endif()
