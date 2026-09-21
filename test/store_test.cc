@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include "city.h"
+
 #include <gtest/gtest.h>
 
 using udepot::PosixIO;
@@ -253,4 +255,145 @@ TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
     size_t val_size = 0;
     int rc = store_.get("crc_key", val, sizeof(val), &val_size).run_sync();
     EXPECT_NE(rc, 0);  // Should fail due to CRC mismatch.
+}
+
+// --- Tag collision tests ---
+// Two keys that hash to the same bucket with the same 8-bit tag but are
+// different keys.  The store must find each one via disk verification,
+// not stop at the first tag match.
+
+// Brute-force search for a pair of short keys whose CityHash64 values
+// share the same tag (top 8 bits) and bucket (low index_bits bits).
+static std::pair<std::string, std::string> find_colliding_keys(
+    uint32_t index_bits) {
+    uint64_t bucket_mask = (1ULL << index_bits) - 1;
+    // Try sequential integer keys; CityHash spreads them well, so two
+    // that collide on both tag and bucket take a little searching.
+    for (int a = 0; a < 100000; ++a) {
+        std::string ka = "col_a_" + std::to_string(a);
+        uint64_t ha = CityHash64(ka.data(), ka.size());
+        uint8_t tag_a = static_cast<uint8_t>(ha >> 56);
+        uint64_t bucket_a = ha & bucket_mask;
+
+        for (int b = a + 1; b < a + 200; ++b) {
+            std::string kb = "col_b_" + std::to_string(b);
+            uint64_t hb = CityHash64(kb.data(), kb.size());
+            uint8_t tag_b = static_cast<uint8_t>(hb >> 56);
+            uint64_t bucket_b = hb & bucket_mask;
+
+            if (tag_a == tag_b && bucket_a == bucket_b)
+                return {ka, kb};
+        }
+    }
+    // Collision must be found — 10-bit bucket × 8-bit tag = 18 bits, so
+    // any window of ~500k pairs will contain dozens.
+    ADD_FAILURE() << "no colliding pair found";
+    return {"", ""};
+}
+
+TEST_F(StoreTest, GetWithTagCollisionReturnsCorrectValue) {
+    auto [key_a, key_b] = find_colliding_keys(config_.index_bits);
+    ASSERT_FALSE(key_a.empty());
+
+    ASSERT_EQ(store_.put(key_a, "val_a").run_sync(), 0);
+    ASSERT_EQ(store_.put(key_b, "val_b").run_sync(), 0);
+
+    uint8_t val[64];
+    size_t val_size = 0;
+
+    ASSERT_EQ(store_.get(key_a, val, sizeof(val), &val_size).run_sync(), 0);
+    EXPECT_EQ(std::string_view(reinterpret_cast<char*>(val), val_size),
+              "val_a");
+
+    ASSERT_EQ(store_.get(key_b, val, sizeof(val), &val_size).run_sync(), 0);
+    EXPECT_EQ(std::string_view(reinterpret_cast<char*>(val), val_size),
+              "val_b");
+}
+
+TEST_F(StoreTest, DeleteWithTagCollisionRemovesCorrectKey) {
+    auto [key_a, key_b] = find_colliding_keys(config_.index_bits);
+    ASSERT_FALSE(key_a.empty());
+
+    ASSERT_EQ(store_.put(key_a, "val_a").run_sync(), 0);
+    ASSERT_EQ(store_.put(key_b, "val_b").run_sync(), 0);
+
+    // Delete key_a; key_b must survive.
+    ASSERT_EQ(store_.del(key_a).run_sync(), 0);
+
+    uint8_t val[64];
+    size_t val_size = 0;
+    EXPECT_NE(store_.get(key_a, val, sizeof(val), &val_size).run_sync(), 0);
+
+    ASSERT_EQ(store_.get(key_b, val, sizeof(val), &val_size).run_sync(), 0);
+    EXPECT_EQ(std::string_view(reinterpret_cast<char*>(val), val_size),
+              "val_b");
+}
+
+TEST_F(StoreTest, ExistsWithTagCollisionFindsCorrectKey) {
+    auto [key_a, key_b] = find_colliding_keys(config_.index_bits);
+    ASSERT_FALSE(key_a.empty());
+
+    ASSERT_EQ(store_.put(key_a, "aaa").run_sync(), 0);
+    ASSERT_EQ(store_.put(key_b, "bbbbb").run_sync(), 0);
+
+    size_t val_size = 0;
+    ASSERT_EQ(store_.exists(key_a, &val_size).run_sync(), 0);
+    EXPECT_EQ(val_size, 3u);
+
+    ASSERT_EQ(store_.exists(key_b, &val_size).run_sync(), 0);
+    EXPECT_EQ(val_size, 5u);
+}
+
+// --- CRC table-based vs bit-by-bit equivalence ---
+
+static uint16_t crc16_bitwise(const uint8_t* data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= static_cast<uint16_t>(data[i]) << 8;
+        for (int j = 0; j < 8; ++j)
+            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+    }
+    return crc;
+}
+
+TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
+    // Put a key/value pair; read it back via raw I/O and verify the
+    // on-disk CRC matches the reference bitwise implementation.
+    std::string key = "crc_check_key";
+    std::vector<uint8_t> val(256);
+    for (size_t i = 0; i < val.size(); ++i)
+        val[i] = static_cast<uint8_t>(i);
+
+    auto key_span = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(key.data()), key.size());
+    auto val_span = std::span<const uint8_t>(val);
+
+    ASSERT_EQ(store_.put(key_span, val_span).run_sync(), 0);
+
+    // Read the raw on-disk entry from grain 0.
+    size_t entry_bytes = sizeof(udepot::KvHeader) + key.size() + val.size() +
+                         sizeof(udepot::KvSuffix);
+    size_t grains = (entry_bytes + config_.grain_size - 1) / config_.grain_size;
+    size_t read_size = grains * config_.grain_size;
+
+    std::vector<uint8_t> buf(read_size);
+    ssize_t nread = store_.io().pread(buf.data(), read_size, 0).run_sync();
+    ASSERT_EQ(nread, static_cast<ssize_t>(read_size));
+
+    // Compute reference CRC over header + key + value.
+    uint16_t ref_crc = 0xFFFF;
+    // Header
+    ref_crc = crc16_bitwise(buf.data(), sizeof(udepot::KvHeader));
+    // To chain properly, feed remaining data byte-by-byte into the same state.
+    // Simpler: just compute over the whole prefix.
+    size_t crc_input_len = sizeof(udepot::KvHeader) + key.size() + val.size();
+    ref_crc = crc16_bitwise(buf.data(), crc_input_len);
+
+    // Read the stored CRC from the suffix.
+    udepot::KvSuffix suffix;
+    std::memcpy(&suffix, buf.data() + crc_input_len, sizeof(suffix));
+
+    EXPECT_EQ(suffix.crc16, ref_crc)
+        << "On-disk CRC (from table-based compute_crc16) must match "
+           "reference bitwise CRC-CCITT";
 }
