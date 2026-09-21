@@ -1,5 +1,6 @@
 #include "udepot/store.h"
 
+#include <array>
 #include <cerrno>
 #include <cstring>
 
@@ -7,27 +8,33 @@
 
 namespace udepot {
 
+// CRC-CCITT (0x1021) lookup table, computed at compile time.
+static constexpr auto kCrc16Table = [] {
+    std::array<uint16_t, 256> t{};
+    for (int i = 0; i < 256; ++i) {
+        uint16_t crc = static_cast<uint16_t>(i) << 8;
+        for (int j = 0; j < 8; ++j)
+            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+        t[i] = crc;
+    }
+    return t;
+}();
+
+static uint16_t crc16_update(uint16_t crc, const uint8_t* data, size_t len) {
+    for (size_t i = 0; i < len; ++i)
+        crc = kCrc16Table[((crc >> 8) ^ data[i]) & 0xFF] ^ (crc << 8);
+    return crc;
+}
+
 template <typename IO>
 uint16_t UDepot<IO>::compute_crc16(const KvHeader& hdr,
                                    std::span<const uint8_t> key,
                                    std::span<const uint8_t> val) {
     uint16_t crc = 0xFFFF;
-
-    auto update = [&crc](const uint8_t* data, size_t len) {
-        for (size_t i = 0; i < len; ++i) {
-            crc ^= static_cast<uint16_t>(data[i]) << 8;
-            for (int j = 0; j < 8; ++j) {
-                if (crc & 0x8000)
-                    crc = (crc << 1) ^ 0x1021;
-                else
-                    crc <<= 1;
-            }
-        }
-    };
-
-    update(reinterpret_cast<const uint8_t*>(&hdr), sizeof(hdr));
-    update(key.data(), key.size());
-    update(val.data(), val.size());
+    crc = crc16_update(crc, reinterpret_cast<const uint8_t*>(&hdr),
+                       sizeof(hdr));
+    crc = crc16_update(crc, key.data(), key.size());
+    crc = crc16_update(crc, val.data(), val.size());
     return crc;
 }
 
@@ -189,74 +196,70 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
     if (key.empty()) co_return -EINVAL;
 
     uint64_t hash = hash_key(key);
-    uint8_t tag = hash_to_tag(hash);
 
     rcu_.read_lock(rcu_token_);
 
-    HashEntry entry = directory_->lookup(hash);
+    // Iterate through all tag-matching entries to handle collisions.
+    for (uint32_t start = 0; ; ) {
+        HashEntry entry = directory_->lookup(hash, start);
+        if (entry.empty()) break;
 
-    if (entry.empty()) {
+        start = entry.bucket_offset() + 1;
+
+        uint64_t pba = entry.pba();
+        uint16_t kv_grains = entry.kv_size();
+
+        size_t read_bytes = static_cast<size_t>(kv_grains) * grain_size_;
+        IoBuffer buf = io_.alloc_buffer(read_bytes);
+        if (!buf.data) {
+            rcu_.read_unlock(rcu_token_);
+            co_return -ENOMEM;
+        }
+
+        ssize_t nread = co_await io_.pread(buf.data, read_bytes,
+                                           grain_to_offset(pba));
+        if (nread < static_cast<ssize_t>(sizeof(KvHeader)))
+            continue;
+
+        auto* p = static_cast<const uint8_t*>(buf.data);
+        KvHeader hdr;
+        std::memcpy(&hdr, p, sizeof(hdr));
+
+        if (hdr.key_size != key.size()) continue;
+
+        size_t entry_total = kv_total_bytes(hdr.key_size, hdr.val_size);
+        if (entry_total > read_bytes) continue;
+
+        if (std::memcmp(p + sizeof(hdr), key.data(), key.size()) != 0)
+            continue;
+
+        // Verify CRC.
+        auto key_span = std::span<const uint8_t>(p + sizeof(hdr), hdr.key_size);
+        auto val_span = std::span<const uint8_t>(
+            p + sizeof(hdr) + hdr.key_size, hdr.val_size);
+
+        KvSuffix suffix;
+        std::memcpy(&suffix, p + sizeof(hdr) + hdr.key_size + hdr.val_size,
+                    sizeof(suffix));
+        uint16_t expected = compute_crc16(hdr, key_span, val_span);
+        if (suffix.crc16 != expected) {
+            rcu_.read_unlock(rcu_token_);
+            co_return -EIO;
+        }
+
+        if (val_size_out) *val_size_out = hdr.val_size;
+        if (val_out && val_buf_size > 0) {
+            size_t to_copy = std::min(val_buf_size,
+                                      static_cast<size_t>(hdr.val_size));
+            std::memcpy(val_out, p + sizeof(hdr) + hdr.key_size, to_copy);
+        }
+
         rcu_.read_unlock(rcu_token_);
-        co_return -ENOENT;
+        co_return 0;
     }
 
-    if (entry.key_tag() != tag) {
-        rcu_.read_unlock(rcu_token_);
-        co_return -ENOENT;
-    }
-
-    uint64_t pba = entry.pba();
-    uint16_t kv_grains = entry.kv_size();
-
-    // Read the full KV entry from disk.
-    size_t read_bytes = static_cast<size_t>(kv_grains) * grain_size_;
-    IoBuffer buf = io_.alloc_buffer(read_bytes);
-    if (!buf.data) {
-        rcu_.read_unlock(rcu_token_);
-        co_return -ENOMEM;
-    }
-
-    ssize_t nread = co_await io_.pread(buf.data, read_bytes,
-                                       grain_to_offset(pba));
     rcu_.read_unlock(rcu_token_);
-
-    if (nread < static_cast<ssize_t>(sizeof(KvHeader))) {
-        co_return -EIO;
-    }
-
-    auto* p = static_cast<const uint8_t*>(buf.data);
-    KvHeader hdr;
-    std::memcpy(&hdr, p, sizeof(hdr));
-
-    // Verify key match.
-    if (hdr.key_size != key.size()) co_return -ENOENT;
-
-    size_t entry_total = kv_total_bytes(hdr.key_size, hdr.val_size);
-    if (entry_total > read_bytes) co_return -EIO;
-
-    if (std::memcmp(p + sizeof(hdr), key.data(), key.size()) != 0)
-        co_return -ENOENT;
-
-    // Verify CRC.
-    auto key_span = std::span<const uint8_t>(p + sizeof(hdr), hdr.key_size);
-    auto val_span = std::span<const uint8_t>(
-        p + sizeof(hdr) + hdr.key_size, hdr.val_size);
-
-    KvSuffix suffix;
-    std::memcpy(&suffix, p + sizeof(hdr) + hdr.key_size + hdr.val_size,
-                sizeof(suffix));
-    uint16_t expected = compute_crc16(hdr, key_span, val_span);
-    if (suffix.crc16 != expected) co_return -EIO;
-
-    // Copy value to caller's buffer.
-    if (val_size_out) *val_size_out = hdr.val_size;
-
-    if (val_out && val_buf_size > 0) {
-        size_t to_copy = std::min(val_buf_size, static_cast<size_t>(hdr.val_size));
-        std::memcpy(val_out, p + sizeof(hdr) + hdr.key_size, to_copy);
-    }
-
-    co_return 0;
+    co_return -ENOENT;
 }
 
 template <typename IO>
@@ -264,36 +267,34 @@ CoroTask<int> UDepot<IO>::del(std::span<const uint8_t> key) {
     if (key.empty()) co_return -EINVAL;
 
     uint64_t hash = hash_key(key);
-    uint8_t tag = hash_to_tag(hash);
 
     rcu_.read_lock(rcu_token_);
 
-    HashEntry entry = directory_->lookup(hash);
+    for (uint32_t start = 0; ; ) {
+        HashEntry entry = directory_->lookup(hash, start);
+        if (entry.empty()) break;
 
-    if (entry.empty() || entry.key_tag() != tag) {
+        start = entry.bucket_offset() + 1;
+
+        uint64_t pba = entry.pba();
+        uint16_t kv_grains = entry.kv_size();
+
+        int rc = co_await verify_key_at_pba(pba, kv_grains, key, nullptr);
+        if (rc != 0) continue;
+
+        bool removed = directory_->remove(hash, pba);
+
         rcu_.read_unlock(rcu_token_);
+
+        if (removed) {
+            invalidate_grains(pba, kv_grains);
+            co_return 0;
+        }
+
         co_return -ENOENT;
     }
-
-    uint64_t pba = entry.pba();
-    uint16_t kv_grains = entry.kv_size();
-
-    // Verify the key on disk before removing.
-    int rc = co_await verify_key_at_pba(pba, kv_grains, key, nullptr);
-    if (rc != 0) {
-        rcu_.read_unlock(rcu_token_);
-        co_return -ENOENT;
-    }
-
-    bool removed = directory_->remove(hash, pba);
 
     rcu_.read_unlock(rcu_token_);
-
-    if (removed) {
-        invalidate_grains(pba, kv_grains);
-        co_return 0;
-    }
-
     co_return -ENOENT;
 }
 
@@ -303,29 +304,30 @@ CoroTask<int> UDepot<IO>::exists(std::span<const uint8_t> key,
     if (key.empty()) co_return -EINVAL;
 
     uint64_t hash = hash_key(key);
-    uint8_t tag = hash_to_tag(hash);
 
     rcu_.read_lock(rcu_token_);
 
-    HashEntry entry = directory_->lookup(hash);
+    for (uint32_t start = 0; ; ) {
+        HashEntry entry = directory_->lookup(hash, start);
+        if (entry.empty()) break;
 
-    if (entry.empty() || entry.key_tag() != tag) {
+        start = entry.bucket_offset() + 1;
+
+        uint64_t pba = entry.pba();
+        uint16_t kv_grains = entry.kv_size();
+
+        KvHeader hdr;
+        int rc = co_await verify_key_at_pba(pba, kv_grains, key, &hdr);
+        if (rc != 0) continue;
+
         rcu_.read_unlock(rcu_token_);
-        co_return -ENOENT;
+
+        if (val_size_out) *val_size_out = hdr.val_size;
+        co_return 0;
     }
 
-    uint64_t pba = entry.pba();
-    uint16_t kv_grains = entry.kv_size();
-
-    KvHeader hdr;
-    int rc = co_await verify_key_at_pba(pba, kv_grains, key, &hdr);
-
     rcu_.read_unlock(rcu_token_);
-
-    if (rc != 0) co_return -ENOENT;
-
-    if (val_size_out) *val_size_out = hdr.val_size;
-    co_return 0;
+    co_return -ENOENT;
 }
 
 // Explicit instantiation for PosixIO.

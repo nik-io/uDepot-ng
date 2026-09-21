@@ -32,7 +32,10 @@ public:
     // Lock-free lookup. Returns the matching entry, or an empty entry if
     // not found. The caller must verify the key on disk (the tag is a
     // probabilistic filter).
-    HashEntry lookup(uint64_t hash) const noexcept;
+    //
+    // To handle tag collisions, pass start_offset > 0 to resume scanning
+    // past a previous match. Returns the next matching entry.
+    HashEntry lookup(uint64_t hash, uint32_t start_offset = 0) const noexcept;
 
     // Insert an entry under the stripe lock. Returns 0 on success, -1 if
     // the neighborhood is full (table needs to grow).

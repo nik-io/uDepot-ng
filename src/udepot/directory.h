@@ -54,7 +54,8 @@ public:
     Directory& operator=(const Directory&) = delete;
 
     // Lock-free lookup. Caller must hold an RCU read lock.
-    HashEntry lookup(uint64_t hash) const noexcept;
+    // Pass start_offset > 0 to resume past a previous tag-matching entry.
+    HashEntry lookup(uint64_t hash, uint32_t start_offset = 0) const noexcept;
 
     // Insert under stripe lock. Caller must hold an RCU read lock.
     int insert(uint64_t hash, uint16_t kv_size, uint64_t pba);

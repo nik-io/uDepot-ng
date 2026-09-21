@@ -56,4 +56,8 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(hash_table_test test/hash_table_test.cc)
     udepot_add_test(directory_test  test/directory_test.cc)
     udepot_add_test(store_test      test/store_test.cc)
+
+    # Perf benchmark binary (not a gtest — standalone executable).
+    add_executable(udepot_ng_bench test/perf/udepot_ng_bench.cc)
+    target_link_libraries(udepot_ng_bench PRIVATE udepot)
 endif()

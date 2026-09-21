@@ -19,11 +19,11 @@ HashTable::HashTable(uint32_t index_bits, uint32_t num_stripe_locks)
 
 HashTable::~HashTable() = default;
 
-HashEntry HashTable::lookup(uint64_t hash) const noexcept {
+HashEntry HashTable::lookup(uint64_t hash, uint32_t start_offset) const noexcept {
     uint64_t bucket = hash_to_bucket(hash);
     uint8_t tag = hash_to_tag(hash);
 
-    for (uint32_t i = 0; i < HashEntry::kHopRange; ++i) {
+    for (uint32_t i = start_offset; i < HashEntry::kHopRange; ++i) {
         uint64_t idx = bucket + i;
         HashEntry entry = HashEntry::load(slots_[idx]);
         if (entry.empty()) continue;

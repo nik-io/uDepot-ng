@@ -12,9 +12,9 @@ Directory::Directory(Rcu& rcu, uint32_t initial_tables,
 
 Directory::~Directory() { delete current_.load(std::memory_order_relaxed); }
 
-HashEntry Directory::lookup(uint64_t hash) const noexcept {
+HashEntry Directory::lookup(uint64_t hash, uint32_t start_offset) const noexcept {
     DirSnapshot* snap = current_.load(std::memory_order_acquire);
-    return snap->table_for_hash(hash).lookup(hash);
+    return snap->table_for_hash(hash).lookup(hash, start_offset);
 }
 
 int Directory::insert(uint64_t hash, uint16_t kv_size, uint64_t pba) {
