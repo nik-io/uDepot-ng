@@ -24,7 +24,7 @@ public:
 
     int open(const char* path, size_t size) {
         int flags = O_RDWR | O_CREAT;
-        fd_ = ::open(path, flags, 0644);
+        fd_ = ::open(path, flags, 0666);
         if (fd_ < 0) return -errno;
 
         struct stat st;
