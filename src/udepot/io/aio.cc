@@ -30,6 +30,48 @@ static inline int sys_io_getevents(aio_context_t ctx, long min_nr,
         syscall(SYS_io_getevents, ctx, min_nr, max_nr, events, timeout));
 }
 
+// User-space AIO ring buffer — the kernel maps the aio_context_t as a ring
+// that userspace can poll directly, avoiding the io_getevents syscall.
+// Enabled only in release builds, matching uDepot's aio_user_getevents.
+struct AioRing {
+    unsigned id;
+    unsigned nr;
+    unsigned head;
+    unsigned tail;
+    unsigned magic;
+    unsigned compat_features;
+    unsigned incompat_features;
+    unsigned header_length;
+    struct io_event events[];
+};
+
+static constexpr unsigned kAioRingMagic = 0xa10a10a1;
+
+static inline bool aio_ring_valid(aio_context_t ctx) {
+#ifdef NDEBUG
+    return reinterpret_cast<AioRing*>(ctx)->magic == kAioRingMagic;
+#else
+    (void)ctx;
+    return false;
+#endif
+}
+
+static inline int aio_ring_getevents(aio_context_t ctx, unsigned max,
+                                     struct io_event* events) {
+    auto* ring = reinterpret_cast<AioRing*>(ctx);
+    int i = 0;
+    while (static_cast<unsigned>(i) < max) {
+        unsigned head = ring->head;
+        if (head == ring->tail)
+            break;
+        events[i] = ring->events[head];
+        __asm__ __volatile__("lfence" ::: "memory");
+        ring->head = (head + 1) % ring->nr;
+        ++i;
+    }
+    return i;
+}
+
 struct AioRequest {
     struct iocb cb;
     ssize_t result;
@@ -59,7 +101,11 @@ struct AioSubmitAwaitable {
 AioIO::~AioIO() { close(); }
 
 int AioIO::open(const char* path, size_t size) {
-    fd_ = ::open(path, O_RDWR | O_CREAT, 0644);
+    // Match uDepot: O_DIRECT | O_NOATIME.  Fall back to buffered I/O if the
+    // filesystem does not support O_DIRECT (e.g. tmpfs in tests).
+    fd_ = ::open(path, O_RDWR | O_CREAT | O_DIRECT | O_NOATIME, 0644);
+    if (fd_ < 0 && (errno == EINVAL || errno == ENOTSUP))
+        fd_ = ::open(path, O_RDWR | O_CREAT, 0644);
     if (fd_ < 0) return -errno;
 
     struct stat st;
@@ -82,7 +128,7 @@ int AioIO::open(const char* path, size_t size) {
     size_ = size;
 
     ctx_ = 0;
-    if (sys_io_setup(256, &ctx_) < 0) {
+    if (sys_io_setup(1024, &ctx_) < 0) {
         int err = errno;
         ::close(fd_);
         fd_ = -1;
@@ -117,6 +163,7 @@ CoroTask<ssize_t> AioIO::pread(void* buf, size_t count, off_t offset) {
     std::memset(&req.cb, 0, sizeof(req.cb));
     req.cb.aio_fildes = static_cast<uint32_t>(fd_);
     req.cb.aio_lio_opcode = IOCB_CMD_PREAD;
+    req.cb.aio_reqprio = 0;
     req.cb.aio_buf = reinterpret_cast<uint64_t>(buf);
     req.cb.aio_nbytes = count;
     req.cb.aio_offset = offset;
@@ -131,6 +178,7 @@ CoroTask<ssize_t> AioIO::pwrite(const void* buf, size_t count, off_t offset) {
     std::memset(&req.cb, 0, sizeof(req.cb));
     req.cb.aio_fildes = static_cast<uint32_t>(fd_);
     req.cb.aio_lio_opcode = IOCB_CMD_PWRITE;
+    req.cb.aio_reqprio = 0;
     req.cb.aio_buf = reinterpret_cast<uint64_t>(buf);
     req.cb.aio_nbytes = count;
     req.cb.aio_offset = offset;
@@ -141,17 +189,22 @@ CoroTask<ssize_t> AioIO::pwrite(const void* buf, size_t count, off_t offset) {
 }
 
 IoBuffer AioIO::alloc_buffer(size_t size) {
-    size_t aligned = (size + 511) & ~size_t{511};
-    return IoBuffer::alloc_aligned(aligned, 512);
+    size_t aligned = (size + 4095) & ~size_t{4095};
+    return IoBuffer::alloc_aligned(aligned, 4096);
 }
 
 void AioIO::poller_loop() {
-    static constexpr int kMaxEvents = 64;
+    static constexpr int kMaxEvents = 8;
     struct io_event events[kMaxEvents];
 
     while (running_.load(std::memory_order_acquire)) {
-        struct timespec timeout = {0, 100'000'000};
-        int n = sys_io_getevents(ctx_, 1, kMaxEvents, events, &timeout);
+        int n = 0;
+        if (aio_ring_valid(ctx_))
+            n = aio_ring_getevents(ctx_, kMaxEvents, events);
+        if (n == 0) {
+            struct timespec timeout = {0, 100'000'000};
+            n = sys_io_getevents(ctx_, 1, kMaxEvents, events, &timeout);
+        }
         if (n < 0) {
             if (errno == EINTR) continue;
             break;
@@ -159,18 +212,27 @@ void AioIO::poller_loop() {
 
         for (int i = 0; i < n; ++i) {
             auto* req = reinterpret_cast<AioRequest*>(events[i].data);
-            req->result = static_cast<ssize_t>(events[i].res);
+            if (events[i].res2 != 0) {
+                req->result = -EIO;
+            } else {
+                req->result = static_cast<ssize_t>(events[i].res);
+            }
             req->handle.resume();
         }
     }
 
+    // Drain remaining events on shutdown.
     for (;;) {
         struct timespec timeout = {0, 0};
         int n = sys_io_getevents(ctx_, 0, kMaxEvents, events, &timeout);
         if (n <= 0) break;
         for (int i = 0; i < n; ++i) {
             auto* req = reinterpret_cast<AioRequest*>(events[i].data);
-            req->result = static_cast<ssize_t>(events[i].res);
+            if (events[i].res2 != 0) {
+                req->result = -EIO;
+            } else {
+                req->result = static_cast<ssize_t>(events[i].res);
+            }
             req->handle.resume();
         }
     }

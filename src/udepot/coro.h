@@ -7,6 +7,10 @@
 #include <exception>
 #include <utility>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 namespace udepot {
 
 template <typename T = int>
@@ -73,8 +77,11 @@ public:
     // For sync backends (PosixIO), the coroutine completes eagerly.
     // For async backends (AioIO), spins until the poller resumes it.
     T run_sync() {
-        while (!handle_.promise().completed_.load(std::memory_order_acquire))
-            ;
+        while (!handle_.promise().completed_.load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        }
         T result = handle_.promise().result_;
         destroy();
         return result;
