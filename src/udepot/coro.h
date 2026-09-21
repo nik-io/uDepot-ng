@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <coroutine>
 #include <cstdint>
@@ -18,6 +19,7 @@ public:
         bool await_ready() noexcept { return false; }
 
         std::coroutine_handle<> await_suspend(handle_type h) noexcept {
+            h.promise().completed_.store(true, std::memory_order_release);
             return h.promise().continuation_;
         }
 
@@ -27,6 +29,7 @@ public:
     struct promise_type {
         std::coroutine_handle<> continuation_ = std::noop_coroutine();
         T result_{};
+        std::atomic<bool> completed_{false};
 
         std::suspend_never initial_suspend() noexcept { return {}; }
         FinalAwaitable final_suspend() noexcept { return {}; }
@@ -67,9 +70,11 @@ public:
     T await_resume() noexcept { return handle_.promise().result_; }
 
     // Drive to completion from non-coroutine code.
-    // Only valid when the coroutine completed eagerly (sync backends).
+    // For sync backends (PosixIO), the coroutine completes eagerly.
+    // For async backends (AioIO), spins until the poller resumes it.
     T run_sync() {
-        assert(done() && "run_sync: coroutine did not complete eagerly");
+        while (!handle_.promise().completed_.load(std::memory_order_acquire))
+            ;
         T result = handle_.promise().result_;
         destroy();
         return result;

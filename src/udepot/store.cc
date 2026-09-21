@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 
+#include "udepot/io/aio.h"
 #include "udepot/io/posix.h"
 
 namespace udepot {
@@ -326,7 +327,8 @@ CoroTask<int> UDepot<IO>::exists(std::span<const uint8_t> key,
     co_return -ENOENT;
 }
 
-// Explicit instantiation for PosixIO.
+// Explicit instantiations.
 template class UDepot<PosixIO>;
+template class UDepot<AioIO>;
 
 }  // namespace udepot

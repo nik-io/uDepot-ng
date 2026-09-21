@@ -25,6 +25,7 @@ add_library(udepot
     src/udepot/hash_table.cc
     src/udepot/directory.cc
     src/udepot/store.cc
+    src/udepot/io/aio.cc
 )
 target_include_directories(udepot PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
@@ -55,7 +56,9 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(posix_test      test/io/posix_test.cc)
     udepot_add_test(hash_table_test test/hash_table_test.cc)
     udepot_add_test(directory_test  test/directory_test.cc)
+    udepot_add_test(aio_test        test/io/aio_test.cc)
     udepot_add_test(store_test      test/store_test.cc)
+    udepot_add_test(aio_store_test  test/aio_store_test.cc)
 
     # Perf benchmark binary (not a gtest — standalone executable).
     add_executable(udepot_ng_bench test/perf/udepot_ng_bench.cc)
