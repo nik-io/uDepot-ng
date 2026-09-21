@@ -2,10 +2,15 @@
 
 #include <array>
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "udepot/io/aio.h"
 #include "udepot/io/posix.h"
+
+#include "frontends/usalsa++/Scm.hh"
+#include "frontends/usalsa++/SalsaMD.hh"
 
 namespace udepot {
 
@@ -41,22 +46,115 @@ UDepot<IO>::UDepot() = default;
 template <typename IO>
 UDepot<IO>::~UDepot() { close(); }
 
+static inline uint64_t align_up(uint64_t val, uint64_t align) {
+    return (val + align - 1) / align * align;
+}
+
 template <typename IO>
 int UDepot<IO>::open(const StoreConfig& config) {
     grain_size_ = config.grain_size;
     total_grains_ = config.size / grain_size_;
-    next_grain_.store(0, std::memory_order_relaxed);
 
     int rc = io_.open(config.path, config.size);
     if (rc != 0) return rc;
 
     rcu_token_ = rcu_.register_thread();
     directory_ = new Directory(rcu_, config.initial_tables, config.index_bits);
+
+    // Salsa initialization — matches uDepot's init_local().
+    seg_md_grains_ = align_up(sizeof(salsa::salsa_seg_md), grain_size_) /
+                     grain_size_;
+
+    uint64_t segment_size = config.segment_size;
+    if (segment_size == 0)
+        segment_size = (1ULL << 29) / grain_size_ + 2;
+
+    // Purging GC (type=1) for v0: entries in reclaimed segments are
+    // dropped rather than relocated.  Matches uDepot's MC variants.
+    static constexpr uint32_t kGcType = 1;
+    static constexpr uint32_t kGcLowWm = 20;
+    static constexpr uint32_t kGcHighWm = 40;
+
+    // Halving retry loop (matches uDepot): if the segment size is too
+    // large for the device, halve and try again.
+    while (true) {
+        char argv_buf[256];
+        snprintf(argv_buf, sizeof(argv_buf),
+                 "scm_dev= dev_size=%lu grain_size=%u"
+                 " segment_size=%lu gc_type=%u gc_low_wm=%u gc_high_wm=%u"
+                 " gc_thread_nr=1 simulation=1",
+                 static_cast<unsigned long>(config.size),
+                 grain_size_,
+                 static_cast<unsigned long>(segment_size),
+                 kGcType, kGcLowWm, kGcHighWm);
+
+        char* argv[16];
+        int argc = 0;
+        char* token = strtok(argv_buf, " ");
+        while (token && argc < 15) {
+            argv[argc++] = token;
+            token = strtok(nullptr, " ");
+        }
+
+        scm_ = new salsa::Scm();
+        rc = scm_->init(argc, argv, config.overprovision);
+        if (rc == 0) break;
+
+        delete scm_;
+        scm_ = nullptr;
+        segment_size /= 2;
+        if (segment_size <= 1) {
+            delete directory_;
+            directory_ = nullptr;
+            rcu_.unregister_thread(rcu_token_);
+            rcu_token_ = Rcu::Token{};
+            io_.close();
+            return -EINVAL;
+        }
+    }
+
+    // Initialize our SalsaCtlr with 1 stream, 1 relocation stream.
+    rc = salsa::SalsaCtlr::init(scm_, seg_md_grains_, 1, 1);
+    if (rc != 0) {
+        delete scm_;
+        scm_ = nullptr;
+        delete directory_;
+        directory_ = nullptr;
+        rcu_.unregister_thread(rcu_token_);
+        rcu_token_ = Rcu::Token{};
+        io_.close();
+        return -rc;
+    }
+
+    rc = scm_->init_threads();
+    if (rc != 0) {
+        salsa::SalsaCtlr::shutdown();
+        delete scm_;
+        scm_ = nullptr;
+        delete directory_;
+        directory_ = nullptr;
+        rcu_.unregister_thread(rcu_token_);
+        rcu_token_ = Rcu::Token{};
+        io_.close();
+        return -rc;
+    }
+
     return 0;
 }
 
 template <typename IO>
 void UDepot<IO>::close() {
+    if (scm_) {
+        scm_->exit_threads();
+        salsa::SalsaCtlr::shutdown();
+        if (gc_rcu_token_.valid()) {
+            rcu_.unregister_thread(gc_rcu_token_);
+            gc_rcu_token_ = Rcu::Token{};
+        }
+        delete scm_;
+        scm_ = nullptr;
+    }
+
     delete directory_;
     directory_ = nullptr;
     if (rcu_token_.valid()) {
@@ -68,15 +166,100 @@ void UDepot<IO>::close() {
 
 template <typename IO>
 uint64_t UDepot<IO>::allocate_grains(uint64_t count) {
-    uint64_t grain = next_grain_.fetch_add(count, std::memory_order_relaxed);
-    if (grain + count > total_grains_) return UINT64_MAX;
-    return grain;
+    u64 grain_out = 0;
+    int rc = salsa::SalsaCtlr::allocate_grains(
+        static_cast<u64>(count), &grain_out);
+    if (rc != 0) return UINT64_MAX;
+    return grain_out;
 }
 
 template <typename IO>
-void UDepot<IO>::invalidate_grains(uint64_t, uint64_t) {
-    // Bump allocator: no-op. Salsa would reclaim these via GC.
+void UDepot<IO>::invalidate_grains(uint64_t grain, uint64_t count) {
+    salsa::SalsaCtlr::invalidate_grains(
+        static_cast<u64>(grain), static_cast<u64>(count), false);
 }
+
+// GC callback — called from salsa's GC thread when it reclaims a segment.
+// Purging GC: walk the segment's KV entries and remove them from the
+// hash directory so no dangling references remain.
+template <typename IO>
+int UDepot<IO>::gc_callback(u64 grain_start, u64 grain_nr) {
+    if (!gc_rcu_token_.valid())
+        gc_rcu_token_ = rcu_.register_thread();
+
+    // Net segment excludes the per-segment metadata grains at the tail.
+    uint64_t end_grain = grain_start + grain_nr - seg_md_grains_;
+    uint64_t grain = grain_start;
+
+    while (grain < end_grain) {
+        // Read the first grain to get the KvHeader.
+        IoBuffer buf = io_.alloc_buffer(grain_size_);
+        if (!buf.data) break;
+
+        ssize_t nread = io_.pread(buf.data, grain_size_,
+                                  grain_to_offset(grain)).run_sync();
+        if (nread < static_cast<ssize_t>(sizeof(KvHeader))) {
+            grain++;
+            continue;
+        }
+
+        auto* p = static_cast<const uint8_t*>(buf.data);
+        KvHeader hdr;
+        std::memcpy(&hdr, p, sizeof(hdr));
+
+        if (hdr.key_size == 0) {
+            grain++;
+            continue;
+        }
+
+        uint64_t entry_grains = kv_total_grains(hdr.key_size, hdr.val_size);
+        if (entry_grains == 0 || grain + entry_grains > end_grain) {
+            grain++;
+            continue;
+        }
+
+        // Read the key for hashing.  Most keys fit in the first grain.
+        const uint8_t* key_data = nullptr;
+        IoBuffer key_buf{};
+        size_t key_end = sizeof(KvHeader) + hdr.key_size;
+
+        if (key_end <= static_cast<size_t>(grain_size_)) {
+            key_data = p + sizeof(KvHeader);
+        } else {
+            size_t aligned = ((key_end + grain_size_ - 1) / grain_size_) *
+                             grain_size_;
+            key_buf = io_.alloc_buffer(aligned);
+            if (!key_buf.data) {
+                grain += entry_grains;
+                continue;
+            }
+            nread = io_.pread(key_buf.data, aligned,
+                              grain_to_offset(grain)).run_sync();
+            if (nread < static_cast<ssize_t>(key_end)) {
+                grain += entry_grains;
+                continue;
+            }
+            key_data = static_cast<const uint8_t*>(key_buf.data) +
+                       sizeof(KvHeader);
+        }
+
+        uint64_t hash = CityHash64(
+            reinterpret_cast<const char*>(key_data), hdr.key_size);
+
+        rcu_.read_lock(gc_rcu_token_);
+        directory_->remove(hash, grain);
+        rcu_.read_unlock(gc_rcu_token_);
+
+        grain += entry_grains;
+    }
+
+    return 0;
+}
+
+// Segment metadata callback — called when salsa allocates a new segment.
+// No crash recovery in v0, so this is a no-op.
+template <typename IO>
+void UDepot<IO>::seg_md_callback(u64, u64) {}
 
 template <typename IO>
 CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,

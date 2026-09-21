@@ -32,6 +32,15 @@ target_include_directories(salsa PUBLIC
     ${SALSA_SRC_DIR}/frontends/usalsa++
 )
 
+# Mark salsa headers as SYSTEM for consumers so -Werror doesn't hit
+# vendored code when included from udepot sources.
+target_include_directories(salsa SYSTEM INTERFACE
+    ${SALSA_INCLUDE_DIR}
+    ${SALSA_INCLUDE_DIR}/data-structures
+    ${SALSA_INCLUDE_DIR}/generic
+    ${SALSA_SRC_DIR}/frontends/usalsa++
+)
+
 target_compile_definitions(salsa PRIVATE
     _GNU_SOURCE
     __STDC_FORMAT_MACROS

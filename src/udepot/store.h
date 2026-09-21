@@ -12,6 +12,9 @@
 #include "udepot/hash_entry.h"
 #include "udepot/rcu.h"
 
+#include "frontends/usalsa++/SalsaCtlr.hh"
+#include "frontends/usalsa++/SalsaMD.hh"
+
 #include "city.h"
 
 namespace udepot {
@@ -40,14 +43,19 @@ struct StoreConfig {
     uint32_t grain_size = 512;
     uint32_t initial_tables = 2;
     uint32_t index_bits = 10;
+    // Segment size in grains. 0 = auto (uDepot default: (1<<29)/grain_size + 2,
+    // halved until it fits the device).
+    uint64_t segment_size = 0;
+    // Overprovision in per-mille (200 = 20% reserved for GC).
+    uint32_t overprovision = 200;
 };
 
 // High-performance KV store, parameterized on the I/O backend.
 //
 // Uses RCU-protected directory for lock-free reads, salsa for grain
-// allocation, and the IoBackend for storage I/O.
+// allocation and GC, and the IoBackend for storage I/O.
 template <typename IO>
-class UDepot {
+class UDepot : private salsa::SalsaCtlr {
 public:
     UDepot();
     ~UDepot();
@@ -118,8 +126,14 @@ private:
     uint32_t grain_size_ = 512;
     uint64_t total_grains_ = 0;
 
-    // Simple bump allocator for v0. Salsa integration comes next.
-    std::atomic<uint64_t> next_grain_{0};
+    // Salsa segment allocator.
+    salsa::Scm* scm_ = nullptr;
+    uint64_t seg_md_grains_ = 0;
+    Rcu::Token gc_rcu_token_{};
+
+    // SalsaCtlr overrides — called from salsa's GC thread.
+    int gc_callback(u64 grain_start, u64 grain_nr) override;
+    void seg_md_callback(u64 grain_start, u64 grain_nr) override;
 
     uint64_t allocate_grains(uint64_t count);
     void invalidate_grains(uint64_t grain, uint64_t count);

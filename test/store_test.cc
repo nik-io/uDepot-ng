@@ -237,11 +237,24 @@ TEST_F(StoreTest, DataSurvivesDirectoryGrow) {
 TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
     ASSERT_EQ(store_.put("crc_key", "crc_val").run_sync(), 0);
 
+    // Look up the PBA from the directory (salsa allocates grains, so the
+    // first put does not necessarily land at grain 0).
+    uint64_t hash = store_.hash_key(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>("crc_key"), 7));
+    auto tok = store_.rcu().register_thread();
+    store_.rcu().read_lock(tok);
+    udepot::HashEntry entry = store_.directory().lookup(hash);
+    store_.rcu().read_unlock(tok);
+    store_.rcu().unregister_thread(tok);
+    ASSERT_FALSE(entry.empty());
+
+    off_t offset = static_cast<off_t>(entry.pba()) * store_.grain_size();
+
     // Corrupt the on-disk header metadata so the CRC (which covers only
-    // the header, matching uDepot) won't match.  We know the first put
-    // goes to grain 0.
+    // the header, matching uDepot) won't match.
     uint8_t grain[512];
-    ssize_t nread = store_.io().pread(grain, sizeof(grain), 0).run_sync();
+    ssize_t nread = store_.io().pread(grain, sizeof(grain), offset)
+                        .run_sync();
     ASSERT_EQ(nread, 512);
 
     // Flip the timestamp field in the header (bytes 6..13) while keeping
@@ -251,7 +264,7 @@ TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
     hdr.timestamp ^= 0xDEADBEEF;
     std::memcpy(grain, &hdr, sizeof(hdr));
 
-    ssize_t written = store_.io().pwrite(grain, sizeof(grain), 0)
+    ssize_t written = store_.io().pwrite(grain, sizeof(grain), offset)
                           .run_sync();
     ASSERT_EQ(written, 512);
 
@@ -376,14 +389,26 @@ TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
 
     ASSERT_EQ(store_.put(key_span, val_span).run_sync(), 0);
 
-    // Read the raw on-disk entry from grain 0.
+    // Look up the PBA from the directory.
+    uint64_t hash = store_.hash_key(key_span);
+    auto tok = store_.rcu().register_thread();
+    store_.rcu().read_lock(tok);
+    udepot::HashEntry entry = store_.directory().lookup(hash);
+    store_.rcu().read_unlock(tok);
+    store_.rcu().unregister_thread(tok);
+    ASSERT_FALSE(entry.empty());
+
+    off_t offset = static_cast<off_t>(entry.pba()) * store_.grain_size();
+
+    // Read the raw on-disk entry at the allocated PBA.
     size_t entry_bytes = sizeof(udepot::KvHeader) + key.size() + val.size() +
                          sizeof(udepot::KvSuffix);
     size_t grains = (entry_bytes + config_.grain_size - 1) / config_.grain_size;
     size_t read_size = grains * config_.grain_size;
 
     std::vector<uint8_t> buf(read_size);
-    ssize_t nread = store_.io().pread(buf.data(), read_size, 0).run_sync();
+    ssize_t nread = store_.io().pread(buf.data(), read_size, offset)
+                        .run_sync();
     ASSERT_EQ(nread, static_cast<ssize_t>(read_size));
 
     // Reference CRC over the header only (14 bytes).
