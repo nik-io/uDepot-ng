@@ -27,14 +27,10 @@ static uint16_t crc16_update(uint16_t crc, const uint8_t* data, size_t len) {
 }
 
 template <typename IO>
-uint16_t UDepot<IO>::compute_crc16(const KvHeader& hdr,
-                                   std::span<const uint8_t> key,
-                                   std::span<const uint8_t> val) {
+uint16_t UDepot<IO>::compute_crc16(const KvHeader& hdr) {
     uint16_t crc = 0xFFFF;
     crc = crc16_update(crc, reinterpret_cast<const uint8_t*>(&hdr),
                        sizeof(hdr));
-    crc = crc16_update(crc, key.data(), key.size());
-    crc = crc16_update(crc, val.data(), val.size());
     return crc;
 }
 
@@ -118,7 +114,7 @@ CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
     std::memcpy(p + sizeof(hdr) + key.size(), val.data(), val.size());
 
     KvSuffix suffix;
-    suffix.crc16 = compute_crc16(hdr, key, val);
+    suffix.crc16 = compute_crc16(hdr);
     std::memcpy(p + sizeof(hdr) + key.size() + val.size(),
                 &suffix, sizeof(suffix));
 
@@ -233,19 +229,19 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
         if (std::memcmp(p + sizeof(hdr), key.data(), key.size()) != 0)
             continue;
 
-        // Verify CRC.
-        auto key_span = std::span<const uint8_t>(p + sizeof(hdr), hdr.key_size);
-        auto val_span = std::span<const uint8_t>(
-            p + sizeof(hdr) + hdr.key_size, hdr.val_size);
-
-        KvSuffix suffix;
-        std::memcpy(&suffix, p + sizeof(hdr) + hdr.key_size + hdr.val_size,
-                    sizeof(suffix));
-        uint16_t expected = compute_crc16(hdr, key_span, val_span);
-        if (suffix.crc16 != expected) {
-            rcu_.read_unlock(rcu_token_);
-            co_return -EIO;
+#ifndef NDEBUG
+        // Debug-only CRC verification (matches uDepot's _UDEPOT_DATA_DEBUG_VERIFY).
+        {
+            KvSuffix suffix;
+            std::memcpy(&suffix, p + sizeof(hdr) + hdr.key_size + hdr.val_size,
+                        sizeof(suffix));
+            uint16_t expected = compute_crc16(hdr);
+            if (suffix.crc16 != expected) {
+                rcu_.read_unlock(rcu_token_);
+                co_return -EIO;
+            }
         }
+#endif
 
         if (val_size_out) *val_size_out = hdr.val_size;
         if (val_out && val_buf_size > 0) {

@@ -124,9 +124,7 @@ private:
     uint64_t allocate_grains(uint64_t count);
     void invalidate_grains(uint64_t grain, uint64_t count);
 
-    static uint16_t compute_crc16(const KvHeader& hdr,
-                                  std::span<const uint8_t> key,
-                                  std::span<const uint8_t> val);
+    static uint16_t compute_crc16(const KvHeader& hdr);
 
     size_t kv_total_bytes(size_t key_size, size_t val_size) const {
         return sizeof(KvHeader) + key_size + val_size + sizeof(KvSuffix);

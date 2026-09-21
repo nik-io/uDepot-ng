@@ -230,24 +230,28 @@ TEST_F(StoreTest, DataSurvivesDirectoryGrow) {
 }
 
 // --- CRC integrity ---
+// CRC verification on get is debug-only (matching uDepot's
+// _UDEPOT_DATA_DEBUG_VERIFY), so this test only runs in debug builds.
 
+#ifndef NDEBUG
 TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
     ASSERT_EQ(store_.put("crc_key", "crc_val").run_sync(), 0);
 
-    // Corrupt the on-disk data by writing garbage at the stored location.
-    // We know the first put goes to grain 0.
-    uint8_t garbage[512];
-    std::memset(garbage, 0xFF, sizeof(garbage));
-    // Preserve the header so lookup finds it, but corrupt the value.
-    udepot::KvHeader hdr;
-    hdr.key_size = 7;  // "crc_key"
-    hdr.val_size = 7;  // "crc_val"
-    hdr.timestamp = 0;
-    std::memcpy(garbage, &hdr, sizeof(hdr));
-    std::memcpy(garbage + sizeof(hdr), "crc_key", 7);
-    // Value is now 0xFF bytes, CRC won't match.
+    // Corrupt the on-disk header metadata so the CRC (which covers only
+    // the header, matching uDepot) won't match.  We know the first put
+    // goes to grain 0.
+    uint8_t grain[512];
+    ssize_t nread = store_.io().pread(grain, sizeof(grain), 0).run_sync();
+    ASSERT_EQ(nread, 512);
 
-    ssize_t written = store_.io().pwrite(garbage, sizeof(garbage), 0)
+    // Flip the timestamp field in the header (bytes 6..13) while keeping
+    // key_size and val_size intact so lookup still finds the entry.
+    udepot::KvHeader hdr;
+    std::memcpy(&hdr, grain, sizeof(hdr));
+    hdr.timestamp ^= 0xDEADBEEF;
+    std::memcpy(grain, &hdr, sizeof(hdr));
+
+    ssize_t written = store_.io().pwrite(grain, sizeof(grain), 0)
                           .run_sync();
     ASSERT_EQ(written, 512);
 
@@ -256,6 +260,7 @@ TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
     int rc = store_.get("crc_key", val, sizeof(val), &val_size).run_sync();
     EXPECT_NE(rc, 0);  // Should fail due to CRC mismatch.
 }
+#endif
 
 // --- Tag collision tests ---
 // Two keys that hash to the same bucket with the same 8-bit tag but are
@@ -359,6 +364,7 @@ static uint16_t crc16_bitwise(const uint8_t* data, size_t len) {
 TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
     // Put a key/value pair; read it back via raw I/O and verify the
     // on-disk CRC matches the reference bitwise implementation.
+    // The CRC covers only the 14-byte header (matching uDepot).
     std::string key = "crc_check_key";
     std::vector<uint8_t> val(256);
     for (size_t i = 0; i < val.size(); ++i)
@@ -380,20 +386,14 @@ TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
     ssize_t nread = store_.io().pread(buf.data(), read_size, 0).run_sync();
     ASSERT_EQ(nread, static_cast<ssize_t>(read_size));
 
-    // Compute reference CRC over header + key + value.
-    uint16_t ref_crc = 0xFFFF;
-    // Header
-    ref_crc = crc16_bitwise(buf.data(), sizeof(udepot::KvHeader));
-    // To chain properly, feed remaining data byte-by-byte into the same state.
-    // Simpler: just compute over the whole prefix.
-    size_t crc_input_len = sizeof(udepot::KvHeader) + key.size() + val.size();
-    ref_crc = crc16_bitwise(buf.data(), crc_input_len);
+    // Reference CRC over the header only (14 bytes).
+    uint16_t ref_crc = crc16_bitwise(buf.data(), sizeof(udepot::KvHeader));
 
     // Read the stored CRC from the suffix.
+    size_t suffix_offset = sizeof(udepot::KvHeader) + key.size() + val.size();
     udepot::KvSuffix suffix;
-    std::memcpy(&suffix, buf.data() + crc_input_len, sizeof(suffix));
+    std::memcpy(&suffix, buf.data() + suffix_offset, sizeof(suffix));
 
     EXPECT_EQ(suffix.crc16, ref_crc)
-        << "On-disk CRC (from table-based compute_crc16) must match "
-           "reference bitwise CRC-CCITT";
+        << "On-disk CRC covers only the 14-byte header (matching uDepot)";
 }
