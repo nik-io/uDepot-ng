@@ -55,6 +55,30 @@ int HashTable::insert(uint64_t hash, uint16_t kv_size, uint64_t pba) {
     return 0;
 }
 
+bool HashTable::update(uint64_t hash, uint64_t old_pba,
+                       uint16_t new_kv_size, uint64_t new_pba) {
+    uint64_t bucket = hash_to_bucket(hash);
+    uint8_t tag = hash_to_tag(hash);
+
+    std::lock_guard<std::mutex> lock(stripe_locks_[stripe_for_bucket(bucket)]);
+
+    for (uint32_t i = 0; i < HashEntry::kHopRange; ++i) {
+        uint64_t idx = bucket + i;
+        HashEntry entry = HashEntry::load(slots_[idx],
+                                          std::memory_order_relaxed);
+        if (entry.empty()) continue;
+        if (entry.bucket_offset() != i) continue;
+        if (entry.key_tag() != tag) continue;
+        if (entry.pba() != old_pba) continue;
+
+        HashEntry updated = HashEntry::make(
+            static_cast<uint8_t>(i), tag, new_kv_size, new_pba);
+        HashEntry::store(slots_[idx], updated);
+        return true;
+    }
+    return false;
+}
+
 bool HashTable::remove(uint64_t hash, uint64_t pba) {
     uint64_t bucket = hash_to_bucket(hash);
     uint8_t tag = hash_to_tag(hash);

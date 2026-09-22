@@ -60,6 +60,11 @@ public:
     // Insert under stripe lock. Caller must hold an RCU read lock.
     int insert(uint64_t hash, uint16_t kv_size, uint64_t pba);
 
+    // Atomically replace the entry at (hash, old_pba) with a new entry
+    // pointing to new_pba. Caller must hold an RCU read lock.
+    bool update(uint64_t hash, uint64_t old_pba,
+                uint16_t new_kv_size, uint64_t new_pba);
+
     // Remove under stripe lock. Caller must hold an RCU read lock.
     bool remove(uint64_t hash, uint64_t pba);
 

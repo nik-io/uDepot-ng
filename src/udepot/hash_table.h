@@ -41,6 +41,13 @@ public:
     // the neighborhood is full (table needs to grow).
     int insert(uint64_t hash, uint16_t kv_size, uint64_t pba);
 
+    // Atomically replace the entry at (hash, old_pba) with a new entry
+    // pointing to new_pba. Used by put() for upsert: the slot keeps its
+    // position in the hopscotch neighborhood. Returns true if the entry
+    // was found and updated; false if old_pba is no longer present.
+    bool update(uint64_t hash, uint64_t old_pba,
+                uint16_t new_kv_size, uint64_t new_pba);
+
     // Remove the entry matching (hash, pba) under the stripe lock.
     // Returns true if found and removed.
     bool remove(uint64_t hash, uint64_t pba);

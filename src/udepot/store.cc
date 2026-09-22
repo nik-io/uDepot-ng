@@ -318,12 +318,46 @@ CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
         co_return (written < 0) ? static_cast<int>(written) : -EIO;
     }
 
-    // Insert into hash directory under RCU.
+    // Lookup-before-write: check if the key already exists in the
+    // directory and update in place if so (upsert semantics, matching
+    // legacy uDepot's local_put_mbuff / lookup_mbuff_put).
     rcu_.read_lock(rcu_token_);
 
-    int rc = directory_->insert(hash,
-                                static_cast<uint16_t>(grains_needed),
-                                grain);
+    uint64_t old_pba = UINT64_MAX;
+    uint16_t old_kv_grains = 0;
+
+    for (uint32_t start = 0; ; ) {
+        HashEntry entry = directory_->lookup(hash, start);
+        if (entry.empty()) break;
+
+        start = entry.bucket_offset() + 1;
+
+        int vrc = co_await verify_key_at_pba(
+            entry.pba(), entry.kv_size(), key, nullptr);
+        if (vrc == 0) {
+            old_pba = entry.pba();
+            old_kv_grains = entry.kv_size();
+            break;
+        }
+    }
+
+    int rc;
+    if (old_pba != UINT64_MAX) {
+        // Key exists — atomically update the directory entry.
+        bool updated = directory_->update(
+            hash, old_pba,
+            static_cast<uint16_t>(grains_needed), grain);
+        if (updated) {
+            rcu_.read_unlock(rcu_token_);
+            invalidate_grains(old_pba, old_kv_grains);
+            co_return 0;
+        }
+        // Entry was concurrently removed — fall through to insert.
+    }
+
+    rc = directory_->insert(hash,
+                            static_cast<uint16_t>(grains_needed),
+                            grain);
 
     rcu_.read_unlock(rcu_token_);
 

@@ -22,6 +22,13 @@ int Directory::insert(uint64_t hash, uint16_t kv_size, uint64_t pba) {
     return snap->table_for_hash(hash).insert(hash, kv_size, pba);
 }
 
+bool Directory::update(uint64_t hash, uint64_t old_pba,
+                       uint16_t new_kv_size, uint64_t new_pba) {
+    DirSnapshot* snap = current_.load(std::memory_order_acquire);
+    return snap->table_for_hash(hash).update(hash, old_pba,
+                                              new_kv_size, new_pba);
+}
+
 bool Directory::remove(uint64_t hash, uint64_t pba) {
     DirSnapshot* snap = current_.load(std::memory_order_acquire);
     return snap->table_for_hash(hash).remove(hash, pba);

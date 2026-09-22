@@ -374,6 +374,110 @@ static uint16_t crc16_bitwise(const uint8_t* data, size_t len) {
     return crc;
 }
 
+// --- Upsert (overwrite) ---
+
+TEST_F(StoreTest, PutOverwriteUpdatesValue) {
+    ASSERT_EQ(store_.put("key", "old_val").run_sync(), 0);
+    ASSERT_EQ(store_.put("key", "new_val").run_sync(), 0);
+
+    uint8_t val[64];
+    size_t val_size = 0;
+    ASSERT_EQ(store_.get("key", val, sizeof(val), &val_size).run_sync(), 0);
+    EXPECT_EQ(val_size, 7u);
+    EXPECT_EQ(std::string_view(reinterpret_cast<char*>(val), val_size),
+              "new_val");
+}
+
+TEST_F(StoreTest, PutOverwriteDoesNotLeaveOldValue) {
+    ASSERT_EQ(store_.put("dup", "first").run_sync(), 0);
+    ASSERT_EQ(store_.put("dup", "second").run_sync(), 0);
+
+    // After overwrite, only one directory entry should exist for "dup".
+    uint64_t hash = store_.hash_key(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>("dup"), 3));
+
+    auto tok = store_.rcu().register_thread();
+    store_.rcu().read_lock(tok);
+
+    int count = 0;
+    for (uint32_t start = 0; ; ) {
+        udepot::HashEntry entry = store_.directory().lookup(hash, start);
+        if (entry.empty()) break;
+        start = entry.bucket_offset() + 1;
+        ++count;
+    }
+
+    store_.rcu().read_unlock(tok);
+    store_.rcu().unregister_thread(tok);
+
+    EXPECT_EQ(count, 1) << "overwrite must not create duplicate entries";
+}
+
+TEST_F(StoreTest, PutOverwriteWithDifferentSize) {
+    ASSERT_EQ(store_.put("resize", "short").run_sync(), 0);
+
+    std::vector<uint8_t> big_val(2048, 0xCC);
+    auto key = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>("resize"), 6);
+    auto val = std::span<const uint8_t>(big_val.data(), big_val.size());
+    ASSERT_EQ(store_.put(key, val).run_sync(), 0);
+
+    std::vector<uint8_t> out(2048);
+    size_t val_size = 0;
+    ASSERT_EQ(store_.get(key, out.data(), out.size(), &val_size).run_sync(), 0);
+    EXPECT_EQ(val_size, 2048u);
+    EXPECT_EQ(out, big_val);
+}
+
+TEST_F(StoreTest, PutOverwriteThenDelete) {
+    ASSERT_EQ(store_.put("od", "v1").run_sync(), 0);
+    ASSERT_EQ(store_.put("od", "v2").run_sync(), 0);
+    ASSERT_EQ(store_.del("od").run_sync(), 0);
+
+    uint8_t val[64];
+    size_t val_size = 0;
+    EXPECT_NE(store_.get("od", val, sizeof(val), &val_size).run_sync(), 0);
+}
+
+TEST_F(StoreTest, PutOverwriteMultipleTimes) {
+    for (int i = 0; i < 10; ++i) {
+        std::string val = "iteration_" + std::to_string(i);
+        ASSERT_EQ(store_.put("multi", val).run_sync(), 0);
+    }
+
+    uint8_t val[64];
+    size_t val_size = 0;
+    ASSERT_EQ(store_.get("multi", val, sizeof(val), &val_size).run_sync(), 0);
+    EXPECT_EQ(std::string_view(reinterpret_cast<char*>(val), val_size),
+              "iteration_9");
+}
+
+TEST_F(StoreTest, PutOverwriteDoesNotAffectOtherKeys) {
+    ASSERT_EQ(store_.put("a", "a_val").run_sync(), 0);
+    ASSERT_EQ(store_.put("b", "b_val").run_sync(), 0);
+    ASSERT_EQ(store_.put("a", "a_new").run_sync(), 0);
+
+    uint8_t val[64];
+    size_t val_size = 0;
+
+    ASSERT_EQ(store_.get("a", val, sizeof(val), &val_size).run_sync(), 0);
+    EXPECT_EQ(std::string_view(reinterpret_cast<char*>(val), val_size),
+              "a_new");
+
+    ASSERT_EQ(store_.get("b", val, sizeof(val), &val_size).run_sync(), 0);
+    EXPECT_EQ(std::string_view(reinterpret_cast<char*>(val), val_size),
+              "b_val");
+}
+
+TEST_F(StoreTest, PutOverwriteExistsReportsNewSize) {
+    ASSERT_EQ(store_.put("ex", "ab").run_sync(), 0);
+    ASSERT_EQ(store_.put("ex", "abcdef").run_sync(), 0);
+
+    size_t val_size = 0;
+    ASSERT_EQ(store_.exists("ex", &val_size).run_sync(), 0);
+    EXPECT_EQ(val_size, 6u);
+}
+
 TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
     // Put a key/value pair; read it back via raw I/O and verify the
     // on-disk CRC matches the reference bitwise implementation.
