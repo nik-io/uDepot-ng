@@ -1,18 +1,13 @@
-#include "udepot/store.h"
-#include "udepot/io/posix.h"
+#include "kv.hh"
+#include "uDepot/kv-conf.hh"
+#include "uDepot/kv-factory.hh"
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <string>
-#include <vector>
-
-using udepot::PosixIO;
-using udepot::StoreConfig;
-using udepot::UDepot;
 
 static constexpr uint64_t kPrime = 0x9E3779B97F4A7C15ULL;
 
@@ -22,7 +17,7 @@ struct BenchConfig {
     uint64_t seed = 42;
     uint32_t grain_size = 512;
     size_t store_size = 1077936129;
-    const char* file = "/dev/shm/udepot-ng-bench.store";
+    const char* file = "/dev/shm/udepot-legacy-bench.store";
 };
 
 static double now_secs() {
@@ -31,19 +26,29 @@ static double now_secs() {
 }
 
 static int run_bench(const BenchConfig& cfg) {
-    StoreConfig sc;
-    sc.path = cfg.file;
-    sc.size = cfg.store_size;
-    sc.grain_size = cfg.grain_size;
-    sc.initial_tables = 4;
-    sc.index_bits = 14;
+    uint64_t segment_size = (1ULL << 29) / cfg.grain_size + 2;
+    udepot::KV_conf conf(
+        cfg.file,
+        cfg.store_size,
+        true,
+        cfg.grain_size,
+        segment_size);
+    conf.type_m = udepot::KV_conf::KV_UDEPOT_SALSA;
 
-    UDepot<PosixIO> store;
-    int rc = store.open(sc);
-    if (rc != 0) {
-        fprintf(stderr, "open failed: %d\n", rc);
+    KV* kv = udepot::KV_factory::KV_new(conf);
+    if (!kv) {
+        fprintf(stderr, "KV_new failed\n");
         return 1;
     }
+
+    int rc = kv->init();
+    if (rc != 0) {
+        fprintf(stderr, "init failed: %d\n", rc);
+        delete kv;
+        return 1;
+    }
+
+    kv->thread_local_entry();
 
     std::vector<uint8_t> val(cfg.val_size, 0);
     uint8_t keyb[32] = {};
@@ -58,13 +63,16 @@ static int run_bench(const BenchConfig& cfg) {
         std::memcpy(keyb, &key, sizeof(key));
         std::memcpy(val.data(), &valu, sizeof(valu));
 
-        rc = store.put(
-            std::span<const uint8_t>(keyb, key_size),
-            std::span<const uint8_t>(val.data(), cfg.val_size)).run_sync();
+        rc = static_cast<int>(kv->put(
+            reinterpret_cast<const char*>(keyb), key_size,
+            reinterpret_cast<const char*>(val.data()), cfg.val_size
+        ).run_sync());
         if (rc != 0) {
             fprintf(stderr, "put failed at i=%lu: %d\n",
                     static_cast<unsigned long>(i), rc);
-            store.close();
+            kv->thread_local_exit();
+            kv->shutdown();
+            delete kv;
             return 1;
         }
     }
@@ -73,7 +81,7 @@ static int run_bench(const BenchConfig& cfg) {
            put_secs, cfg.ops / (put_secs * 1e6));
 
     // GET phase
-    std::vector<uint8_t> val_out(cfg.val_size);
+    std::vector<char> val_out(cfg.val_size);
     t0 = now_secs();
     for (uint64_t i = 0; i < cfg.ops; ++i) {
         uint64_t key = (cfg.seed + i) * kPrime;
@@ -83,13 +91,18 @@ static int run_bench(const BenchConfig& cfg) {
         std::memcpy(keyb, &key, sizeof(key));
 
         size_t val_size_read = 0;
-        rc = store.get(
-            std::span<const uint8_t>(keyb, key_size),
-            val_out.data(), val_out.size(), &val_size_read).run_sync();
+        size_t val_size_total = 0;
+        rc = static_cast<int>(kv->get(
+            reinterpret_cast<const char*>(keyb), key_size,
+            val_out.data(), val_out.size(),
+            val_size_read, val_size_total
+        ).run_sync());
         if (rc != 0) {
             fprintf(stderr, "get failed at i=%lu: %d\n",
                     static_cast<unsigned long>(i), rc);
-            store.close();
+            kv->thread_local_exit();
+            kv->shutdown();
+            delete kv;
             return 1;
         }
 
@@ -99,7 +112,9 @@ static int run_bench(const BenchConfig& cfg) {
             if (val_ret != valu) {
                 fprintf(stderr, "value mismatch at i=%lu\n",
                         static_cast<unsigned long>(i));
-                store.close();
+                kv->thread_local_exit();
+                kv->shutdown();
+                delete kv;
                 return 1;
             }
         }
@@ -117,12 +132,15 @@ static int run_bench(const BenchConfig& cfg) {
         std::memcpy(keyb, &key, sizeof(key));
 
         size_t val_sz = 0;
-        rc = store.exists(
-            std::span<const uint8_t>(keyb, key_size), &val_sz).run_sync();
+        rc = static_cast<int>(kv->exists(
+            reinterpret_cast<const char*>(keyb), key_size, val_sz
+        ).run_sync());
         if (rc != 0) {
             fprintf(stderr, "exists failed at i=%lu: %d\n",
                     static_cast<unsigned long>(i), rc);
-            store.close();
+            kv->thread_local_exit();
+            kv->shutdown();
+            delete kv;
             return 1;
         }
     }
@@ -138,12 +156,15 @@ static int run_bench(const BenchConfig& cfg) {
 
         std::memcpy(keyb, &key, sizeof(key));
 
-        rc = store.del(
-            std::span<const uint8_t>(keyb, key_size)).run_sync();
+        rc = static_cast<int>(kv->del(
+            reinterpret_cast<const char*>(keyb), key_size
+        ).run_sync());
         if (rc != 0) {
             fprintf(stderr, "del failed at i=%lu: %d\n",
                     static_cast<unsigned long>(i), rc);
-            store.close();
+            kv->thread_local_exit();
+            kv->shutdown();
+            delete kv;
             return 1;
         }
     }
@@ -151,15 +172,17 @@ static int run_bench(const BenchConfig& cfg) {
     printf("DELs Aggregate time=%lfs Mops/sec=%lf\n",
            del_secs, cfg.ops / (del_secs * 1e6));
 
-    store.close();
+    kv->thread_local_exit();
+    kv->shutdown();
+    delete kv;
     return 0;
 }
 
 static void usage() {
     fprintf(stderr,
-        "Usage: udepot_ng_bench [options]\n"
+        "Usage: udepot_legacy_bench [options]\n"
         "  -w <ops>       Number of operations per phase (default: 10000)\n"
-        "  -f <file>      Store file path (default: /dev/shm/udepot-ng-bench.store)\n"
+        "  -f <file>      Store file path (default: /dev/shm/udepot-legacy-bench.store)\n"
         "  --size <bytes> Store size (default: 1077936129)\n"
         "  --grain-size <bytes> Grain size (default: 512)\n"
         "  --val-size <bytes>   Value size (default: 1024)\n"
@@ -193,8 +216,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::filesystem::remove(cfg.file);
     int rc = run_bench(cfg);
-    std::filesystem::remove(cfg.file);
     return rc;
 }

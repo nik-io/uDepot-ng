@@ -63,4 +63,35 @@ if(UDEPOT_BUILD_TESTS)
     # Perf benchmark binary (not a gtest — standalone executable).
     add_executable(udepot_ng_bench test/perf/udepot_ng_bench.cc)
     target_link_libraries(udepot_ng_bench PRIVATE udepot)
+
+    # Legacy uDepot benchmark for the perf regression gate.
+    # Requires UDEPOT_ROOT pointing to a built uDepot tree with libudepot.a.
+    if(NOT DEFINED UDEPOT_ROOT)
+        if(DEFINED ENV{UDEPOT_ROOT})
+            set(UDEPOT_ROOT "$ENV{UDEPOT_ROOT}")
+        else()
+            set(UDEPOT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../uDepot")
+        endif()
+    endif()
+
+    if(EXISTS "${UDEPOT_ROOT}/libudepot.a")
+        add_executable(udepot_legacy_bench test/perf/udepot_legacy_bench.cc)
+        target_include_directories(udepot_legacy_bench SYSTEM PRIVATE
+            ${UDEPOT_ROOT}/src/include
+            ${UDEPOT_ROOT}/salsa/src/include
+            ${UDEPOT_ROOT}/trt/src
+            ${UDEPOT_ROOT}/external/cityhash/..
+            ${UDEPOT_ROOT}/trt/external/liburing/src/include
+        )
+        target_link_libraries(udepot_legacy_bench PRIVATE
+            ${UDEPOT_ROOT}/libudepot.a
+            ${UDEPOT_ROOT}/external/cityhash/src/.libs/libcityhash.a
+            ${UDEPOT_ROOT}/trt/external/liburing/src/liburing.a
+            pthread rt z
+        )
+        target_compile_options(udepot_legacy_bench PRIVATE -Wno-error)
+    else()
+        message(STATUS "UDEPOT_ROOT=${UDEPOT_ROOT} — libudepot.a not found, "
+                       "skipping legacy benchmark build")
+    endif()
 endif()
