@@ -115,4 +115,24 @@ and asserts `median_ng <= median_legacy` for each. A small tolerance (default
 Both sides use the same I/O backend, same grain size, same store size, same
 device (`/dev/shm` for deterministic cache-bound measurement — same rationale as
 uDepot's own zero-copy perf test). The comparison is apples-to-apples: same
-on-disk format, same hash function (CityHash64), same operations.
+on-disk format, same hash function (CityHash64), same operations. Legacy uDepot
+must be built at `BUILD_TYPE=PERFORMANCE` (`-O3 -DNDEBUG`) to match uDepot-ng's
+cmake Release build; `perf-regression.sh` does this automatically.
+
+The speed gap is genuine, not a benchmark artifact. With both at -O3, uDepot-ng
+is 2-7x faster. The overhead sources in legacy, per strace:
+
+- **PUT**: Mbuff allocation + copy per operation, pwritev (scatter-gather) vs
+  pwrite64 (flat buffer), TRT coroutine scheduling overhead, virtual dispatch
+  through `uDepotIO_`. I/O counts are identical (one pread for lookup-before-write
+  + one pwrite for data, on both sides).
+- **GET/EXISTS**: Same I/O count (one pread each). Legacy takes a per-bucket
+  mutex on every read — the architectural change RCU eliminates. Plus
+  Mbuff/TRT/vtable overhead.
+- **DEL**: All of the above, plus legacy writes a tombstone to disk for every
+  delete (500 extra pwritev per 500 DEL ops). uDepot-ng removes the directory
+  entry and invalidates grains without a disk write. Tombstones serve crash
+  recovery (so `restore()` knows a key was deleted); uDepot-ng has no restore
+  path yet, so omitting them is consistent with the "enterprise-grade crash
+  recovery only" principle. When restore is added, DEL will need tombstones and
+  the DEL speedup will narrow.

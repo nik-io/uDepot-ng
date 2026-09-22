@@ -11,6 +11,11 @@
 # Requires:
 #   - build/udepot_ng_bench     (cmake --build build)
 #   - build/udepot_legacy_bench (cmake --build build, needs UDEPOT_ROOT)
+#
+# Legacy uDepot must be built at BUILD_TYPE=PERFORMANCE (-O3 -DNDEBUG) so
+# the comparison is apples-to-apples with uDepot-ng's cmake Release build.
+# This script rebuilds it automatically when UDEPOT_ROOT is set or defaults
+# to ../uDepot.
 set -uo pipefail
 
 OPS="${1:-5000}"
@@ -21,6 +26,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NG_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 NG_BIN="${NG_ROOT}/build/udepot_ng_bench"
 LEGACY_BIN="${NG_ROOT}/build/udepot_legacy_bench"
+
+# Ensure legacy uDepot is built at -O3 -DNDEBUG (BUILD_TYPE=PERFORMANCE).
+UDEPOT_ROOT="${UDEPOT_ROOT:-${NG_ROOT}/../uDepot}"
+if [ -d "$UDEPOT_ROOT" ]; then
+    echo "Building legacy uDepot at BUILD_TYPE=PERFORMANCE..." >&2
+    make -C "$UDEPOT_ROOT" BUILD_TYPE=PERFORMANCE -j"$(nproc)" 2>&1 | tail -1 >&2
+    # Rebuild the legacy benchmark binary to link against the fresh library.
+    cmake --build "${NG_ROOT}/build" --target udepot_legacy_bench 2>&1 | tail -1 >&2
+fi
 
 NG_FILE="/dev/shm/udepot-ng-perf.store"
 LEGACY_FILE="/dev/shm/udepot-legacy-perf.store"
