@@ -5,6 +5,8 @@
 #include <cstring>
 #include <span>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "udepot/buffer.h"
 #include "udepot/coro.h"
@@ -122,7 +124,6 @@ private:
     Rcu rcu_;
     IO io_;
     Directory* directory_ = nullptr;
-    Rcu::Token rcu_token_{};
     uint32_t grain_size_ = 512;
     uint64_t total_grains_ = 0;
 
@@ -152,6 +153,13 @@ private:
     off_t grain_to_offset(uint64_t grain) const {
         return static_cast<off_t>(grain) * grain_size_;
     }
+
+    // Per-thread RCU token.  Each calling thread lazily registers with
+    // the RCU subsystem on first use.  Tokens are cleaned up when the
+    // thread exits (thread_local destructor).  Safe only when coroutines
+    // are driven by run_sync() on the calling thread — a coroutine that
+    // migrates threads would need a different scheme.
+    Rcu::Token thread_token();
 
     // Read the on-disk header at a given PBA and verify the key matches.
     // Returns 0 if the key matches, ENOENT if it doesn't.

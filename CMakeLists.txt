@@ -59,6 +59,7 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(aio_test        test/io/aio_test.cc)
     udepot_add_test(store_test      test/store_test.cc)
     udepot_add_test(aio_store_test  test/aio_store_test.cc)
+    udepot_add_test(concurrent_store_test test/concurrent_store_test.cc)
 
     # Perf benchmark binary (not a gtest — standalone executable).
     add_executable(udepot_ng_bench test/perf/udepot_ng_bench.cc)

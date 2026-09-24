@@ -46,6 +46,28 @@ UDepot<IO>::UDepot() = default;
 template <typename IO>
 UDepot<IO>::~UDepot() { close(); }
 
+template <typename IO>
+Rcu::Token UDepot<IO>::thread_token() {
+    struct TokenEntry {
+        Rcu* rcu;
+        Rcu::Token token;
+    };
+    struct TokenStore {
+        std::vector<TokenEntry> entries;
+        ~TokenStore() {
+            for (auto& e : entries)
+                if (e.token.valid()) e.rcu->unregister_thread(e.token);
+        }
+    };
+    thread_local TokenStore store;
+    for (auto& e : store.entries) {
+        if (e.rcu == &rcu_) return e.token;
+    }
+    auto tok = rcu_.register_thread();
+    store.entries.push_back({&rcu_, tok});
+    return tok;
+}
+
 static inline uint64_t align_up(uint64_t val, uint64_t align) {
     return (val + align - 1) / align * align;
 }
@@ -58,7 +80,6 @@ int UDepot<IO>::open(const StoreConfig& config) {
     int rc = io_.open(config.path, config.size);
     if (rc != 0) return rc;
 
-    rcu_token_ = rcu_.register_thread();
     directory_ = new Directory(rcu_, config.initial_tables, config.index_bits);
 
     // Salsa initialization — matches uDepot's init_local().
@@ -106,8 +127,6 @@ int UDepot<IO>::open(const StoreConfig& config) {
         if (segment_size <= 1) {
             delete directory_;
             directory_ = nullptr;
-            rcu_.unregister_thread(rcu_token_);
-            rcu_token_ = Rcu::Token{};
             io_.close();
             return -EINVAL;
         }
@@ -120,8 +139,6 @@ int UDepot<IO>::open(const StoreConfig& config) {
         scm_ = nullptr;
         delete directory_;
         directory_ = nullptr;
-        rcu_.unregister_thread(rcu_token_);
-        rcu_token_ = Rcu::Token{};
         io_.close();
         return -rc;
     }
@@ -133,8 +150,6 @@ int UDepot<IO>::open(const StoreConfig& config) {
         scm_ = nullptr;
         delete directory_;
         directory_ = nullptr;
-        rcu_.unregister_thread(rcu_token_);
-        rcu_token_ = Rcu::Token{};
         io_.close();
         return -rc;
     }
@@ -157,10 +172,6 @@ void UDepot<IO>::close() {
 
     delete directory_;
     directory_ = nullptr;
-    if (rcu_token_.valid()) {
-        rcu_.unregister_thread(rcu_token_);
-        rcu_token_ = Rcu::Token{};
-    }
     io_.close();
 }
 
@@ -321,7 +332,8 @@ CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
     // Lookup-before-write: check if the key already exists in the
     // directory and update in place if so (upsert semantics, matching
     // legacy uDepot's local_put_mbuff / lookup_mbuff_put).
-    rcu_.read_lock(rcu_token_);
+    Rcu::Token tok = thread_token();
+    rcu_.read_lock(tok);
 
     uint64_t old_pba = UINT64_MAX;
     uint16_t old_kv_grains = 0;
@@ -348,7 +360,7 @@ CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
             hash, old_pba,
             static_cast<uint16_t>(grains_needed), grain);
         if (updated) {
-            rcu_.read_unlock(rcu_token_);
+            rcu_.read_unlock(tok);
             invalidate_grains(old_pba, old_kv_grains);
             co_return 0;
         }
@@ -359,7 +371,7 @@ CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
                             static_cast<uint16_t>(grains_needed),
                             grain);
 
-    rcu_.read_unlock(rcu_token_);
+    rcu_.read_unlock(tok);
 
     if (rc != 0) {
         invalidate_grains(grain, grains_needed);
@@ -410,8 +422,9 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
     if (key.empty()) co_return -EINVAL;
 
     uint64_t hash = hash_key(key);
+    Rcu::Token tok = thread_token();
 
-    rcu_.read_lock(rcu_token_);
+    rcu_.read_lock(tok);
 
     // Iterate through all tag-matching entries to handle collisions.
     for (uint32_t start = 0; ; ) {
@@ -426,7 +439,7 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
         size_t read_bytes = static_cast<size_t>(kv_grains) * grain_size_;
         IoBuffer buf = io_.alloc_buffer(read_bytes);
         if (!buf.data) {
-            rcu_.read_unlock(rcu_token_);
+            rcu_.read_unlock(tok);
             co_return -ENOMEM;
         }
 
@@ -455,7 +468,7 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
                         sizeof(suffix));
             uint16_t expected = compute_crc16(hdr);
             if (suffix.crc16 != expected) {
-                rcu_.read_unlock(rcu_token_);
+                rcu_.read_unlock(tok);
                 co_return -EIO;
             }
         }
@@ -468,11 +481,11 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
             std::memcpy(val_out, p + sizeof(hdr) + hdr.key_size, to_copy);
         }
 
-        rcu_.read_unlock(rcu_token_);
+        rcu_.read_unlock(tok);
         co_return 0;
     }
 
-    rcu_.read_unlock(rcu_token_);
+    rcu_.read_unlock(tok);
     co_return -ENOENT;
 }
 
@@ -481,8 +494,9 @@ CoroTask<int> UDepot<IO>::del(std::span<const uint8_t> key) {
     if (key.empty()) co_return -EINVAL;
 
     uint64_t hash = hash_key(key);
+    Rcu::Token tok = thread_token();
 
-    rcu_.read_lock(rcu_token_);
+    rcu_.read_lock(tok);
 
     for (uint32_t start = 0; ; ) {
         HashEntry entry = directory_->lookup(hash, start);
@@ -498,7 +512,7 @@ CoroTask<int> UDepot<IO>::del(std::span<const uint8_t> key) {
 
         bool removed = directory_->remove(hash, pba);
 
-        rcu_.read_unlock(rcu_token_);
+        rcu_.read_unlock(tok);
 
         if (removed) {
             invalidate_grains(pba, kv_grains);
@@ -508,7 +522,7 @@ CoroTask<int> UDepot<IO>::del(std::span<const uint8_t> key) {
         co_return -ENOENT;
     }
 
-    rcu_.read_unlock(rcu_token_);
+    rcu_.read_unlock(tok);
     co_return -ENOENT;
 }
 
@@ -518,8 +532,9 @@ CoroTask<int> UDepot<IO>::exists(std::span<const uint8_t> key,
     if (key.empty()) co_return -EINVAL;
 
     uint64_t hash = hash_key(key);
+    Rcu::Token tok = thread_token();
 
-    rcu_.read_lock(rcu_token_);
+    rcu_.read_lock(tok);
 
     for (uint32_t start = 0; ; ) {
         HashEntry entry = directory_->lookup(hash, start);
@@ -534,13 +549,13 @@ CoroTask<int> UDepot<IO>::exists(std::span<const uint8_t> key,
         int rc = co_await verify_key_at_pba(pba, kv_grains, key, &hdr);
         if (rc != 0) continue;
 
-        rcu_.read_unlock(rcu_token_);
+        rcu_.read_unlock(tok);
 
         if (val_size_out) *val_size_out = hdr.val_size;
         co_return 0;
     }
 
-    rcu_.read_unlock(rcu_token_);
+    rcu_.read_unlock(tok);
     co_return -ENOENT;
 }
 
