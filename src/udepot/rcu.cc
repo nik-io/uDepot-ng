@@ -8,6 +8,11 @@
 
 namespace udepot {
 
+uint64_t Rcu::next_id() noexcept {
+    static std::atomic<uint64_t> counter{1};
+    return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
 Rcu::Token Rcu::register_thread() noexcept {
     uint32_t slot = thread_count_.fetch_add(1, std::memory_order_relaxed);
     assert(slot < kMaxThreads && "too many RCU threads");

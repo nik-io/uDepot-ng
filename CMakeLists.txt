@@ -46,6 +46,20 @@ target_include_directories(udepot PUBLIC
 target_compile_features(udepot PUBLIC cxx_std_23)
 target_link_libraries(udepot PUBLIC salsa cityhash)
 
+# ── io_uring backend ─────────────────────────────────────────────────────────
+if(UDEPOT_BUILD_URING)
+    find_library(LIBURING_LIB uring)
+    find_path(LIBURING_INCLUDE liburing.h)
+    if(NOT LIBURING_LIB OR NOT LIBURING_INCLUDE)
+        message(STATUS "liburing not found — disabling io_uring backend")
+        set(UDEPOT_BUILD_URING OFF)
+    else()
+        target_sources(udepot PRIVATE src/udepot/io/uring.cc)
+        target_compile_definitions(udepot PUBLIC UDEPOT_BUILD_URING=1)
+        target_link_libraries(udepot PUBLIC ${LIBURING_LIB})
+    endif()
+endif()
+
 # ── SPDK backend ─────────────────────────────────────────────────────────────
 if(UDEPOT_BUILD_SPDK)
     if(NOT DEFINED SPDK_DIR)
@@ -137,6 +151,12 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(aio_queue_depth_test test/aio_queue_depth_test.cc)
     set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 120)
     udepot_add_test(net_test test/io/net_test.cc)
+
+    if(UDEPOT_BUILD_URING)
+        udepot_add_test(uring_test test/io/uring_test.cc)
+        udepot_add_test(uring_store_test test/uring_store_test.cc)
+        udepot_add_test(concurrent_uring_store_test test/concurrent_uring_store_test.cc)
+    endif()
 
     if(UDEPOT_BUILD_SPDK)
         udepot_add_test(spdk_test test/io/spdk_test.cc)

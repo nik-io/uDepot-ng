@@ -11,6 +11,9 @@
 
 #include "udepot/io/aio.h"
 #include "udepot/io/posix.h"
+#ifdef UDEPOT_BUILD_URING
+#include "udepot/io/uring.h"
+#endif
 #ifdef UDEPOT_BUILD_SPDK
 #include "udepot/io/spdk.h"
 #endif
@@ -19,6 +22,34 @@
 #include "frontends/usalsa++/SalsaMD.hh"
 
 namespace udepot {
+
+namespace {
+
+struct TokenEntry {
+    Rcu* rcu;
+    uint64_t rcu_id;
+    Rcu::Token token;
+};
+
+struct TokenStore {
+    std::vector<TokenEntry> entries;
+};
+
+thread_local TokenStore tl_tokens;
+
+void purge_thread_token(Rcu* rcu) {
+    auto& entries = tl_tokens.entries;
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        if (it->rcu == rcu) {
+            if (it->rcu_id == rcu->id() && it->token.valid())
+                rcu->unregister_thread(it->token);
+            entries.erase(it);
+            return;
+        }
+    }
+}
+
+}  // namespace
 
 // CRC-CCITT (0x1021) lookup table, computed at compile time.
 static constexpr auto kCrc16Table = [] {
@@ -54,23 +85,16 @@ UDepot<IO>::~UDepot() { close(); }
 
 template <typename IO>
 Rcu::Token UDepot<IO>::thread_token() {
-    struct TokenEntry {
-        Rcu* rcu;
-        Rcu::Token token;
-    };
-    struct TokenStore {
-        std::vector<TokenEntry> entries;
-        ~TokenStore() {
-            for (auto& e : entries)
-                if (e.token.valid()) e.rcu->unregister_thread(e.token);
-        }
-    };
-    thread_local TokenStore store;
-    for (auto& e : store.entries) {
-        if (e.rcu == &rcu_) return e.token;
+    auto& entries = tl_tokens.entries;
+    for (auto& e : entries) {
+        if (e.rcu != &rcu_) continue;
+        if (e.rcu_id == rcu_.id()) return e.token;
+        e.token = rcu_.register_thread();
+        e.rcu_id = rcu_.id();
+        return e.token;
     }
     auto tok = rcu_.register_thread();
-    store.entries.push_back({&rcu_, tok});
+    entries.push_back({&rcu_, rcu_.id(), tok});
     return tok;
 }
 
@@ -179,6 +203,7 @@ void UDepot<IO>::close() {
     delete directory_;
     directory_ = nullptr;
     io_.close();
+    purge_thread_token(&rcu_);
 }
 
 template <typename IO>
@@ -568,6 +593,9 @@ CoroTask<int> UDepot<IO>::exists(std::span<const uint8_t> key,
 // Explicit instantiations.
 template class UDepot<PosixIO>;
 template class UDepot<AioIO>;
+#ifdef UDEPOT_BUILD_URING
+template class UDepot<UringIO>;
+#endif
 #ifdef UDEPOT_BUILD_SPDK
 template class UDepot<SpdkIO>;
 #endif
