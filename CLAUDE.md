@@ -30,6 +30,16 @@
    Check in only when different readings would lead to materially different
    work.
 8. **Delegate to a subagent only for large, genuinely independent tasks.**
+9. **This is a refactoring of uDepot — preserve its design choices.** uDepot-ng
+   must persist uDepot's architecture and implementation choices except for the
+   specific changes identified at the beginning of the rewrite (userspace RCU
+   replacing per-bucket mutexes, C++23 eager-start coroutines replacing TRT,
+   simplified single-file build). When a question arises about how something
+   should work — yielding, polling, I/O submission, buffer management, hash
+   table layout, segment geometry — **check what uDepot does first** and match
+   it unless there is an explicit, agreed-upon reason to diverge. When unsure
+   whether a choice is covered by the rewrite plan or is a new divergence,
+   **ask before implementing.**
 
 ## Project Overview
 
