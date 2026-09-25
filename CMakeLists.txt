@@ -48,6 +48,7 @@ if(UDEPOT_BUILD_TESTS)
         add_executable(${name} ${source})
         target_link_libraries(${name} PRIVATE udepot GTest::gtest_main)
         add_test(NAME ${name} COMMAND ${name})
+        set_tests_properties(${name} PROPERTIES TIMEOUT 60)
     endfunction()
 
     udepot_add_test(coro_test       test/coro_test.cc)
@@ -61,6 +62,7 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(aio_store_test  test/aio_store_test.cc)
     udepot_add_test(concurrent_store_test test/concurrent_store_test.cc)
     udepot_add_test(concurrent_aio_store_test test/concurrent_aio_store_test.cc)
+    udepot_add_test(aio_queue_depth_test test/aio_queue_depth_test.cc)
 
     # Perf benchmark binary (not a gtest — standalone executable).
     add_executable(udepot_ng_bench test/perf/udepot_ng_bench.cc)

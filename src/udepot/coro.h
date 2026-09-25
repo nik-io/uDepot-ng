@@ -5,6 +5,7 @@
 #include <coroutine>
 #include <cstdint>
 #include <exception>
+#include <thread>
 #include <utility>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -77,10 +78,14 @@ public:
     // For sync backends (PosixIO), the coroutine completes eagerly.
     // For async backends (AioIO), spins until the poller resumes it.
     T run_sync() {
-        while (!handle_.promise().completed_.load(std::memory_order_acquire)) {
+        for (uint32_t spins = 0;
+             !handle_.promise().completed_.load(std::memory_order_acquire);
+             ++spins) {
 #if defined(__x86_64__) || defined(_M_X64)
             _mm_pause();
 #endif
+            if ((spins & 0xFFFF) == 0 && spins > 0)
+                std::this_thread::yield();
         }
         T result = handle_.promise().result_;
         destroy();
