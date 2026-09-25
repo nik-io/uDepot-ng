@@ -122,6 +122,18 @@ if(UDEPOT_BUILD_SPDK)
     )
 endif()
 
+# ── Memcache server ─────────────────────────────────────────────────────────
+if(UDEPOT_BUILD_NET)
+    add_library(udepot_memcache STATIC src/net/memcache.cc)
+    target_include_directories(udepot_memcache PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    )
+    target_link_libraries(udepot_memcache PUBLIC udepot)
+    if(UDEPOT_BUILD_URING)
+        target_compile_definitions(udepot_memcache PRIVATE UDEPOT_BUILD_URING=1)
+    endif()
+endif()
+
 # ── Python bindings (libpyudepot.so) ─────────────────────────────────────────
 if(UDEPOT_BUILD_PYTHON)
     add_library(pyudepot SHARED src/python/pyudepot.cc)
@@ -183,6 +195,13 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(aio_queue_depth_test test/aio_queue_depth_test.cc)
     set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 180)
     udepot_add_test(net_test test/io/net_test.cc)
+
+    if(UDEPOT_BUILD_NET)
+        add_executable(memcache_test test/memcache_test.cc)
+        target_link_libraries(memcache_test PRIVATE udepot_memcache GTest::gtest_main)
+        add_test(NAME memcache_test COMMAND memcache_test)
+        set_tests_properties(memcache_test PROPERTIES TIMEOUT 60)
+    endif()
 
     if(UDEPOT_BUILD_URING)
         udepot_add_test(uring_test test/io/uring_test.cc)
