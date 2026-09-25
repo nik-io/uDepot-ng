@@ -10,6 +10,7 @@ option(UDEPOT_BUILD_URING  "Build io_uring backend"         ON)
 option(UDEPOT_BUILD_AIO    "Build Linux AIO backend"        ON)
 option(UDEPOT_BUILD_NET    "Build network/memcache server"  ON)
 option(UDEPOT_BUILD_PYTHON "Build pyudepot shared library"  ON)
+option(UDEPOT_BUILD_JNI    "Build JNI bindings"              OFF)
 option(UDEPOT_BUILD_TESTS  "Build test suite"               ON)
 
 # Vendored dependencies — built before our warning flags so -Werror
@@ -44,6 +45,7 @@ target_include_directories(udepot PUBLIC
     $<INSTALL_INTERFACE:src>
 )
 target_compile_features(udepot PUBLIC cxx_std_23)
+set_target_properties(udepot PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(udepot PUBLIC salsa cityhash)
 
 # ── io_uring backend ─────────────────────────────────────────────────────────
@@ -120,6 +122,21 @@ if(UDEPOT_BUILD_SPDK)
     )
 endif()
 
+# ── JNI bindings ─────────────────────────────────────────────────────────────
+if(UDEPOT_BUILD_JNI)
+    find_package(JNI REQUIRED)
+    add_library(uDepotJNI SHARED src/jni/udepot_jni.cc)
+    target_include_directories(uDepotJNI PRIVATE
+        ${JNI_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/jni
+    )
+    target_link_libraries(uDepotJNI PRIVATE udepot)
+    set_target_properties(uDepotJNI PROPERTIES
+        OUTPUT_NAME uDepotJNI
+        PREFIX "lib"
+    )
+endif()
+
 if(UDEPOT_BUILD_TESTS)
     enable_testing()
     include(FetchContent)
@@ -156,6 +173,48 @@ if(UDEPOT_BUILD_TESTS)
         udepot_add_test(uring_test test/io/uring_test.cc)
         udepot_add_test(uring_store_test test/uring_store_test.cc)
         udepot_add_test(concurrent_uring_store_test test/concurrent_uring_store_test.cc)
+    endif()
+
+    if(UDEPOT_BUILD_JNI)
+        find_package(Java REQUIRED)
+        set(JNI_JAVA_SRC
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/jni/com/ibm/udepot/uDepotJNI.java
+        )
+        set(JNI_TEST_SRC
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/jni/UDepotJNITest.java
+        )
+        set(JNI_CLASSES_DIR ${CMAKE_CURRENT_BINARY_DIR}/jni-classes)
+        file(MAKE_DIRECTORY ${JNI_CLASSES_DIR})
+        add_custom_command(
+            OUTPUT ${JNI_CLASSES_DIR}/com/ibm/udepot/uDepotJNI.class
+            COMMAND ${Java_JAVAC_EXECUTABLE}
+                -d ${JNI_CLASSES_DIR}
+                ${JNI_JAVA_SRC}
+            DEPENDS ${JNI_JAVA_SRC}
+            COMMENT "Compiling uDepotJNI.java"
+        )
+        add_custom_command(
+            OUTPUT ${JNI_CLASSES_DIR}/UDepotJNITest.class
+            COMMAND ${Java_JAVAC_EXECUTABLE}
+                -cp ${JNI_CLASSES_DIR}
+                -d ${JNI_CLASSES_DIR}
+                ${JNI_TEST_SRC}
+            DEPENDS ${JNI_TEST_SRC}
+                    ${JNI_CLASSES_DIR}/com/ibm/udepot/uDepotJNI.class
+            COMMENT "Compiling UDepotJNITest.java"
+        )
+        add_custom_target(jni_classes ALL
+            DEPENDS ${JNI_CLASSES_DIR}/com/ibm/udepot/uDepotJNI.class
+                    ${JNI_CLASSES_DIR}/UDepotJNITest.class
+        )
+        add_test(
+            NAME jni_test
+            COMMAND ${Java_JAVA_EXECUTABLE}
+                -cp ${JNI_CLASSES_DIR}
+                -Djava.library.path=$<TARGET_FILE_DIR:uDepotJNI>
+                UDepotJNITest
+        )
+        set_tests_properties(jni_test PROPERTIES TIMEOUT 60)
     endif()
 
     if(UDEPOT_BUILD_SPDK)
