@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -53,6 +55,8 @@ struct StoreConfig {
     uint64_t segment_size = 0;
     // Overprovision in per-mille (200 = 20% reserved for GC).
     uint32_t overprovision = 200;
+    // Destroy any existing data on the device and start fresh.
+    bool force_destroy = false;
 };
 
 // High-performance KV store, parameterized on the I/O backend.
@@ -135,6 +139,12 @@ private:
     uint64_t seg_md_grains_ = 0;
     Rcu::Token gc_rcu_token_{};
 
+    // Crash recovery metadata.
+    uint64_t seed_ = 0;
+    uint64_t num_segments_ = 0;
+    std::unique_ptr<std::atomic<uint64_t>[]> seg_timestamps_;
+    std::unique_ptr<std::atomic<bool>[]> seg_md_dirty_;
+
     // SalsaCtlr overrides — called from salsa's GC thread.
     int gc_callback(u64 grain_start, u64 grain_nr) override;
     void seg_md_callback(u64 grain_start, u64 grain_nr) override;
@@ -143,6 +153,20 @@ private:
     void invalidate_grains(uint64_t grain, uint64_t count);
 
     static uint16_t compute_crc16(const KvHeader& hdr);
+    static uint32_t compute_crc32(uint32_t seed, const uint8_t* data,
+                                  size_t len);
+
+    // Device metadata: sits at the tail past the last whole segment.
+    uint64_t dev_md_grain_offset() const;
+    int persist_dev_md();
+    bool validate_dev_md(salsa::salsa_dev_md* md_out);
+
+    // Segment metadata: written at the tail of each segment.
+    int persist_seg_md(uint64_t grain_start, uint64_t timestamp);
+    bool validate_seg_md(const salsa::salsa_seg_md& md) const;
+
+    // Full crash recovery: scan all segments, rebuild directory.
+    int crash_recovery();
 
     size_t kv_total_bytes(size_t key_size, size_t val_size) const {
         return sizeof(KvHeader) + key_size + val_size + sizeof(KvSuffix);
@@ -163,6 +187,10 @@ private:
     // are driven by run_sync() on the calling thread — a coroutine that
     // migrates threads would need a different scheme.
     Rcu::Token thread_token();
+
+    // Persist segment metadata for the segment containing `grain` if it
+    // has not been written yet.  Called from coroutine context (put/del).
+    CoroTask<int> ensure_seg_md(uint64_t grain);
 
     // Read the on-disk header at a given PBA and verify the key matches.
     // Returns 0 if the key matches, ENOENT if it doesn't.
