@@ -15,7 +15,18 @@ option(UDEPOT_BUILD_TESTS  "Build test suite"               ON)
 # Vendored dependencies — built before our warning flags so -Werror
 # doesn't hit vendored code.
 add_subdirectory(extern/salsa)
-add_subdirectory(extern/cityhash)
+
+# cityhash (git submodule — no CMakeLists.txt upstream).
+add_library(cityhash STATIC extern/cityhash/src/city.cc)
+target_include_directories(cityhash
+    PUBLIC extern/cityhash/src
+    PRIVATE extern/cityhash-config
+)
+set_target_properties(cityhash PROPERTIES
+    CXX_STANDARD 11
+    POSITION_INDEPENDENT_CODE ON
+)
+target_compile_options(cityhash PRIVATE -Wno-sign-compare)
 
 # Our own warning flags — apply only to udepot targets, not vendored code.
 add_compile_options(-Wall -Wextra -Werror)
@@ -63,6 +74,7 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(concurrent_store_test test/concurrent_store_test.cc)
     udepot_add_test(concurrent_aio_store_test test/concurrent_aio_store_test.cc)
     udepot_add_test(aio_queue_depth_test test/aio_queue_depth_test.cc)
+    set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 120)
 
     # Perf benchmark binary (not a gtest — standalone executable).
     add_executable(udepot_ng_bench test/perf/udepot_ng_bench.cc)
