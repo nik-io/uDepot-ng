@@ -3,14 +3,9 @@
 #include <atomic>
 #include <cassert>
 #include <coroutine>
-#include <cstdint>
 #include <exception>
 #include <thread>
 #include <utility>
-
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#endif
 
 namespace udepot {
 
@@ -76,17 +71,12 @@ public:
 
     // Drive to completion from non-coroutine code.
     // For sync backends (PosixIO), the coroutine completes eagerly.
-    // For async backends (AioIO), spins until the poller resumes it.
+    // For async backends (AioIO), yields until the poller resumes it.
+    // TODO: reconsider busy-wait vs kernel-assisted wait (futex/eventfd)
+    // once we have real device latency measurements.
     T run_sync() {
-        for (uint32_t spins = 0;
-             !handle_.promise().completed_.load(std::memory_order_acquire);
-             ++spins) {
-#if defined(__x86_64__) || defined(_M_X64)
-            _mm_pause();
-#endif
-            if ((spins & 0xFFFF) == 0 && spins > 0)
-                std::this_thread::yield();
-        }
+        while (!handle_.promise().completed_.load(std::memory_order_acquire))
+            std::this_thread::yield();
         T result = handle_.promise().result_;
         destroy();
         return result;
