@@ -41,6 +41,20 @@ $ cmake -B build -DCMAKE_BUILD_TYPE=Release
 $ cmake --build build -j$(nproc)
 ```
 
+### Building with SPDK support
+
+To build with the SPDK NVMe backend:
+
+```
+$ cd extern/spdk
+$ git submodule update --init
+$ ./configure
+$ make -j$(nproc)
+$ cd ../..
+$ cmake -B build -DCMAKE_BUILD_TYPE=Release -DUDEPOT_BUILD_SPDK=ON
+$ cmake --build build -j$(nproc)
+```
+
 ## C++ usage example
 
 ```cpp

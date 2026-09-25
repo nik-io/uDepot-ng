@@ -11,6 +11,9 @@
 
 #include "udepot/io/aio.h"
 #include "udepot/io/posix.h"
+#ifdef UDEPOT_BUILD_SPDK
+#include "udepot/io/spdk.h"
+#endif
 
 #include "frontends/usalsa++/Scm.hh"
 #include "frontends/usalsa++/SalsaMD.hh"
@@ -565,5 +568,8 @@ CoroTask<int> UDepot<IO>::exists(std::span<const uint8_t> key,
 // Explicit instantiations.
 template class UDepot<PosixIO>;
 template class UDepot<AioIO>;
+#ifdef UDEPOT_BUILD_SPDK
+template class UDepot<SpdkIO>;
+#endif
 
 }  // namespace udepot

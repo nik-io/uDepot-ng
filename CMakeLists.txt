@@ -45,6 +45,66 @@ target_include_directories(udepot PUBLIC
 target_compile_features(udepot PUBLIC cxx_std_23)
 target_link_libraries(udepot PUBLIC salsa cityhash)
 
+# ── SPDK backend ─────────────────────────────────────────────────────────────
+if(UDEPOT_BUILD_SPDK)
+    if(NOT DEFINED SPDK_DIR)
+        if(DEFINED ENV{SPDK_DIR})
+            set(SPDK_DIR "$ENV{SPDK_DIR}")
+        else()
+            set(SPDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/spdk")
+        endif()
+    endif()
+
+    if(NOT EXISTS "${SPDK_DIR}/include/spdk/nvme.h")
+        message(FATAL_ERROR
+            "SPDK_DIR=${SPDK_DIR} does not contain include/spdk/nvme.h.\n"
+            "Build SPDK first: cd extern/spdk && git submodule update --init "
+            "&& ./configure && make -j$(nproc)")
+    endif()
+
+    target_sources(udepot PRIVATE src/udepot/io/spdk.cc)
+    target_compile_definitions(udepot PUBLIC UDEPOT_BUILD_SPDK=1)
+
+    target_include_directories(udepot PUBLIC
+        "${SPDK_DIR}/include"
+        "${SPDK_DIR}/dpdk/build/include"
+    )
+
+    # SPDK and DPDK static libraries.  The order matters for static linking.
+    set(SPDK_LIBS
+        "${SPDK_DIR}/build/lib/libspdk_nvme.a"
+        "${SPDK_DIR}/build/lib/libspdk_env_dpdk.a"
+        "${SPDK_DIR}/build/lib/libspdk_env_dpdk_rpc.a"
+        "${SPDK_DIR}/build/lib/libspdk_util.a"
+        "${SPDK_DIR}/build/lib/libspdk_log.a"
+        "${SPDK_DIR}/build/lib/libspdk_sock.a"
+        "${SPDK_DIR}/build/lib/libspdk_sock_posix.a"
+        "${SPDK_DIR}/build/lib/libspdk_json.a"
+        "${SPDK_DIR}/build/lib/libspdk_jsonrpc.a"
+        "${SPDK_DIR}/build/lib/libspdk_rpc.a"
+        "${SPDK_DIR}/build/lib/libspdk_trace.a"
+        "${SPDK_DIR}/build/lib/libspdk_vfio_user.a"
+    )
+
+    set(DPDK_LIBS
+        "${SPDK_DIR}/dpdk/build/lib/librte_eal.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_mempool.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_mempool_ring.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_ring.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_pci.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_bus_pci.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_kvargs.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_telemetry.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_log.a"
+    )
+
+    target_link_libraries(udepot PUBLIC
+        ${SPDK_LIBS}
+        ${DPDK_LIBS}
+        pthread dl rt numa uuid
+    )
+endif()
+
 if(UDEPOT_BUILD_TESTS)
     enable_testing()
     include(FetchContent)
@@ -75,6 +135,13 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(concurrent_aio_store_test test/concurrent_aio_store_test.cc)
     udepot_add_test(aio_queue_depth_test test/aio_queue_depth_test.cc)
     set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 120)
+
+    if(UDEPOT_BUILD_SPDK)
+        udepot_add_test(spdk_test test/io/spdk_test.cc)
+        udepot_add_test(spdk_store_test test/spdk_store_test.cc)
+        set_tests_properties(spdk_test PROPERTIES TIMEOUT 120)
+        set_tests_properties(spdk_store_test PROPERTIES TIMEOUT 120)
+    endif()
 
     # Perf benchmark binary (not a gtest — standalone executable).
     add_executable(udepot_ng_bench test/perf/udepot_ng_bench.cc)

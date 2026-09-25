@@ -8,6 +8,10 @@
 #include <cstdlib>
 #include <utility>
 
+#ifdef UDEPOT_BUILD_SPDK
+#include <rte_malloc.h>
+#endif
+
 namespace udepot {
 
 // How the buffer was allocated — determines the deallocation path.
@@ -74,6 +78,19 @@ struct IoBuffer {
         return {p, 0, size, BufferAlloc::kAligned};
     }
 
+    // Allocate a DMA-safe buffer (SPDK hugepage memory).
+    static IoBuffer alloc_dma(size_t size, size_t alignment = 512) {
+#ifdef UDEPOT_BUILD_SPDK
+        void* p = rte_malloc_socket(nullptr, size, alignment, SOCKET_ID_ANY);
+        if (!p) return {};
+        return {p, 0, size, BufferAlloc::kDma};
+#else
+        (void)alignment;
+        (void)size;
+        return {};
+#endif
+    }
+
     // Create a non-owning view into existing memory.
     static IoBuffer view(void* data, size_t length) {
         return {data, length, length, BufferAlloc::kNone};
@@ -92,7 +109,9 @@ private:
                 std::free(data);
                 break;
             case BufferAlloc::kDma:
-                // rte_free(data) — linked only when SPDK is built
+#ifdef UDEPOT_BUILD_SPDK
+                rte_free(data);
+#endif
                 break;
             case BufferAlloc::kNone:
                 break;
