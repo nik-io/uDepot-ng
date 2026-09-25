@@ -256,36 +256,33 @@ no-copy property end to end.
 uDepot-ng/
 ├── docs/
 │   └── architecture.md          # this document
-├── include/udepot/
+├── src/udepot/
 │   ├── store.h                  # UDepot<IO> — the single KV implementation
+│   ├── store.cc
 │   ├── directory.h              # RCU-protected hash directory
+│   ├── directory.cc
 │   ├── hash_table.h             # hopscotch table (lock-free reads)
+│   ├── hash_table.cc
 │   ├── hash_entry.h             # 8-byte packed hash entry
 │   ├── rcu.h                    # per-thread epoch-based userspace RCU
+│   ├── rcu.cc
 │   ├── buffer.h                 # IoBuffer, allocator tags
 │   ├── coro.h                   # CoroTask (eager start, symmetric transfer)
-│   ├── segment.h                # segment geometry, salsa GC
 │   └── io/
 │       ├── backend.h            # IoBackend concept
 │       ├── posix.h              # pread/pwrite (sync)
 │       ├── o_direct.h           # pread/pwrite with O_DIRECT (sync)
 │       ├── aio.h                # Linux AIO + poller
+│       ├── aio.cc
 │       ├── uring.h              # io_uring + poller
+│       ├── uring.cc
 │       ├── spdk.h               # SPDK/NVMe + poller, DMA buffers
+│       ├── spdk.cc
 │       ├── net.h                # socket I/O (epoll or io_uring)
+│       ├── net.cc
 │       └── poller.h             # shared poller infrastructure
-├── src/
-│   ├── store.cc
-│   ├── directory.cc
-│   ├── rcu.cc
-│   ├── segment.cc
-│   ├── io/
-│   │   ├── aio.cc
-│   │   ├── uring.cc
-│   │   ├── spdk.cc
-│   │   └── net.cc
-│   └── net/
-│       └── memcache.cc          # memcache protocol server
+├── src/net/
+│   └── memcache.cc              # memcache protocol server
 ├── python/
 │   ├── wrapper/
 │   │   ├── pyudepot.h           # C ABI (7 functions)
@@ -329,13 +326,35 @@ ccache is picked up automatically when present (same as the original).
 
 ## Python Bindings (pyudepot)
 
-The C ABI stays synchronous for the initial version — each call blocks via
-`run_sync()`. The Python `uDepot` class exposes the same 4-method surface
-flywheel uses today: `get`, `put`, `delete`, `exists`.
+**No thread-per-get.** Flywheel's old `ThreadPoolExecutor.submit(self.get, …)`
+per key in `multi_get` is exactly the overhead this rewrite eliminates. All I/O
+concurrency comes from the eager-start coroutine model — one thread, zero thread
+creation.
 
-An async Python API (asyncio-compatible) is planned as a follow-up. Not
-urgent — flywheel's `ThreadPoolExecutor` with GIL release works well with
-the sync API.
+The C ABI exposes both single-key and batch entry points:
+
+```c
+int udepot_get(udepot_t h, const void* key, uint32_t klen,
+               void* val, uint32_t vlen, uint32_t* val_size);
+
+int udepot_multi_get(udepot_t h, uint32_t n,
+                     const udepot_iov* keys,
+                     udepot_iov* vals,
+                     int* results);
+```
+
+`udepot_multi_get` launches N eager-start coroutines — each submits its I/O
+immediately — then drives the poller until all complete. On an async backend
+(uring, SPDK) this is true I/O concurrency from a single call, single thread.
+On the sync backend (posix) the coroutines never suspend, so it degrades to
+sequential I/O — correct but not concurrent, same as today.
+
+The Python `uDepot` class exposes `get`, `put`, `delete`, `exists`, and
+`multi_get`. `multi_get` is a single ctypes call into `udepot_multi_get`, not a
+Python-side thread pool.
+
+An async Python API (asyncio-compatible, mapping each coroutine to an asyncio
+future) is planned as a follow-up once the async backends are working.
 
 ## On-Disk Format
 
@@ -363,5 +382,8 @@ not the persistent format.
     server.
 
 The first milestone is `UDepot<PosixIO>` passing the existing test suite —
-RCU directory, lock-free gets, hopscotch table, sync I/O. Everything after
-that adds backends and protocol support.
+RCU directory, lock-free gets, hopscotch table, sync I/O. **v0 is not
+complete until the perf regression test passes**: uDepot-ng must be strictly
+equal to or faster than uDepot on every operation (put, get, exists, delete),
+measured head-to-head in the same run. Everything after that adds backends and
+protocol support.

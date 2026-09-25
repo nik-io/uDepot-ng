@@ -1,0 +1,6 @@
+#ifndef CITYHASH_CONFIG_H_
+#define CITYHASH_CONFIG_H_
+
+#define HAVE_BUILTIN_EXPECT 1
+
+#endif

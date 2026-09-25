@@ -30,6 +30,16 @@
    Check in only when different readings would lead to materially different
    work.
 8. **Delegate to a subagent only for large, genuinely independent tasks.**
+9. **This is a refactoring of uDepot — preserve its design choices.** uDepot-ng
+   must persist uDepot's architecture and implementation choices except for the
+   specific changes identified at the beginning of the rewrite (userspace RCU
+   replacing per-bucket mutexes, C++23 eager-start coroutines replacing TRT,
+   simplified single-file build). When a question arises about how something
+   should work — yielding, polling, I/O submission, buffer management, hash
+   table layout, segment geometry — **check what uDepot does first** and match
+   it unless there is an explicit, agreed-upon reason to diverge. When unsure
+   whether a choice is covered by the rewrite plan or is a new divergence,
+   **ask before implementing.**
 
 ## Project Overview
 
@@ -54,6 +64,11 @@ These are foundational constraints. Every change must preserve them.
    overhead beyond what the log-structured allocator needs.
 4. **Enterprise-grade crash recovery only**: Either the recovery path is
    correct and complete, or it does not exist.
+5. **No thread-per-operation**: I/O concurrency comes from the eager-start
+   coroutine model (submit N I/Os, drive the poller, harvest completions),
+   not from spawning threads. A `multi_get` of 100 keys uses one thread
+   and 100 coroutines, not 100 threads. This is what the coroutine rewrite
+   exists to deliver.
 
 ## Style Guide
 
@@ -93,3 +108,41 @@ ctest --test-dir build
 - A failing test must fail the build — never silently exit 0
 - SPDK tests require `UDEPOT_BUILD_SPDK=ON` and a configured SPDK environment
 - Non-SPDK tests must always pass
+
+### Performance regression gate
+
+**uDepot-ng must be strictly equal to or faster than uDepot on every
+operation.** This is a v0 completion criterion, not a stretch goal. The perf
+test builds both uDepot (from the submodule in flywheel) and uDepot-ng, runs
+the same workload against each in the same process, and fails if uDepot-ng is
+slower on any operation.
+
+The test runs interleaved (uDepot, uDepot-ng, uDepot, uDepot-ng, …) to cancel
+shared drift, measures median latency per operation (put, get, exists, delete),
+and asserts `median_ng <= median_legacy` for each. A small tolerance (default
+5%) absorbs per-pair noise; a real regression is far larger.
+
+Both sides use the same I/O backend, same grain size, same store size, same
+device (`/dev/shm` for deterministic cache-bound measurement — same rationale as
+uDepot's own zero-copy perf test). The comparison is apples-to-apples: same
+on-disk format, same hash function (CityHash64), same operations. Legacy uDepot
+must be built at `BUILD_TYPE=PERFORMANCE` (`-O3 -DNDEBUG`) to match uDepot-ng's
+cmake Release build; `perf-regression.sh` does this automatically.
+
+The speed gap is genuine, not a benchmark artifact. With both at -O3, uDepot-ng
+is 2-7x faster. The overhead sources in legacy, per strace:
+
+- **PUT**: Mbuff allocation + copy per operation, pwritev (scatter-gather) vs
+  pwrite64 (flat buffer), TRT coroutine scheduling overhead, virtual dispatch
+  through `uDepotIO_`. I/O counts are identical (one pread for lookup-before-write
+  + one pwrite for data, on both sides).
+- **GET/EXISTS**: Same I/O count (one pread each). Legacy takes a per-bucket
+  mutex on every read — the architectural change RCU eliminates. Plus
+  Mbuff/TRT/vtable overhead.
+- **DEL**: All of the above, plus legacy writes a tombstone to disk for every
+  delete (500 extra pwritev per 500 DEL ops). uDepot-ng removes the directory
+  entry and invalidates grains without a disk write. Tombstones serve crash
+  recovery (so `restore()` knows a key was deleted); uDepot-ng has no restore
+  path yet, so omitting them is consistent with the "enterprise-grade crash
+  recovery only" principle. When restore is added, DEL will need tombstones and
+  the DEL speedup will narrow.
