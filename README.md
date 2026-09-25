@@ -1,4 +1,4 @@
-# uDepot-ng Key Value Store
+# uDepot Next Generation (uDepot-ng)
 
 A ground-up rewrite of [uDepot](https://github.com/nik-io/uDepot) — a
 multi-threaded, scalable, persistent store that is flash optimized by using
@@ -125,12 +125,20 @@ against `/dev/shm` or other buffered backends.
 
 ## Notes
 
-- Crash recovery: Not yet implemented. Consistent with the "enterprise-grade
-  crash recovery only" principle — either the recovery path is correct and
-  complete, or it does not exist. When added, it will follow uDepot's approach.
+- Crash recovery is not yet implemented.
 
 - Best performance is expected when using the AIO backend with batched
   coroutines for queue-depth scaling.
+
+## Roadmap
+
+- **Crash recovery** — persist and restore from the uDepot data log
+- **SPDK backend** — NVMe direct access via SPDK queue pairs
+- **io_uring backend** — kernel-side I/O submission ring
+- **Network backends** — memcache protocol server (TCP/RDMA), NVMe over Fabrics
+- **Python API** — ctypes bindings to `libpyudepot.so`
+- **Java JNI API** — JNI bindings and YCSB benchmark integration
+- **Directory grow** — deferred reclaim of retired directories, gradual per-table growth
 
 ## License
 
