@@ -117,9 +117,9 @@ for (auto& task : tasks)
 $ ctest --test-dir build
 ```
 
-12 test suites covering the coroutine runtime, RCU, hash table, directory,
-both I/O backends, the full KV API, concurrent correctness, and async
-queue-depth scaling.
+13 test suites covering the coroutine runtime, RCU, hash table, directory,
+I/O backends (posix, aio), network (epoll), the full KV API, concurrent
+correctness, and async queue-depth scaling.
 
 ### Using a block device
 

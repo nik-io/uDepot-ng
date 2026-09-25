@@ -37,6 +37,7 @@ add_library(udepot
     src/udepot/directory.cc
     src/udepot/store.cc
     src/udepot/io/aio.cc
+    src/udepot/io/net.cc
 )
 target_include_directories(udepot PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
@@ -135,6 +136,7 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(concurrent_aio_store_test test/concurrent_aio_store_test.cc)
     udepot_add_test(aio_queue_depth_test test/aio_queue_depth_test.cc)
     set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 120)
+    udepot_add_test(net_test test/io/net_test.cc)
 
     if(UDEPOT_BUILD_SPDK)
         udepot_add_test(spdk_test test/io/spdk_test.cc)
