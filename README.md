@@ -20,6 +20,8 @@ allocation and GC is described in the [MASCOTS18 paper](https://ieeexplore.ieee.
   harvest completions for queue-depth scaling
 - **CMake** replaces the Makefile build
 - **No TRT dependency** — standalone runtime, no separate scheduler
+- **SPDK backend** — NVMe direct access via SPDK queue pairs, NVMe-oF
+  support via `UDEPOT_NVMEF` env var
 
 Everything else — on-disk format, hash function (CityHash64), segment
 geometry, salsa allocator, I/O backend structure — is preserved from uDepot.
@@ -147,7 +149,6 @@ against `/dev/shm` or other buffered backends.
 ## Roadmap
 
 - **Crash recovery** — persist and restore from the uDepot data log
-- **SPDK backend** — NVMe direct access via SPDK queue pairs
 - **io_uring backend** — kernel-side I/O submission ring
 - **Network backends** — memcache protocol server (TCP/RDMA), NVMe over Fabrics
 - **Python API** — ctypes bindings to `libpyudepot.so`
