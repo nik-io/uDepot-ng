@@ -2,7 +2,7 @@
 
 A ground-up rewrite of [uDepot](https://github.com/nik-io/uDepot) — a
 multi-threaded, scalable, persistent store that is flash optimized by using
-a log-structured space allocation and GC framework.
+a log-structured space allocation, state of the art GC algorithms. It minimizes read and write amplification factors to preserve the underlying‘s device performance at the application level as much as possible.
 
 It uses a two-level directory map table as the main data structure
 that grows together with the data and will utilize as much capacity as
@@ -11,17 +11,16 @@ possible before returning out of space.
 See the [FAST19 paper](https://www.usenix.org/system/files/fast19-kourtis.pdf) for more details on uDepot. The log-structured space
 allocation and GC is described in the [MASCOTS18 paper](https://ieeexplore.ieee.org/document/8526893).
 
-### What changed from uDepot
+### What changes from uDepot
 
 - **Userspace RCU** replaces per-bucket mutexes — lock-free reads, per-thread
   epoch with zero shared-line atomic RMW on the read path
 - **Eager-start C++23 coroutines** replace TRT — `initial_suspend = suspend_never`,
   so creating a CoroTask immediately submits I/O; batch N coroutines then
   harvest completions for queue-depth scaling
-- **CMake** replaces the Makefile build
-- **No TRT dependency** — standalone runtime, no separate scheduler
 
-Everything else — on-disk format, hash function (CityHash64), segment
+
+Everything else — on-disk format, hash function, segment
 geometry, salsa allocator, I/O backend structure — is preserved from uDepot.
 
 ## Install
@@ -114,14 +113,13 @@ truncated**, so set `size` to the device capacity.
 **Device size must not be an exact multiple of the segment size.** uDepot puts
 its device metadata in the tail left over after `align_down(device_size,
 segment_size * grain_size)`. A device whose size divides exactly leaves no
-tail, and init fails. This is why file-backed examples use sizes like
-`64 * 1024 * 1024 + 1`.
+tail, and init fails.
 
 Note the grain size: with an O_DIRECT backend every write must be a multiple
 of the device sector size, and uDepot-ng sizes its segment metadata writes in
 grains. A grain smaller than the sector size makes those writes fail with
 `EINVAL`. Use `grain_size = 512` or `4096`; small grain sizes work only
-against `/dev/shm` or other buffered backends.
+against buffered IO backend. 
 
 ## Notes
 
