@@ -122,6 +122,19 @@ if(UDEPOT_BUILD_SPDK)
     )
 endif()
 
+# ── Python bindings (libpyudepot.so) ─────────────────────────────────────────
+if(UDEPOT_BUILD_PYTHON)
+    add_library(pyudepot SHARED src/python/pyudepot.cc)
+    target_include_directories(pyudepot PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/python
+    )
+    target_link_libraries(pyudepot PRIVATE udepot)
+    set_target_properties(pyudepot PROPERTIES
+        OUTPUT_NAME pyudepot
+        PREFIX "lib"
+    )
+endif()
+
 # ── JNI bindings ─────────────────────────────────────────────────────────────
 if(UDEPOT_BUILD_JNI)
     find_package(JNI REQUIRED)
@@ -173,6 +186,19 @@ if(UDEPOT_BUILD_TESTS)
         udepot_add_test(uring_test test/io/uring_test.cc)
         udepot_add_test(uring_store_test test/uring_store_test.cc)
         udepot_add_test(concurrent_uring_store_test test/concurrent_uring_store_test.cc)
+    endif()
+
+    if(UDEPOT_BUILD_PYTHON)
+        add_test(
+            NAME pyudepot_test
+            COMMAND ${CMAKE_COMMAND} -E env
+                "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:pyudepot>:$ENV{LD_LIBRARY_PATH}"
+                "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:$ENV{PYTHONPATH}"
+                python3 -m pytest
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_pyudepot.py
+                    -q --tb=short
+        )
+        set_tests_properties(pyudepot_test PROPERTIES TIMEOUT 60)
     endif()
 
     if(UDEPOT_BUILD_JNI)
