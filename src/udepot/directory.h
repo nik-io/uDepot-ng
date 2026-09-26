@@ -1,3 +1,6 @@
+// Copyright (c) 2024-2026 Nikolas Ioannou
+// SPDX-License-Identifier: BSD-3-Clause
+
 #pragma once
 
 #include <atomic>
@@ -80,8 +83,8 @@ public:
 private:
     Rcu& rcu_;
     uint32_t index_bits_;
-    std::atomic<DirSnapshot*> current_;
-    std::mutex grow_mutex_;
+    alignas(64) std::atomic<DirSnapshot*> current_;
+    alignas(64) std::mutex grow_mutex_;
 };
 
 }  // namespace udepot

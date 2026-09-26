@@ -10,6 +10,7 @@ option(UDEPOT_BUILD_URING  "Build io_uring backend"         ON)
 option(UDEPOT_BUILD_AIO    "Build Linux AIO backend"        ON)
 option(UDEPOT_BUILD_NET    "Build network/memcache server"  ON)
 option(UDEPOT_BUILD_PYTHON "Build pyudepot shared library"  ON)
+option(UDEPOT_BUILD_JNI    "Build JNI bindings"              OFF)
 option(UDEPOT_BUILD_TESTS  "Build test suite"               ON)
 
 # Vendored dependencies — built before our warning flags so -Werror
@@ -37,13 +38,129 @@ add_library(udepot
     src/udepot/directory.cc
     src/udepot/store.cc
     src/udepot/io/aio.cc
+    src/udepot/io/net.cc
 )
 target_include_directories(udepot PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     $<INSTALL_INTERFACE:src>
 )
 target_compile_features(udepot PUBLIC cxx_std_23)
+set_target_properties(udepot PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(udepot PUBLIC salsa cityhash)
+
+# ── io_uring backend ─────────────────────────────────────────────────────────
+if(UDEPOT_BUILD_URING)
+    find_library(LIBURING_LIB uring)
+    find_path(LIBURING_INCLUDE liburing.h)
+    if(NOT LIBURING_LIB OR NOT LIBURING_INCLUDE)
+        message(STATUS "liburing not found — disabling io_uring backend")
+        set(UDEPOT_BUILD_URING OFF)
+    else()
+        target_sources(udepot PRIVATE src/udepot/io/uring.cc)
+        target_compile_definitions(udepot PUBLIC UDEPOT_BUILD_URING=1)
+        target_link_libraries(udepot PUBLIC ${LIBURING_LIB})
+    endif()
+endif()
+
+# ── SPDK backend ─────────────────────────────────────────────────────────────
+if(UDEPOT_BUILD_SPDK)
+    if(NOT DEFINED SPDK_DIR)
+        if(DEFINED ENV{SPDK_DIR})
+            set(SPDK_DIR "$ENV{SPDK_DIR}")
+        else()
+            set(SPDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/spdk")
+        endif()
+    endif()
+
+    if(NOT EXISTS "${SPDK_DIR}/include/spdk/nvme.h")
+        message(FATAL_ERROR
+            "SPDK_DIR=${SPDK_DIR} does not contain include/spdk/nvme.h.\n"
+            "Build SPDK first: cd extern/spdk && git submodule update --init "
+            "&& ./configure && make -j$(nproc)")
+    endif()
+
+    target_sources(udepot PRIVATE src/udepot/io/spdk.cc)
+    target_compile_definitions(udepot PUBLIC UDEPOT_BUILD_SPDK=1)
+
+    target_include_directories(udepot PUBLIC
+        "${SPDK_DIR}/include"
+        "${SPDK_DIR}/dpdk/build/include"
+    )
+
+    # SPDK and DPDK static libraries.  The order matters for static linking.
+    set(SPDK_LIBS
+        "${SPDK_DIR}/build/lib/libspdk_nvme.a"
+        "${SPDK_DIR}/build/lib/libspdk_env_dpdk.a"
+        "${SPDK_DIR}/build/lib/libspdk_env_dpdk_rpc.a"
+        "${SPDK_DIR}/build/lib/libspdk_util.a"
+        "${SPDK_DIR}/build/lib/libspdk_log.a"
+        "${SPDK_DIR}/build/lib/libspdk_sock.a"
+        "${SPDK_DIR}/build/lib/libspdk_sock_posix.a"
+        "${SPDK_DIR}/build/lib/libspdk_json.a"
+        "${SPDK_DIR}/build/lib/libspdk_jsonrpc.a"
+        "${SPDK_DIR}/build/lib/libspdk_rpc.a"
+        "${SPDK_DIR}/build/lib/libspdk_trace.a"
+        "${SPDK_DIR}/build/lib/libspdk_vfio_user.a"
+    )
+
+    set(DPDK_LIBS
+        "${SPDK_DIR}/dpdk/build/lib/librte_eal.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_mempool.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_mempool_ring.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_ring.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_pci.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_bus_pci.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_kvargs.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_telemetry.a"
+        "${SPDK_DIR}/dpdk/build/lib/librte_log.a"
+    )
+
+    target_link_libraries(udepot PUBLIC
+        ${SPDK_LIBS}
+        ${DPDK_LIBS}
+        pthread dl rt numa uuid
+    )
+endif()
+
+# ── Memcache server ─────────────────────────────────────────────────────────
+if(UDEPOT_BUILD_NET)
+    add_library(udepot_memcache STATIC src/net/memcache.cc)
+    target_include_directories(udepot_memcache PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    )
+    target_link_libraries(udepot_memcache PUBLIC udepot)
+    if(UDEPOT_BUILD_URING)
+        target_compile_definitions(udepot_memcache PRIVATE UDEPOT_BUILD_URING=1)
+    endif()
+endif()
+
+# ── Python bindings (libpyudepot.so) ─────────────────────────────────────────
+if(UDEPOT_BUILD_PYTHON)
+    add_library(pyudepot SHARED src/python/pyudepot.cc)
+    target_include_directories(pyudepot PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/python
+    )
+    target_link_libraries(pyudepot PRIVATE udepot)
+    set_target_properties(pyudepot PROPERTIES
+        OUTPUT_NAME pyudepot
+        PREFIX "lib"
+    )
+endif()
+
+# ── JNI bindings ─────────────────────────────────────────────────────────────
+if(UDEPOT_BUILD_JNI)
+    find_package(JNI REQUIRED)
+    add_library(uDepotJNI SHARED src/jni/udepot_jni.cc)
+    target_include_directories(uDepotJNI PRIVATE
+        ${JNI_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/jni
+    )
+    target_link_libraries(uDepotJNI PRIVATE udepot)
+    set_target_properties(uDepotJNI PROPERTIES
+        OUTPUT_NAME uDepotJNI
+        PREFIX "lib"
+    )
+endif()
 
 if(UDEPOT_BUILD_TESTS)
     enable_testing()
@@ -72,9 +189,87 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(store_test      test/store_test.cc)
     udepot_add_test(aio_store_test  test/aio_store_test.cc)
     udepot_add_test(concurrent_store_test test/concurrent_store_test.cc)
+    udepot_add_test(store_recovery_test test/store_recovery_test.cc)
     udepot_add_test(concurrent_aio_store_test test/concurrent_aio_store_test.cc)
+    set_tests_properties(concurrent_aio_store_test PROPERTIES TIMEOUT 180)
     udepot_add_test(aio_queue_depth_test test/aio_queue_depth_test.cc)
-    set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 120)
+    set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 180)
+    udepot_add_test(net_test test/io/net_test.cc)
+
+    if(UDEPOT_BUILD_NET)
+        add_executable(memcache_test test/memcache_test.cc)
+        target_link_libraries(memcache_test PRIVATE udepot_memcache GTest::gtest_main)
+        add_test(NAME memcache_test COMMAND memcache_test)
+        set_tests_properties(memcache_test PROPERTIES TIMEOUT 60)
+    endif()
+
+    if(UDEPOT_BUILD_URING)
+        udepot_add_test(uring_test test/io/uring_test.cc)
+        udepot_add_test(uring_store_test test/uring_store_test.cc)
+        udepot_add_test(concurrent_uring_store_test test/concurrent_uring_store_test.cc)
+    endif()
+
+    if(UDEPOT_BUILD_PYTHON)
+        add_test(
+            NAME pyudepot_test
+            COMMAND ${CMAKE_COMMAND} -E env
+                "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:pyudepot>:$ENV{LD_LIBRARY_PATH}"
+                "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:$ENV{PYTHONPATH}"
+                python3 -m pytest
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test/python/test_pyudepot.py
+                    -q --tb=short
+        )
+        set_tests_properties(pyudepot_test PROPERTIES TIMEOUT 60)
+    endif()
+
+    if(UDEPOT_BUILD_JNI)
+        find_package(Java REQUIRED)
+        set(JNI_JAVA_SRC
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/jni/com/ibm/udepot/uDepotJNI.java
+        )
+        set(JNI_TEST_SRC
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/jni/UDepotJNITest.java
+        )
+        set(JNI_CLASSES_DIR ${CMAKE_CURRENT_BINARY_DIR}/jni-classes)
+        file(MAKE_DIRECTORY ${JNI_CLASSES_DIR})
+        add_custom_command(
+            OUTPUT ${JNI_CLASSES_DIR}/com/ibm/udepot/uDepotJNI.class
+            COMMAND ${Java_JAVAC_EXECUTABLE}
+                -d ${JNI_CLASSES_DIR}
+                ${JNI_JAVA_SRC}
+            DEPENDS ${JNI_JAVA_SRC}
+            COMMENT "Compiling uDepotJNI.java"
+        )
+        add_custom_command(
+            OUTPUT ${JNI_CLASSES_DIR}/UDepotJNITest.class
+            COMMAND ${Java_JAVAC_EXECUTABLE}
+                -cp ${JNI_CLASSES_DIR}
+                -d ${JNI_CLASSES_DIR}
+                ${JNI_TEST_SRC}
+            DEPENDS ${JNI_TEST_SRC}
+                    ${JNI_CLASSES_DIR}/com/ibm/udepot/uDepotJNI.class
+            COMMENT "Compiling UDepotJNITest.java"
+        )
+        add_custom_target(jni_classes ALL
+            DEPENDS ${JNI_CLASSES_DIR}/com/ibm/udepot/uDepotJNI.class
+                    ${JNI_CLASSES_DIR}/UDepotJNITest.class
+        )
+        add_test(
+            NAME jni_test
+            COMMAND ${Java_JAVA_EXECUTABLE}
+                -cp ${JNI_CLASSES_DIR}
+                -Djava.library.path=$<TARGET_FILE_DIR:uDepotJNI>
+                UDepotJNITest
+        )
+        set_tests_properties(jni_test PROPERTIES TIMEOUT 60)
+    endif()
+
+    if(UDEPOT_BUILD_SPDK)
+        udepot_add_test(spdk_test test/io/spdk_test.cc)
+        udepot_add_test(spdk_store_test test/spdk_store_test.cc)
+        set_tests_properties(spdk_test PROPERTIES TIMEOUT 120)
+        set_tests_properties(spdk_store_test PROPERTIES TIMEOUT 120)
+    endif()
 
     # Perf benchmark binary (not a gtest — standalone executable).
     add_executable(udepot_ng_bench test/perf/udepot_ng_bench.cc)

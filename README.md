@@ -18,6 +18,10 @@ allocation and GC is described in the [MASCOTS18 paper](https://ieeexplore.ieee.
 - **Eager-start C++23 coroutines** replace TRT — `initial_suspend = suspend_never`,
   so creating a CoroTask immediately submits I/O; batch N coroutines then
   harvest completions for queue-depth scaling
+- **CMake** replaces the Makefile build
+- **No TRT dependency** — standalone runtime, no separate scheduler
+- **SPDK backend** — NVMe direct access via SPDK queue pairs, NVMe-oF
+  support via `UDEPOT_NVMEF` env var
 
 
 Everything else — on-disk format, hash function, segment
@@ -37,6 +41,20 @@ After git clone:
 $ git submodule init
 $ git submodule update
 $ cmake -B build -DCMAKE_BUILD_TYPE=Release
+$ cmake --build build -j$(nproc)
+```
+
+### Building with SPDK support
+
+To build with the SPDK NVMe backend:
+
+```
+$ cd extern/spdk
+$ git submodule update --init
+$ ./configure
+$ make -j$(nproc)
+$ cd ../..
+$ cmake -B build -DCMAKE_BUILD_TYPE=Release -DUDEPOT_BUILD_SPDK=ON
 $ cmake --build build -j$(nproc)
 ```
 
@@ -100,9 +118,9 @@ for (auto& task : tasks)
 $ ctest --test-dir build
 ```
 
-12 test suites covering the coroutine runtime, RCU, hash table, directory,
-both I/O backends, the full KV API, concurrent correctness, and async
-queue-depth scaling.
+13 test suites covering the coroutine runtime, RCU, hash table, directory,
+I/O backends (posix, aio), network (epoll), the full KV API, concurrent
+correctness, and async queue-depth scaling.
 
 ### Using a block device
 
@@ -131,7 +149,6 @@ against buffered IO backend.
 ## Roadmap
 
 - **Crash recovery** — persist and restore from the uDepot data log
-- **SPDK backend** — NVMe direct access via SPDK queue pairs
 - **io_uring backend** — kernel-side I/O submission ring
 - **Network backends** — memcache protocol server (TCP/RDMA), NVMe over Fabrics
 - **Python API** — ctypes bindings to `libpyudepot.so`

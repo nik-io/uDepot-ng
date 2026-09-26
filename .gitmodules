@@ -1,3 +1,6 @@
 [submodule "extern/cityhash"]
 	path = extern/cityhash
 	url = https://github.com/google/cityhash.git
+[submodule "extern/spdk"]
+	path = extern/spdk
+	url = https://github.com/spdk/spdk.git

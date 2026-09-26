@@ -1,3 +1,6 @@
+// Copyright (c) 2024-2026 Nikolas Ioannou
+// SPDX-License-Identifier: BSD-3-Clause
+
 #include "kv.hh"
 #include "uDepot/kv-conf.hh"
 #include "uDepot/kv-factory.hh"
