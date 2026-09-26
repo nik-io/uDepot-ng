@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cassert>
 #include <coroutine>
+#include <cstdint>
 #include <exception>
 #include <thread>
 #include <utility>
@@ -22,15 +23,23 @@ public:
         bool await_ready() noexcept { return false; }
 
         std::coroutine_handle<> await_suspend(handle_type h) noexcept {
-            h.promise().completed_.store(true, std::memory_order_release);
-            return h.promise().continuation_;
+            auto& p = h.promise();
+            p.completed_.store(true, std::memory_order_release);
+            void* prev = p.continuation_.exchange(
+                completed_tag(), std::memory_order_acq_rel);
+            if (prev != nullptr)
+                return std::coroutine_handle<>::from_address(prev);
+            return std::noop_coroutine();
         }
 
         void await_resume() noexcept {}
     };
 
     struct promise_type {
-        std::coroutine_handle<> continuation_ = std::noop_coroutine();
+        // nullptr = no continuation set (initial state).
+        // completed_tag() = child has completed.
+        // anything else = parent's coroutine handle address.
+        std::atomic<void*> continuation_{nullptr};
         T result_{};
         std::atomic<bool> completed_{false};
 
@@ -64,10 +73,16 @@ public:
     bool done() const noexcept { return !handle_ || handle_.done(); }
 
     // Awaitable interface — for co_await from another coroutine.
-    bool await_ready() const noexcept { return done(); }
+    bool await_ready() const noexcept {
+        if (!handle_) return true;
+        return handle_.promise().continuation_.load(
+            std::memory_order_acquire) == completed_tag();
+    }
 
-    void await_suspend(std::coroutine_handle<> h) noexcept {
-        handle_.promise().continuation_ = h;
+    bool await_suspend(std::coroutine_handle<> h) noexcept {
+        void* prev = handle_.promise().continuation_.exchange(
+            h.address(), std::memory_order_acq_rel);
+        return prev != completed_tag();
     }
 
     T await_resume() noexcept { return handle_.promise().result_; }
@@ -89,6 +104,12 @@ private:
     handle_type handle_;
 
     explicit CoroTask(handle_type h) noexcept : handle_(h) {}
+
+    // Coroutine frames are pointer-aligned, so address 0x1 can never
+    // be a valid frame and is safe to use as a sentinel.
+    static void* completed_tag() noexcept {
+        return reinterpret_cast<void*>(uintptr_t{1});
+    }
 
     void destroy() noexcept {
         if (handle_) {
