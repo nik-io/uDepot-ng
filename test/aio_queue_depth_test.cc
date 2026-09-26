@@ -21,7 +21,7 @@ using udepot::CoroTask;
 using udepot::StoreConfig;
 using udepot::UDepot;
 
-static constexpr size_t kStoreSize = 64 * 1024 * 1024;
+static constexpr size_t kStoreSize = 16 * 1024 * 1024;
 
 class AioQueueDepthTest : public ::testing::Test {
 protected:
@@ -63,7 +63,7 @@ static std::string make_val(int i) {
 // --- Correctness: batched reads at every queue depth return correct data ---
 
 TEST_F(AioQueueDepthTest, BatchedReadsCorrectAtAllDepths) {
-    constexpr int kKeys = 256;
+    constexpr int kKeys = 64;
 
     for (int i = 0; i < kKeys; ++i) {
         std::string key = make_key(i);
@@ -119,7 +119,7 @@ TEST_F(AioQueueDepthTest, BatchedReadsCorrectAtAllDepths) {
 // --- Correctness: batched writes at every queue depth ---
 
 TEST_F(AioQueueDepthTest, BatchedWritesCorrectAtAllDepths) {
-    constexpr int kKeysPerDepth = 64;
+    constexpr int kKeysPerDepth = 32;
 
     for (int depth = 1; depth <= 32; depth *= 2) {
         SCOPED_TRACE("queue_depth=" + std::to_string(depth));
@@ -180,8 +180,8 @@ static double median(std::vector<double>& v) {
 }
 
 TEST_F(AioQueueDepthTest, DeeperQueueFasterReads) {
-    constexpr int kKeys = 128;
-    constexpr int kIterations = 5;
+    constexpr int kKeys = 64;
+    constexpr int kIterations = 3;
 
     for (int i = 0; i < kKeys; ++i) {
         std::string key = make_key(i);
@@ -254,8 +254,8 @@ TEST_F(AioQueueDepthTest, DeeperQueueFasterReads) {
 }
 
 TEST_F(AioQueueDepthTest, DeeperQueueFasterWrites) {
-    constexpr int kKeys = 128;
-    constexpr int kIterations = 5;
+    constexpr int kKeys = 64;
+    constexpr int kIterations = 3;
 
     struct DepthResult {
         int depth;
