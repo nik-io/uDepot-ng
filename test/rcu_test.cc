@@ -162,3 +162,50 @@ TEST(Rcu, MultipleTokensPerThread) {
     rcu.unregister_thread(t1);
     rcu.unregister_thread(t2);
 }
+
+// Regression: register_thread formerly used a monotonic counter and
+// never reused slots.  After kMaxThreads cumulative registrations (even
+// with only a few concurrent threads) the assert fired.  The fix scans
+// for freed slots under a mutex before allocating new ones.
+TEST(Rcu, SlotReuseDoesNotExhaust) {
+    Rcu rcu;
+    // Register and unregister more than kMaxThreads times, but only
+    // one thread at a time — this would have crashed before the fix.
+    for (uint32_t i = 0; i < Rcu::kMaxThreads + 100; ++i) {
+        auto t = rcu.register_thread();
+        ASSERT_TRUE(t.valid()) << "iteration " << i;
+        rcu.read_lock(t);
+        rcu.read_unlock(t);
+        rcu.unregister_thread(t);
+    }
+    // High-water mark stays at 1 since we reused the same slot each time.
+    EXPECT_EQ(rcu.thread_count(), 1u);
+}
+
+// Regression: verify slot reuse with concurrent threads registering and
+// unregistering.  The mutex must serialize slot allocation correctly.
+TEST(Rcu, ConcurrentSlotReuse) {
+    Rcu rcu;
+    constexpr int kThreads = 8;
+    constexpr int kCycles = 200;
+    std::atomic<int> completed{0};
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&] {
+            for (int c = 0; c < kCycles; ++c) {
+                auto t = rcu.register_thread();
+                ASSERT_TRUE(t.valid());
+                rcu.read_lock(t);
+                std::this_thread::yield();
+                rcu.read_unlock(t);
+                rcu.unregister_thread(t);
+            }
+            completed.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    for (auto& th : threads) th.join();
+    EXPECT_EQ(completed.load(), kThreads);
+    // High-water mark should be at most kThreads (the peak concurrency).
+    EXPECT_LE(rcu.thread_count(), static_cast<uint32_t>(kThreads));
+}

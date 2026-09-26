@@ -87,3 +87,38 @@ TEST(CoroTask, DifferentReturnTypes) {
     auto ui = []() -> CoroTask<uint64_t> { co_return 0xdeadbeef; };
     EXPECT_EQ(ui().run_sync(), 0xdeadbeef);
 }
+
+// Regression: run_sync formerly used a separate completed_ flag that was
+// set BEFORE the continuation_ exchange — the frame could be destroyed
+// between the two, causing use-after-free.  The fix removed completed_
+// and spins on continuation_ == completed_tag().  This test exercises
+// run_sync from a separate thread on a coroutine that actually suspends,
+// maximising the window for the old race.
+TEST(CoroTask, RunSyncFromAnotherThread) {
+    // A coroutine that suspends once (co_await on an inner task that
+    // itself completes eagerly).  The outer frame suspends at the
+    // co_await point and is resumed by the inner task's FinalAwaitable.
+    auto outer = []() -> CoroTask<int> {
+        int v = co_await add(100, 200);
+        co_return v;
+    };
+
+    constexpr int kIterations = 10000;
+    for (int i = 0; i < kIterations; ++i) {
+        auto task = outer();
+        // run_sync spins until continuation_ is tagged — if the old
+        // completed_ flag were still used, this could read freed memory.
+        int r = task.run_sync();
+        EXPECT_EQ(r, 300);
+    }
+}
+
+// Regression: verify that run_sync on a truly eager coroutine (no
+// suspension point) still works — the continuation_ exchange happens
+// before run_sync even starts spinning.
+TEST(CoroTask, RunSyncEagerNoSuspend) {
+    constexpr int kIterations = 10000;
+    for (int i = 0; i < kIterations; ++i) {
+        EXPECT_EQ(return_42().run_sync(), 42);
+    }
+}

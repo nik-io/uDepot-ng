@@ -117,6 +117,63 @@ TEST(HashTable, FillAndOverflow) {
     EXPECT_LT(inserted, 100);
 }
 
+// Regression: stripe locks allowed two writers to adjacent buckets to claim
+// the same empty slot, because hopscotch neighborhoods (32 slots) overlap.
+// The fix uses a per-table write mutex.  This test does concurrent inserts
+// to adjacent buckets and verifies every entry survives — under the old
+// stripe locks, entries would silently be lost.
+TEST(HashTable, ConcurrentWritersAdjacentBuckets) {
+    constexpr uint32_t kBits = 14;  // 16384 buckets
+    HashTable table(kBits);
+    constexpr int kWriters = 4;
+    constexpr int kEntriesPerWriter = 500;
+    std::atomic<int> failures{0};
+
+    std::vector<std::thread> writers;
+    for (int w = 0; w < kWriters; ++w) {
+        writers.emplace_back([&, w] {
+            for (int i = 0; i < kEntriesPerWriter; ++i) {
+                // Each writer targets a contiguous range of buckets so
+                // neighborhoods overlap with the adjacent writer's range.
+                uint64_t bucket = static_cast<uint64_t>(w * kEntriesPerWriter + i)
+                                  % table.num_buckets();
+                uint8_t tag = static_cast<uint8_t>((i % 254) + 1);
+                uint64_t hash = make_hash(bucket, tag, kBits);
+                uint64_t pba = static_cast<uint64_t>(w * kEntriesPerWriter + i);
+                int rc = table.insert(hash, 1, pba);
+                if (rc != 0) failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& w : writers) w.join();
+
+    // Verify: every successfully inserted entry must be findable.
+    int found = 0;
+    for (int w = 0; w < kWriters; ++w) {
+        for (int i = 0; i < kEntriesPerWriter; ++i) {
+            uint64_t bucket = static_cast<uint64_t>(w * kEntriesPerWriter + i)
+                              % table.num_buckets();
+            uint8_t tag = static_cast<uint8_t>((i % 254) + 1);
+            uint64_t hash = make_hash(bucket, tag, kBits);
+            uint64_t pba = static_cast<uint64_t>(w * kEntriesPerWriter + i);
+
+            // Scan all tag-matching entries (there may be tag collisions).
+            uint32_t off = 0;
+            bool located = false;
+            while (true) {
+                HashEntry e = table.lookup(hash, off);
+                if (e.empty()) break;
+                if (e.pba() == pba) { located = true; break; }
+                off = e.bucket_offset() + 1;
+            }
+            if (located) ++found;
+        }
+    }
+    int expected = kWriters * kEntriesPerWriter - failures.load();
+    EXPECT_EQ(found, expected)
+        << "data loss: inserted " << expected << " but found " << found;
+}
+
 TEST(HashTable, ConcurrentReadsWhileWriting) {
     HashTable table(14);  // 16384 buckets
     constexpr int kNumWriters = 2;

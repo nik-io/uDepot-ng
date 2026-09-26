@@ -233,3 +233,66 @@ TEST_F(EpollNetTest, MultipleClients) {
     }
     es_.close_fd(listen_fd);
 }
+
+// Regression: fds_ was accessed by the handler thread (register_fd,
+// await_suspend) and the poller thread (notify_maybe) with no
+// synchronization.  pending_waits_ was a plain size_t — also a data
+// race.  The fix added fds_mu_ and made pending_waits_ atomic.
+//
+// This test exercises the race window: a burst of clients connect while
+// the poller is actively running, forcing register_fd (handler thread)
+// and notify_maybe (poller thread) to overlap on fds_.
+TEST_F(EpollNetTest, ConcurrentRegistrationAndPolling) {
+    auto [listen_fd, port] = make_listener();
+    ASSERT_EQ(es_.listen(listen_fd, 32), 0);
+
+    constexpr int kBurst = 20;
+    std::vector<std::string> results(kBurst);
+
+    // Fire all clients at once so their connections arrive while the
+    // poller is actively processing earlier ones.
+    std::vector<std::thread> clients;
+    for (int i = 0; i < kBurst; ++i) {
+        clients.emplace_back([&, i] {
+            int fd = connect_to(port);
+            if (fd < 0) return;
+            std::string msg = "burst_" + std::to_string(i);
+            ::send(fd, msg.data(), msg.size(), 0);
+            char buf[64] = {};
+            ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n > 0) results[i].assign(buf, static_cast<size_t>(n));
+            ::close(fd);
+        });
+    }
+
+    for (int i = 0; i < kBurst; ++i) {
+        auto task = [&]() -> udepot::CoroTask<int> {
+            struct sockaddr_in cli_addr{};
+            socklen_t cli_len = sizeof(cli_addr);
+            ssize_t afd = co_await es_.accept_ll(
+                listen_fd, reinterpret_cast<sockaddr*>(&cli_addr), &cli_len);
+            if (afd < 0) co_return -1;
+
+            int fd = static_cast<int>(afd);
+            es_.register_fd(fd, EPOLLIN);
+
+            udepot::Connection conn(es_, fd);
+            char buf[64] = {};
+            ssize_t n = co_await conn.recv(buf, sizeof(buf), 0);
+            if (n > 0)
+                co_await conn.send(buf, static_cast<size_t>(n), 0);
+            es_.close_fd(fd);
+            co_return 0;
+        }();
+        EXPECT_EQ(task.run_sync(), 0);
+    }
+
+    for (auto& t : clients) t.join();
+
+    int echoed = 0;
+    for (int i = 0; i < kBurst; ++i) {
+        if (!results[i].empty()) ++echoed;
+    }
+    EXPECT_EQ(echoed, kBurst);
+    es_.close_fd(listen_fd);
+}
