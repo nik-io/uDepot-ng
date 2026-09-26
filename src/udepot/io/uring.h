@@ -38,10 +38,10 @@ private:
     size_t size_ = 0;
     struct io_uring ring_{};
     bool ring_initialized_ = false;
-    alignas(64) std::mutex sq_mutex_;
     std::thread poller_;
+    alignas(64) std::mutex sq_mutex_;
     alignas(64) std::atomic<bool> running_{false};
-    alignas(64) std::atomic<size_t> pending_{0};
+    std::atomic<size_t> pending_{0};
 
     void poller_loop();
 };
