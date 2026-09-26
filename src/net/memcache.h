@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -65,6 +66,9 @@ private:
     std::thread accept_thread_;
     std::vector<std::thread> conn_threads_;
     std::atomic<uint64_t> bytes_stored_{0};
+
+    std::mutex conn_fds_mu_;
+    std::vector<int> conn_fds_;
 
     void accept_loop();
     void handle_connection(int fd);

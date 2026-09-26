@@ -167,7 +167,7 @@ class MemcacheTest : public ::testing::Test {
 protected:
     void SetUp() override {
         path_ = std::filesystem::temp_directory_path() /
-                "udepot_memcache_test";
+                ("udepot_memcache_test_" + std::to_string(getpid()));
         StoreConfig config;
         config.path = path_.c_str();
         config.size = kStoreSize;

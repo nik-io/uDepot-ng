@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <string_view>
+#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
@@ -43,6 +44,7 @@ static constexpr std::string_view kError = "ERROR\r\n";
 static constexpr std::string_view kClientError = "CLIENT_ERROR ";
 static constexpr std::string_view kServerError = "SERVER_ERROR ";
 static constexpr std::string_view kExists = "EXISTS\r\n";
+static constexpr int kSendFlags = MSG_NOSIGNAL;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Request types
@@ -218,7 +220,7 @@ static CoroTask<int> handle_store(
         int exists_rc = co_await store.exists(key_span, &existing_size);
         if (exists_rc == 0) {
             if (!noreply) co_await conn.send_full(
-                kNotStored.data(), kNotStored.size(), 0);
+                kNotStored.data(), kNotStored.size(), kSendFlags);
             co_return 0;
         }
         rc = co_await store.put(key_span, val_span);
@@ -228,7 +230,7 @@ static CoroTask<int> handle_store(
         int exists_rc = co_await store.exists(key_span, &existing_size);
         if (exists_rc != 0) {
             if (!noreply) co_await conn.send_full(
-                kNotStored.data(), kNotStored.size(), 0);
+                kNotStored.data(), kNotStored.size(), kSendFlags);
             co_return 0;
         }
         rc = co_await store.put(key_span, val_span);
@@ -275,10 +277,10 @@ static CoroTask<int> handle_store(
 
     if (!noreply) {
         if (rc == 0) {
-            co_await conn.send_full(kStored.data(), kStored.size(), 0);
+            co_await conn.send_full(kStored.data(), kStored.size(), kSendFlags);
             bytes_stored.fetch_add(value_len, std::memory_order_relaxed);
         } else {
-            co_await conn.send_full(kNotStored.data(), kNotStored.size(), 0);
+            co_await conn.send_full(kNotStored.data(), kNotStored.size(), kSendFlags);
         }
     } else if (rc == 0) {
         bytes_stored.fetch_add(value_len, std::memory_order_relaxed);
@@ -319,12 +321,12 @@ static CoroTask<int> handle_get(
                             static_cast<int>(key.size()), key.data(),
                             flags, data_len);
 
-        co_await conn.send_full(header, static_cast<size_t>(hlen), 0);
+        co_await conn.send_full(header, static_cast<size_t>(hlen), kSendFlags);
         if (data_len > 0)
-            co_await conn.send_full(val_buf.data(), data_len, 0);
-        co_await conn.send_full(kCRLF.data(), kCRLF.size(), 0);
+            co_await conn.send_full(val_buf.data(), data_len, kSendFlags);
+        co_await conn.send_full(kCRLF.data(), kCRLF.size(), kSendFlags);
     }
-    co_await conn.send_full(kEnd.data(), kEnd.size(), 0);
+    co_await conn.send_full(kEnd.data(), kEnd.size(), kSendFlags);
     co_return 0;
 }
 
@@ -339,9 +341,9 @@ static CoroTask<int> handle_delete(
     int rc = co_await store.del(key_span);
     if (!noreply) {
         if (rc == 0)
-            co_await conn.send_full(kDeleted.data(), kDeleted.size(), 0);
+            co_await conn.send_full(kDeleted.data(), kDeleted.size(), kSendFlags);
         else
-            co_await conn.send_full(kNotFound.data(), kNotFound.size(), 0);
+            co_await conn.send_full(kNotFound.data(), kNotFound.size(), kSendFlags);
     }
     co_return 0;
 }
@@ -360,7 +362,7 @@ static CoroTask<int> handle_arithmetic(
                                 val_buf.size(), &val_size);
     if (rc != 0 || val_size < kMetaSize) {
         if (!noreply)
-            co_await conn.send_full(kNotFound.data(), kNotFound.size(), 0);
+            co_await conn.send_full(kNotFound.data(), kNotFound.size(), kSendFlags);
         co_return 0;
     }
 
@@ -371,7 +373,7 @@ static CoroTask<int> handle_arithmetic(
     if (is_expired(expiry)) {
         co_await store.del(key_span);
         if (!noreply)
-            co_await conn.send_full(kNotFound.data(), kNotFound.size(), 0);
+            co_await conn.send_full(kNotFound.data(), kNotFound.size(), kSendFlags);
         co_return 0;
     }
 
@@ -385,7 +387,7 @@ static CoroTask<int> handle_arithmetic(
         if (!noreply) {
             static constexpr std::string_view msg =
                 "CLIENT_ERROR cannot increment or decrement non-numeric value\r\n";
-            co_await conn.send_full(msg.data(), msg.size(), 0);
+            co_await conn.send_full(msg.data(), msg.size(), kSendFlags);
         }
         co_return 0;
     }
@@ -413,9 +415,9 @@ static CoroTask<int> handle_arithmetic(
             char reply[64];
             int rlen = snprintf(reply, sizeof(reply), "%.*s\r\n",
                                 static_cast<int>(new_data_len), new_val_str);
-            co_await conn.send_full(reply, static_cast<size_t>(rlen), 0);
+            co_await conn.send_full(reply, static_cast<size_t>(rlen), kSendFlags);
         } else {
-            co_await conn.send_full(kServerError.data(), kServerError.size(), 0);
+            co_await conn.send_full(kServerError.data(), kServerError.size(), kSendFlags);
         }
     }
     co_return 0;
@@ -429,14 +431,14 @@ static CoroTask<int> handle_stats(
     int len = snprintf(buf, sizeof(buf), "STAT bytes %lu\r\n",
                        static_cast<unsigned long>(
                            bytes_stored.load(std::memory_order_relaxed)));
-    co_await conn.send_full(buf, static_cast<size_t>(len), 0);
-    co_await conn.send_full(kEnd.data(), kEnd.size(), 0);
+    co_await conn.send_full(buf, static_cast<size_t>(len), kSendFlags);
+    co_await conn.send_full(kEnd.data(), kEnd.size(), kSendFlags);
     co_return 0;
 }
 
 static CoroTask<int> handle_version(Connection& conn) {
     static constexpr std::string_view ver = "VERSION udepot-ng 0.1.0\r\n";
-    co_await conn.send_full(ver.data(), ver.size(), 0);
+    co_await conn.send_full(ver.data(), ver.size(), kSendFlags);
     co_return 0;
 }
 
@@ -495,7 +497,7 @@ static CoroTask<int> serve_connection(
             std::vector<std::string_view> keys(tokens.begin() + 1,
                                                tokens.end());
             if (keys.empty()) {
-                co_await conn.send_full(kError.data(), kError.size(), 0);
+                co_await conn.send_full(kError.data(), kError.size(), kSendFlags);
                 continue;
             }
             // Copy keys since they reference the recv buffer which may
@@ -517,7 +519,7 @@ static CoroTask<int> serve_connection(
             // <command> <key> <flags> <exptime> <bytes> [noreply]\r\n
             // <data block>\r\n
             if (tokens.size() < 5) {
-                co_await conn.send_full(kError.data(), kError.size(), 0);
+                co_await conn.send_full(kError.data(), kError.size(), kSendFlags);
                 continue;
             }
 
@@ -525,7 +527,7 @@ static CoroTask<int> serve_connection(
             if (key_owned.size() > MemcacheServer<Store>::kMaxKeyLen) {
                 static constexpr std::string_view msg =
                     "CLIENT_ERROR bad command line format\r\n";
-                co_await conn.send_full(msg.data(), msg.size(), 0);
+                co_await conn.send_full(msg.data(), msg.size(), kSendFlags);
                 continue;
             }
 
@@ -535,14 +537,14 @@ static CoroTask<int> serve_connection(
             if (!parse_u32(tokens[2], flags) ||
                 !parse_u64(tokens[3], exptime) ||
                 !parse_u32(tokens[4], nbytes)) {
-                co_await conn.send_full(kError.data(), kError.size(), 0);
+                co_await conn.send_full(kError.data(), kError.size(), kSendFlags);
                 continue;
             }
 
             if (nbytes > MemcacheServer<Store>::kMaxValueLen) {
                 static constexpr std::string_view msg =
                     "SERVER_ERROR object too large for cache\r\n";
-                co_await conn.send_full(msg.data(), msg.size(), 0);
+                co_await conn.send_full(msg.data(), msg.size(), kSendFlags);
                 continue;
             }
 
@@ -574,7 +576,7 @@ static CoroTask<int> serve_connection(
         if (req == ReqType::kDelete) {
             // delete <key> [noreply]\r\n
             if (tokens.size() < 2) {
-                co_await conn.send_full(kError.data(), kError.size(), 0);
+                co_await conn.send_full(kError.data(), kError.size(), kSendFlags);
                 continue;
             }
             std::string key_owned(tokens[1]);
@@ -586,13 +588,13 @@ static CoroTask<int> serve_connection(
         if (req == ReqType::kIncr || req == ReqType::kDecr) {
             // incr/decr <key> <value> [noreply]\r\n
             if (tokens.size() < 3) {
-                co_await conn.send_full(kError.data(), kError.size(), 0);
+                co_await conn.send_full(kError.data(), kError.size(), kSendFlags);
                 continue;
             }
             std::string key_owned(tokens[1]);
             uint64_t delta = 0;
             if (!parse_u64(tokens[2], delta)) {
-                co_await conn.send_full(kError.data(), kError.size(), 0);
+                co_await conn.send_full(kError.data(), kError.size(), kSendFlags);
                 continue;
             }
             bool noreply = (tokens.size() >= 4 && tokens[3] == "noreply");
@@ -603,7 +605,7 @@ static CoroTask<int> serve_connection(
         }
 
         // Unknown command.
-        co_await conn.send_full(kError.data(), kError.size(), 0);
+        co_await conn.send_full(kError.data(), kError.size(), kSendFlags);
     }
     co_return 0;
 }
@@ -677,6 +679,13 @@ void MemcacheServer<Store>::stop() {
     if (accept_thread_.joinable())
         accept_thread_.join();
 
+    // Force-close all tracked connection fds so handler coroutines unblock.
+    {
+        std::lock_guard<std::mutex> lk(conn_fds_mu_);
+        for (int fd : conn_fds_)
+            shutdown(fd, SHUT_RDWR);
+    }
+
     for (auto& t : conn_threads_) {
         if (t.joinable()) t.join();
     }
@@ -698,6 +707,11 @@ void MemcacheServer<Store>::accept_loop() {
         int optval = 1;
         setsockopt(fd, SOL_TCP, TCP_NODELAY, &optval, sizeof(optval));
 
+        {
+            std::lock_guard<std::mutex> lk(conn_fds_mu_);
+            conn_fds_.push_back(fd);
+        }
+
         conn_threads_.emplace_back(
             &MemcacheServer::handle_connection, this, fd);
     }
@@ -718,8 +732,16 @@ void MemcacheServer<Store>::handle_connection(int fd) {
         store_, es, conn, running_, bytes_stored_);
     task.run_sync();
 
-    es.close_fd(fd);
+    // Stop the poller before touching fds_ to avoid a data race between
+    // the poller's notify_maybe and deregister_fd/close_fd.
     es.stop();
+    ::close(fd);
+
+    {
+        std::lock_guard<std::mutex> lk(conn_fds_mu_);
+        auto it = std::find(conn_fds_.begin(), conn_fds_.end(), fd);
+        if (it != conn_fds_.end()) conn_fds_.erase(it);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
