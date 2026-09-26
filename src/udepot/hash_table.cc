@@ -7,14 +7,12 @@
 
 namespace udepot {
 
-HashTable::HashTable(uint32_t index_bits, uint32_t num_stripe_locks)
+HashTable::HashTable(uint32_t index_bits)
     : index_bits_(index_bits),
       num_buckets_(1ULL << index_bits),
       bucket_mask_(num_buckets_ - 1),
-      num_stripe_locks_(num_stripe_locks),
       slots_(std::make_unique<std::atomic<uint64_t>[]>(
-          num_buckets_ + HashEntry::kHopRange)),
-      stripe_locks_(std::make_unique<PaddedMutex[]>(num_stripe_locks)) {
+          num_buckets_ + HashEntry::kHopRange)) {
     for (uint64_t i = 0; i < num_buckets_ + HashEntry::kHopRange; ++i) {
         slots_[i].store(HashEntry::kEmpty, std::memory_order_relaxed);
     }
@@ -41,7 +39,7 @@ int HashTable::insert(uint64_t hash, uint16_t kv_size, uint64_t pba) {
     uint64_t bucket = hash_to_bucket(hash);
     uint8_t tag = hash_to_tag(hash);
 
-    std::lock_guard<std::mutex> lock(stripe_locks_[stripe_for_bucket(bucket)].mu);
+    std::lock_guard<std::mutex> lock(write_mu_);
 
     // Find an empty slot, potentially displacing entries.
     uint64_t free_idx = find_free_slot(bucket);
@@ -63,7 +61,7 @@ bool HashTable::update(uint64_t hash, uint64_t old_pba,
     uint64_t bucket = hash_to_bucket(hash);
     uint8_t tag = hash_to_tag(hash);
 
-    std::lock_guard<std::mutex> lock(stripe_locks_[stripe_for_bucket(bucket)].mu);
+    std::lock_guard<std::mutex> lock(write_mu_);
 
     for (uint32_t i = 0; i < HashEntry::kHopRange; ++i) {
         uint64_t idx = bucket + i;
@@ -86,7 +84,7 @@ bool HashTable::remove(uint64_t hash, uint64_t pba) {
     uint64_t bucket = hash_to_bucket(hash);
     uint8_t tag = hash_to_tag(hash);
 
-    std::lock_guard<std::mutex> lock(stripe_locks_[stripe_for_bucket(bucket)].mu);
+    std::lock_guard<std::mutex> lock(write_mu_);
 
     for (uint32_t i = 0; i < HashEntry::kHopRange; ++i) {
         uint64_t idx = bucket + i;

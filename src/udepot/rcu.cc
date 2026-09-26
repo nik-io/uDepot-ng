@@ -14,23 +14,31 @@ uint64_t Rcu::next_id() noexcept {
 }
 
 Rcu::Token Rcu::register_thread() noexcept {
-    uint32_t slot = thread_count_.fetch_add(1, std::memory_order_relaxed);
-    assert(slot < kMaxThreads && "too many RCU threads");
-    auto& ts = threads_[slot];
-    assert(!ts.registered && "slot already registered");
-    ts.registered = true;
-    ts.epoch.store(0, std::memory_order_relaxed);
-    ts.nesting = 0;
-    return Token{slot};
+    std::lock_guard<std::mutex> lock(register_mu_);
+    uint32_t count = thread_count_.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!threads_[i].registered.load(std::memory_order_relaxed)) {
+            threads_[i].registered.store(true, std::memory_order_relaxed);
+            threads_[i].epoch.store(0, std::memory_order_relaxed);
+            threads_[i].nesting = 0;
+            return Token{i};
+        }
+    }
+    assert(count < kMaxThreads && "too many concurrent RCU threads");
+    threads_[count].registered.store(true, std::memory_order_relaxed);
+    threads_[count].epoch.store(0, std::memory_order_relaxed);
+    threads_[count].nesting = 0;
+    thread_count_.store(count + 1, std::memory_order_release);
+    return Token{count};
 }
 
 void Rcu::unregister_thread(Token t) noexcept {
     assert(t.valid());
     auto& ts = threads_[t.slot_];
-    assert(ts.registered);
+    assert(ts.registered.load(std::memory_order_relaxed));
     assert(ts.nesting == 0 && "unregistering inside a critical section");
     ts.epoch.store(0, std::memory_order_release);
-    ts.registered = false;
+    ts.registered.store(false, std::memory_order_release);
 }
 
 void Rcu::read_lock(Token t) noexcept {
@@ -56,7 +64,7 @@ void Rcu::synchronize() noexcept {
     uint32_t count = thread_count_.load(std::memory_order_acquire);
     for (uint32_t i = 0; i < count; ++i) {
         auto& ts = threads_[i];
-        if (!ts.registered) continue;
+        if (!ts.registered.load(std::memory_order_acquire)) continue;
         while (true) {
             uint64_t e = ts.epoch.load(std::memory_order_acquire);
             // Quiescent (0) or entered a new critical section after our

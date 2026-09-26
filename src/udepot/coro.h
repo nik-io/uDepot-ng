@@ -24,7 +24,11 @@ public:
 
         std::coroutine_handle<> await_suspend(handle_type h) noexcept {
             auto& p = h.promise();
-            p.completed_.store(true, std::memory_order_release);
+            // The exchange is the LAST access to the promise.  run_sync()
+            // spins on continuation_ == completed_tag(), so setting
+            // completed_tag() must happen after result_ is written
+            // (guaranteed: return_value precedes final_suspend) and must
+            // be the final touch — otherwise the destroyer races with us.
             void* prev = p.continuation_.exchange(
                 completed_tag(), std::memory_order_acq_rel);
             if (prev != nullptr)
@@ -41,7 +45,6 @@ public:
         // anything else = parent's coroutine handle address.
         std::atomic<void*> continuation_{nullptr};
         T result_{};
-        std::atomic<bool> completed_{false};
 
         std::suspend_never initial_suspend() noexcept { return {}; }
         FinalAwaitable final_suspend() noexcept { return {}; }
@@ -93,7 +96,8 @@ public:
     // TODO: reconsider busy-wait vs kernel-assisted wait (futex/eventfd)
     // once we have real device latency measurements.
     T run_sync() {
-        while (!handle_.promise().completed_.load(std::memory_order_acquire))
+        while (handle_.promise().continuation_.load(std::memory_order_acquire)
+               != completed_tag())
             std::this_thread::yield();
         T result = handle_.promise().result_;
         destroy();

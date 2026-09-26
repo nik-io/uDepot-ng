@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <coroutine>
 #include <cstdlib>
 #include <cstring>
@@ -190,6 +191,12 @@ void SpdkGlobalState::unregister_controllers() {
     controllers_.clear();
 }
 
+void SpdkGlobalState::process_all_admin_completions() {
+    for (auto& c : controllers_) {
+        spdk_nvme_ctrlr_process_admin_completions(c.ctlr);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SpdkQpair — per-thread NVMe queue pair
 // Ported from uDepot's trt/src/trt_util/spdk.hh
@@ -273,7 +280,7 @@ void SpdkQpair::free_dma_buffer(void* ptr) {
 struct SpdkRequest {
     SpdkQpair* qp;
     ssize_t result;
-    std::coroutine_handle<> handle;
+    bool completed;
 };
 
 static void spdk_io_cb(void* ctx, const struct spdk_nvme_cpl* cpl) {
@@ -281,9 +288,13 @@ static void spdk_io_cb(void* ctx, const struct spdk_nvme_cpl* cpl) {
     assert(req->qp->npending > 0);
     --req->qp->npending;
     req->result = spdk_nvme_cpl_is_error(cpl) ? -EIO : 0;
-    req->handle.resume();
+    req->completed = true;
 }
 
+// Submit an NVMe command and poll completions inline on the calling
+// thread's qpair until it completes.  The coroutine never actually
+// suspends — this matches uDepot's read_sync/write_sync pattern where
+// each thread submits and polls its own per-thread qpair.
 struct SpdkSubmitAwaitable {
     enum class Op { kRead, kWrite };
 
@@ -296,9 +307,9 @@ struct SpdkSubmitAwaitable {
 
     bool await_ready() noexcept { return false; }
 
-    bool await_suspend(std::coroutine_handle<> h) noexcept {
-        req->handle = h;
+    bool await_suspend(std::coroutine_handle<>) noexcept {
         req->qp = qp;
+        req->completed = false;
         int rc;
         if (op == Op::kRead)
             rc = qp->submit_read(dma_buf, lba, lba_cnt, spdk_io_cb, req);
@@ -308,7 +319,9 @@ struct SpdkSubmitAwaitable {
             req->result = -EIO;
             return false;
         }
-        return true;
+        while (!req->completed)
+            qp->execute_completions(0);
+        return false;
     }
 
     ssize_t await_resume() noexcept { return req->result; }
@@ -517,28 +530,20 @@ IoBuffer SpdkIO::alloc_buffer(size_t size) {
     return IoBuffer::alloc_dma(size);
 }
 
-// Poller thread: drives SPDK I/O completions and admin queue polling.
-// The admin queue poll is throttled to ~10x/sec to keep NVMeoF keep-alives
-// alive without burning CPU on the admin path.
+// Poller thread: drives admin queue polling for NVMeoF keep-alive.
+// I/O completions are polled inline by each thread's SpdkSubmitAwaitable.
+// Admin completions are throttled to ~10x/sec.
 void SpdkIO::poller_loop() {
     uint64_t admin_interval_ticks = spdk_get_ticks_hz() / 10;
     uint64_t last_admin_tick = spdk_get_ticks();
 
     while (running_.load(std::memory_order_acquire)) {
-        // Drive I/O completions on the poller's own thread_local qpair.
-        // Other threads' qpairs are driven by their own calls via run_sync().
-        SpdkQpair* qp = get_thread_qpair();
-        if (qp) {
-            qp->execute_completions(0);
-
-            uint64_t now = spdk_get_ticks();
-            if (now - last_admin_tick >= admin_interval_ticks) {
-                qp->process_admin_completions();
-                last_admin_tick = now;
-            }
+        uint64_t now = spdk_get_ticks();
+        if (now - last_admin_tick >= admin_interval_ticks) {
+            global_state_.process_all_admin_completions();
+            last_admin_tick = now;
         }
-
-        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 

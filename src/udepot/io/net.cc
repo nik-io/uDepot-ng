@@ -56,29 +56,32 @@ bool EpollOpAwaitable::await_ready() noexcept {
 bool EpollOpAwaitable::await_suspend(std::coroutine_handle<> h) noexcept {
     assert(es_->state_ == EpollState::State::kReady);
 
-    auto entry = es_->fds_.find(fd_);
-    assert(entry != es_->fds_.end());
-
     handle_ = h;
 
-    switch (ty_) {
-        case EpollOpType::kIn:
-            assert(!entry->second.handle_in_);
-            entry->second.handle_in_ = h;
-            break;
-        case EpollOpType::kOut:
-            assert(!entry->second.handle_out_);
-            entry->second.handle_out_ = h;
-            break;
+    {
+        std::lock_guard<std::mutex> lock(es_->fds_mu_);
+        auto entry = es_->fds_.find(fd_);
+        assert(entry != es_->fds_.end());
+
+        switch (ty_) {
+            case EpollOpType::kIn:
+                assert(!entry->second.handle_in_);
+                entry->second.handle_in_ = h;
+                break;
+            case EpollOpType::kOut:
+                assert(!entry->second.handle_out_);
+                entry->second.handle_out_ = h;
+                break;
+        }
     }
-    es_->pending_waits_++;
+    es_->pending_waits_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
 ssize_t EpollOpAwaitable::await_resume() noexcept {
     if (ready_) return ret_;
 
-    es_->pending_waits_--;
+    es_->pending_waits_.fetch_sub(1, std::memory_order_relaxed);
     ret_ = syscall_();
     if (ret_ > 0 && reg_) es_->register_fd(static_cast<int>(ret_), EPOLLIN);
     return ret_;
@@ -131,10 +134,13 @@ void EpollState::register_fd(int fd, uint32_t event_mask) {
     int old_flags;
     setnonblocking(fd, old_flags);
 
-    assert(fds_.find(fd) == fds_.end());
-    fds_.emplace(std::piecewise_construct,
-                 std::make_tuple(fd),
-                 std::make_tuple(event_mask, old_flags));
+    {
+        std::lock_guard<std::mutex> lock(fds_mu_);
+        assert(fds_.find(fd) == fds_.end());
+        fds_.emplace(std::piecewise_construct,
+                     std::make_tuple(fd),
+                     std::make_tuple(event_mask, old_flags));
+    }
 
     struct epoll_event ev{};
     ev.events = event_mask;
@@ -147,11 +153,13 @@ void EpollState::register_fd(int fd, uint32_t event_mask) {
 }
 
 int EpollState::deregister_fd(int fd) {
-    auto iter = fds_.find(fd);
-    if (iter == fds_.end())
-        return state_ == State::kDone ? 0 : -ENOENT;
-
-    fds_.erase(iter);
+    {
+        std::lock_guard<std::mutex> lock(fds_mu_);
+        auto iter = fds_.find(fd);
+        if (iter == fds_.end())
+            return state_ == State::kDone ? 0 : -ENOENT;
+        fds_.erase(iter);
+    }
     epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
     return 0;
 }
@@ -170,32 +178,43 @@ int EpollState::close_fd(int fd) {
 }
 
 void EpollState::notify_maybe(int fd, EpollOpType ty) {
-    auto entry = fds_.find(fd);
-    if (entry == fds_.end()) return;
+    std::coroutine_handle<> h;
+    {
+        std::lock_guard<std::mutex> lock(fds_mu_);
+        auto entry = fds_.find(fd);
+        if (entry == fds_.end()) return;
 
-    std::coroutine_handle<>* hptr;
-    switch (ty) {
-        case EpollOpType::kIn:  hptr = &entry->second.handle_in_;  break;
-        case EpollOpType::kOut: hptr = &entry->second.handle_out_; break;
-        default: abort();
+        std::coroutine_handle<>* hptr;
+        switch (ty) {
+            case EpollOpType::kIn:  hptr = &entry->second.handle_in_;  break;
+            case EpollOpType::kOut: hptr = &entry->second.handle_out_; break;
+            default: abort();
+        }
+
+        h = *hptr;
+        if (!h) return;
+        *hptr = {};
     }
-
-    auto h = *hptr;
-    if (!h) return;
-    *hptr = {};
+    // Resume outside the lock — the coroutine may re-enter fds_ via
+    // await_suspend or register_fd.
     h.resume();
 }
 
 void EpollState::shutdown_all() {
+    // Called after the poller thread has been joined, so no lock needed
+    // for the iteration itself. Individual handles are extracted and
+    // resumed one at a time.
     for (auto iter = fds_.begin(); iter != fds_.end();) {
         auto& info = iter->second;
         if (info.handle_in_) {
-            info.handle_in_.resume();
+            auto h = info.handle_in_;
             info.handle_in_ = {};
+            h.resume();
         }
         if (info.handle_out_) {
-            info.handle_out_.resume();
+            auto h = info.handle_out_;
             info.handle_out_ = {};
+            h.resume();
         }
         epoll_ctl(epfd_, EPOLL_CTL_DEL, iter->first, nullptr);
         iter = fds_.erase(iter);
@@ -206,7 +225,7 @@ void EpollState::poller_loop() {
     struct epoll_event events[kMaxEvents];
 
     while (running_.load(std::memory_order_acquire)) {
-        int timeout = (pending_waits_ > 0) ? 10 : 100;
+        int timeout = (pending_waits_.load(std::memory_order_relaxed) > 0) ? 10 : 100;
         int n = epoll_wait(epfd_, events, kMaxEvents, timeout);
         if (n < 0) {
             if (errno == EINTR) continue;

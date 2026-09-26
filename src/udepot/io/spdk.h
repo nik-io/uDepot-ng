@@ -68,6 +68,8 @@ public:
     const std::vector<SpdkNamespace>& namespaces() const { return namespaces_; }
     bool initialized() const { return initialized_; }
 
+    void process_all_admin_completions();
+
 private:
     std::vector<SpdkController> controllers_;
     std::vector<SpdkNamespace> namespaces_;

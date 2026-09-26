@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 
 namespace udepot {
 
@@ -87,12 +88,15 @@ private:
         // When active, stores the global epoch at entry time | 1.
         std::atomic<uint64_t> epoch{0};
         uint32_t nesting{0};
-        bool registered{false};
+        std::atomic<bool> registered{false};
     };
 
     std::array<ThreadState, kMaxThreads> threads_{};
     alignas(64) std::atomic<uint64_t> global_epoch_{0};
+    // High-water mark: total slots ever allocated. Only grows under
+    // register_mu_; used by synchronize() to bound its scan.
     alignas(64) std::atomic<uint32_t> thread_count_{0};
+    std::mutex register_mu_;
     uint64_t id_ = next_id();
 
     static uint64_t next_id() noexcept;

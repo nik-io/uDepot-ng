@@ -15,23 +15,18 @@
 
 namespace udepot {
 
-// Cache-line-padded mutex to prevent false sharing between stripe locks.
-struct alignas(64) PaddedMutex {
-    std::mutex mu;
-};
-
-// Hopscotch hash table with lock-free reads and stripe-locked writes.
+// Hopscotch hash table with lock-free reads and mutex-protected writes.
 //
 // Each slot is an atomic<uint64_t> holding a packed HashEntry. Readers
-// scan the neighborhood without acquiring any lock. Writers take a stripe
-// lock to serialize modifications to overlapping neighborhoods.
+// scan the neighborhood without acquiring any lock. Writers take a
+// per-table mutex to serialize modifications — hopscotch neighborhoods
+// (kHopRange=32 slots) overlap between adjacent buckets, so finer-grained
+// locking would allow two writers to claim the same empty slot.
+// Parallelism across tables is provided by the directory layer.
 class HashTable {
 public:
-    static constexpr uint32_t kDefaultStripeLocks = 1024;
-
     // Construct a hash table with 2^index_bits buckets.
-    explicit HashTable(uint32_t index_bits,
-                       uint32_t num_stripe_locks = kDefaultStripeLocks);
+    explicit HashTable(uint32_t index_bits);
     ~HashTable();
 
     HashTable(const HashTable&) = delete;
@@ -76,17 +71,12 @@ private:
     uint32_t index_bits_;
     uint64_t num_buckets_;
     uint64_t bucket_mask_;
-    uint32_t num_stripe_locks_;
 
     std::unique_ptr<std::atomic<uint64_t>[]> slots_;
-    std::unique_ptr<PaddedMutex[]> stripe_locks_;
+    std::mutex write_mu_;
 
     uint64_t hash_to_bucket(uint64_t hash) const noexcept {
         return hash & bucket_mask_;
-    }
-
-    uint32_t stripe_for_bucket(uint64_t bucket) const noexcept {
-        return static_cast<uint32_t>(bucket % num_stripe_locks_);
     }
 
     // Find an empty slot within hop range of the target bucket, using

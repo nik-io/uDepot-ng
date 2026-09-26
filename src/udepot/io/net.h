@@ -7,6 +7,7 @@
 #include <coroutine>
 #include <cstddef>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -87,7 +88,8 @@ class EpollState {
             : event_mask(mask), old_flags(fl) {}
     };
     std::unordered_map<int, FdInfo> fds_;
-    size_t pending_waits_ = 0;
+    std::mutex fds_mu_;
+    std::atomic<size_t> pending_waits_{0};
 
     std::thread poller_;
     std::atomic<bool> running_{false};
