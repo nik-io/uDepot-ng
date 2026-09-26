@@ -15,6 +15,11 @@
 
 namespace udepot {
 
+// Cache-line-padded mutex to prevent false sharing between stripe locks.
+struct alignas(64) PaddedMutex {
+    std::mutex mu;
+};
+
 // Hopscotch hash table with lock-free reads and stripe-locked writes.
 //
 // Each slot is an atomic<uint64_t> holding a packed HashEntry. Readers
@@ -74,7 +79,7 @@ private:
     uint32_t num_stripe_locks_;
 
     std::unique_ptr<std::atomic<uint64_t>[]> slots_;
-    std::unique_ptr<std::mutex[]> stripe_locks_;
+    std::unique_ptr<PaddedMutex[]> stripe_locks_;
 
     uint64_t hash_to_bucket(uint64_t hash) const noexcept {
         return hash & bucket_mask_;

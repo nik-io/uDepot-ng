@@ -68,7 +68,7 @@ static inline int aio_ring_getevents(aio_context_t ctx, unsigned max,
         if (head == ring->tail)
             break;
         events[i] = ring->events[head];
-        __asm__ __volatile__("lfence" ::: "memory");
+        std::atomic_thread_fence(std::memory_order_acquire);
         ring->head = (head + 1) % ring->nr;
         ++i;
     }

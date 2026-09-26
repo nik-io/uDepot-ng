@@ -92,7 +92,7 @@ private:
 
     std::array<ThreadState, kMaxThreads> threads_{};
     alignas(64) std::atomic<uint64_t> global_epoch_{0};
-    std::atomic<uint32_t> thread_count_{0};
+    alignas(64) std::atomic<uint32_t> thread_count_{0};
     uint64_t id_ = next_id();
 
     static uint64_t next_id() noexcept;
