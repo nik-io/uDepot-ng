@@ -130,7 +130,8 @@ must be built at `BUILD_TYPE=PERFORMANCE` (`-O3 -DNDEBUG`) to match uDepot-ng's
 cmake Release build; `perf-regression.sh` does this automatically.
 
 The speed gap is genuine, not a benchmark artifact. With both at -O3, uDepot-ng
-is 2-7x faster. The overhead sources in legacy, per strace:
+is 2.5-4.5x faster (PUT +157%, GET +174%, EXISTS +345%, DEL +303% at 5000 ops).
+The overhead sources in legacy, per strace:
 
 - **PUT**: Mbuff allocation + copy per operation, pwritev (scatter-gather) vs
   pwrite64 (flat buffer), TRT coroutine scheduling overhead, virtual dispatch
@@ -139,10 +140,6 @@ is 2-7x faster. The overhead sources in legacy, per strace:
 - **GET/EXISTS**: Same I/O count (one pread each). Legacy takes a per-bucket
   mutex on every read — the architectural change RCU eliminates. Plus
   Mbuff/TRT/vtable overhead.
-- **DEL**: All of the above, plus legacy writes a tombstone to disk for every
-  delete (500 extra pwritev per 500 DEL ops). uDepot-ng removes the directory
-  entry and invalidates grains without a disk write. Tombstones serve crash
-  recovery (so `restore()` knows a key was deleted); uDepot-ng has no restore
-  path yet, so omitting them is consistent with the "enterprise-grade crash
-  recovery only" principle. When restore is added, DEL will need tombstones and
-  the DEL speedup will narrow.
+- **DEL**: Same I/O on both sides: a key-verify pread and a tombstone write
+  per delete (crash recovery needs the tombstone to know the key was
+  deleted). The gap is the same per-operation overhead as PUT.
