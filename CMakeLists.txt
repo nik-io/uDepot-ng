@@ -82,43 +82,37 @@ if(UDEPOT_BUILD_SPDK)
     target_sources(udepot PRIVATE src/udepot/io/spdk.cc)
     target_compile_definitions(udepot PUBLIC UDEPOT_BUILD_SPDK=1)
 
-    target_include_directories(udepot PUBLIC
+    # SYSTEM: DPDK's headers do not build warning-free as C++23.
+    target_include_directories(udepot SYSTEM PUBLIC
         "${SPDK_DIR}/include"
         "${SPDK_DIR}/dpdk/build/include"
     )
 
-    # SPDK and DPDK static libraries.  The order matters for static linking.
-    set(SPDK_LIBS
-        "${SPDK_DIR}/build/lib/libspdk_nvme.a"
-        "${SPDK_DIR}/build/lib/libspdk_env_dpdk.a"
-        "${SPDK_DIR}/build/lib/libspdk_env_dpdk_rpc.a"
-        "${SPDK_DIR}/build/lib/libspdk_util.a"
-        "${SPDK_DIR}/build/lib/libspdk_log.a"
-        "${SPDK_DIR}/build/lib/libspdk_sock.a"
-        "${SPDK_DIR}/build/lib/libspdk_sock_posix.a"
-        "${SPDK_DIR}/build/lib/libspdk_json.a"
-        "${SPDK_DIR}/build/lib/libspdk_jsonrpc.a"
-        "${SPDK_DIR}/build/lib/libspdk_rpc.a"
-        "${SPDK_DIR}/build/lib/libspdk_trace.a"
-        "${SPDK_DIR}/build/lib/libspdk_vfio_user.a"
-    )
-
-    set(DPDK_LIBS
-        "${SPDK_DIR}/dpdk/build/lib/librte_eal.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_mempool.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_mempool_ring.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_ring.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_pci.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_bus_pci.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_kvargs.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_telemetry.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_log.a"
-    )
-
+    # Link exactly what SPDK's pkg-config says this SPDK build needs; a
+    # hand-kept list drifts from the SPDK version (v24.09 added keyring and
+    # OpenSSL). --whole-archive as in SPDK's own build: modules such as the
+    # posix socket transport register themselves from static constructors,
+    # which the linker would otherwise drop, leaving NVMe-oF/TCP without a
+    # socket implementation at run time.
+    set(_spdk_pc "${SPDK_DIR}/build/lib/pkgconfig")
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env "PKG_CONFIG_PATH=${_spdk_pc}"
+                pkg-config --libs --static spdk_nvme spdk_env_dpdk
+                spdk_sock_posix
+        OUTPUT_VARIABLE SPDK_PC_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _spdk_pc_rc)
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env "PKG_CONFIG_PATH=${_spdk_pc}"
+                pkg-config --libs --static spdk_syslibs
+        OUTPUT_VARIABLE SPDK_SYS_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT _spdk_pc_rc EQUAL 0)
+        message(FATAL_ERROR "pkg-config could not resolve SPDK in ${_spdk_pc}")
+    endif()
+    separate_arguments(SPDK_PC_LIBS UNIX_COMMAND "${SPDK_PC_LIBS}")
+    separate_arguments(SPDK_SYS_LIBS UNIX_COMMAND "${SPDK_SYS_LIBS}")
     target_link_libraries(udepot PUBLIC
-        ${SPDK_LIBS}
-        ${DPDK_LIBS}
-        pthread dl rt numa uuid
+        -Wl,--whole-archive ${SPDK_PC_LIBS} -Wl,--no-whole-archive
+        ${SPDK_SYS_LIBS}
     )
 endif()
 

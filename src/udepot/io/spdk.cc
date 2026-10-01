@@ -10,6 +10,9 @@
 #include <coroutine>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+
+#include <sched.h>
 
 #include <spdk/nvme.h>
 #include <spdk/env.h>
@@ -90,16 +93,54 @@ void SpdkGlobalState::register_ns(struct spdk_nvme_ctrlr* ctlr,
     namespaces_.push_back(entry);
 }
 
+// The cpu set as a hex mask ("0x..."), as DPDK's -c option takes it.
+static std::string cpuset_to_mask(const cpu_set_t& set) {
+    std::string hex;
+    for (int base = 0; base < CPU_SETSIZE; base += 4) {
+        int nibble = 0;
+        for (int b = 0; b < 4; ++b)
+            if (CPU_ISSET(base + b, &set)) nibble |= 1 << b;
+        hex.insert(hex.begin(), "0123456789abcdef"[nibble]);
+    }
+    size_t first = hex.find_first_not_of('0');
+    return "0x" + (first == std::string::npos ? "0" : hex.substr(first));
+}
+
 static int spdk_env_init_once() {
     struct spdk_env_opts opts;
     spdk_env_opts_init(&opts);
     opts.name = "udepot_ng";
     opts.shm_id = -1;
+    // As uDepot's spdk_init: our affinity is SPDK's core mask, so the EAL
+    // claims no core outside the process's cpu set (by default it takes
+    // core 0, where a co-located target's reactor may be spinning).
+    cpu_set_t affinity;
+    CPU_ZERO(&affinity);
+    if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0) {
+        perror("sched_getaffinity");
+        return -1;
+    }
+    std::string core_mask = cpuset_to_mask(affinity);
+    opts.core_mask = core_mask.c_str();
+    // Hosts without hugepages (CI, containers) can still reach an NVMe-oF
+    // TCP target, which needs no device DMA.
+    const char* no_huge = getenv("UDEPOT_SPDK_NO_HUGE");
+    if (no_huge && no_huge[0] == '1') {
+        opts.no_huge = true;
+        opts.mem_size = 1024;
+        opts.iova_mode = "va";
+    }
     int rc = spdk_env_init(&opts);
     if (rc) {
         fprintf(stderr, "spdk_env_init() failed: %d\n", rc);
         return -1;
     }
+    // The EAL pins the calling thread to its main core. uDepot's TRT
+    // pinned the threads it owned; uDepot-ng runs on its caller's threads,
+    // so give the caller its own affinity back (threads it creates later
+    // inherit it).
+    if (sched_setaffinity(0, sizeof(affinity), &affinity) != 0)
+        perror("sched_setaffinity");
     return 0;
 }
 
@@ -183,7 +224,29 @@ void SpdkGlobalState::shutdown() {
     initialized_ = false;
 }
 
+void SpdkGlobalState::register_qpair(SpdkQpair* qp) {
+    std::lock_guard<std::mutex> lock(qpairs_mu_);
+    qpairs_.push_back(qp);
+}
+
+void SpdkGlobalState::unregister_qpair(SpdkQpair* qp) {
+    std::lock_guard<std::mutex> lock(qpairs_mu_);
+    qpairs_.erase(std::remove(qpairs_.begin(), qpairs_.end(), qp),
+                  qpairs_.end());
+}
+
 void SpdkGlobalState::unregister_controllers() {
+    // Queue pairs live in their threads' TLS and may outlive this; free
+    // them here, before their controllers go, and leave the TLS objects
+    // empty. No I/O may be in flight (callers close their stores first).
+    {
+        std::lock_guard<std::mutex> lock(qpairs_mu_);
+        for (SpdkQpair* qp : qpairs_) {
+            if (qp->qpair) spdk_nvme_ctrlr_free_io_qpair(qp->qpair);
+            qp->qpair = nullptr;
+        }
+        qpairs_.clear();
+    }
     namespaces_.clear();
     for (auto& c : controllers_) {
         spdk_nvme_detach(c.ctlr);
@@ -202,15 +265,19 @@ void SpdkGlobalState::process_all_admin_completions() {
 // Ported from uDepot's trt/src/trt_util/spdk.hh
 // ─────────────────────────────────────────────────────────────────────────────
 
-SpdkQpair::SpdkQpair(SpdkNamespace* namespace_ptr) : ns(namespace_ptr) {
+SpdkQpair::SpdkQpair(SpdkNamespace* namespace_ptr, SpdkGlobalState* owner)
+    : ns(namespace_ptr), gs(owner) {
     qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns->ctlr, nullptr, 0);
     if (!qpair) {
         fprintf(stderr, "spdk: queue pair allocation failed\n");
         abort();
     }
+    if (gs) gs->register_qpair(this);
 }
 
 SpdkQpair::~SpdkQpair() {
+    // Unregister first: shutdown() frees registered queue pairs itself.
+    if (gs) gs->unregister_qpair(this);
     if (qpair) {
         int err = spdk_nvme_ctrlr_free_io_qpair(qpair);
         if (err)
@@ -222,7 +289,13 @@ SpdkQpair::~SpdkQpair() {
 SpdkQpair::SpdkQpair(SpdkQpair&& o) noexcept
     : ns(std::exchange(o.ns, nullptr)),
       qpair(std::exchange(o.qpair, nullptr)),
-      npending(std::exchange(o.npending, 0)) {}
+      npending(std::exchange(o.npending, 0)),
+      gs(std::exchange(o.gs, nullptr)) {
+    if (gs) {
+        gs->unregister_qpair(&o);
+        gs->register_qpair(this);
+    }
+}
 
 int SpdkQpair::submit_read(void* buf, uint64_t lba, uint32_t lba_cnt,
                             spdk_nvme_cmd_cb cb_fn, void* cb_arg) {
@@ -280,7 +353,8 @@ void SpdkQpair::free_dma_buffer(void* ptr) {
 struct SpdkRequest {
     SpdkQpair* qp;
     ssize_t result;
-    bool completed;
+    std::coroutine_handle<> handle;  // async: resume when complete
+    bool* done;                      // sync: set when complete
 };
 
 static void spdk_io_cb(void* ctx, const struct spdk_nvme_cpl* cpl) {
@@ -288,13 +362,14 @@ static void spdk_io_cb(void* ctx, const struct spdk_nvme_cpl* cpl) {
     assert(req->qp->npending > 0);
     --req->qp->npending;
     req->result = spdk_nvme_cpl_is_error(cpl) ? -EIO : 0;
-    req->completed = true;
+    if (req->handle)
+        req->qp->ready.push_back(req->handle);
+    else
+        *req->done = true;
 }
 
-// Submit an NVMe command and poll completions inline on the calling
-// thread's qpair until it completes.  The coroutine never actually
-// suspends — this matches uDepot's read_sync/write_sync pattern where
-// each thread submits and polls its own per-thread qpair.
+// Submit an NVMe command on the calling thread's queue pair and suspend;
+// the thread's poll resumes the coroutine when the command completes.
 struct SpdkSubmitAwaitable {
     enum class Op { kRead, kWrite };
 
@@ -307,9 +382,9 @@ struct SpdkSubmitAwaitable {
 
     bool await_ready() noexcept { return false; }
 
-    bool await_suspend(std::coroutine_handle<>) noexcept {
+    bool await_suspend(std::coroutine_handle<> h) noexcept {
         req->qp = qp;
-        req->completed = false;
+        req->handle = h;
         int rc;
         if (op == Op::kRead)
             rc = qp->submit_read(dma_buf, lba, lba_cnt, spdk_io_cb, req);
@@ -319,9 +394,7 @@ struct SpdkSubmitAwaitable {
             req->result = -EIO;
             return false;
         }
-        while (!req->completed)
-            qp->execute_completions(0);
-        return false;
+        return true;
     }
 
     ssize_t await_resume() noexcept { return req->result; }
@@ -467,8 +540,51 @@ SpdkQpair* SpdkIO::get_thread_qpair() {
         return nullptr;
     }
 
-    thread_qpair_ = std::make_unique<SpdkQpair>(target);
+    thread_qpair_ = std::make_unique<SpdkQpair>(target, &global_state_);
+    set_thread_poll(&SpdkIO::poll_thread_qpair);
     return thread_qpair_.get();
+}
+
+bool SpdkIO::poll_thread_qpair() {
+    SpdkQpair* qp = thread_qpair_.get();
+    if (!qp || !qp->qpair) return false;
+    qp->execute_completions(0);
+    // Resumed coroutines may submit more and complete more; drain until
+    // this pass found nothing ready.
+    while (!qp->ready.empty()) {
+        std::vector<std::coroutine_handle<>> ready;
+        ready.swap(qp->ready);
+        for (auto h : ready) h.resume();
+    }
+    return qp->npending > 0;
+}
+
+ssize_t SpdkIO::pwrite_sync(const void* buf, size_t count, off_t offset) {
+    SpdkQpair* qp = get_thread_qpair();
+    if (!qp) return -EIO;
+
+    uint32_t bsize = qp->get_sector_size();
+    uint64_t lba_start = static_cast<uint64_t>(offset) / bsize;
+    uint64_t lba_end = (static_cast<uint64_t>(offset) + count + bsize - 1) / bsize;
+    uint64_t nlbas = lba_end - lba_start;
+
+    void* dma_buf = qp->alloc_dma_buffer(nlbas * bsize);
+    if (!dma_buf) return -ENOMEM;
+    size_t copy_off = static_cast<size_t>(offset) - lba_start * bsize;
+    std::memcpy(static_cast<char*>(dma_buf) + copy_off, buf, count);
+
+    bool done = false;
+    SpdkRequest req{qp, 0, {}, &done};
+    int rc = qp->submit_write(dma_buf, lba_start, static_cast<uint32_t>(nlbas),
+                              spdk_io_cb, &req);
+    if (rc == 0) {
+        // Completions of this thread's suspended coroutines that arrive
+        // meanwhile are queued for its next poll, not resumed here.
+        while (!done) qp->execute_completions(0);
+    }
+    qp->free_dma_buffer(dma_buf);
+    if (rc != 0 || req.result < 0) return -EIO;
+    return static_cast<ssize_t>(count);
 }
 
 CoroTask<ssize_t> SpdkIO::pread(void* buf, size_t count, off_t offset) {

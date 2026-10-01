@@ -4,10 +4,12 @@
 #include "udepot/store.h"
 #include "udepot/io/spdk.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -152,4 +154,74 @@ TEST_F(SpdkStoreTest, ManyKeysRoundTrip) {
                   expected)
             << "i=" << i;
     }
+}
+
+namespace {
+
+std::string value_for(int key, int round, size_t len) {
+    std::string v(len, '\0');
+    for (size_t i = 0; i < len; ++i)
+        v[i] = static_cast<char>('a' + (key * 31 + round * 7 + i) % 26);
+    return v;
+}
+
+std::string get_or_empty(UDepot<SpdkIO>& store, const std::string& key,
+                         size_t max) {
+    std::string out(max, '\0');
+    size_t n = 0;
+    int rc = store.get(key, reinterpret_cast<uint8_t*>(out.data()), max, &n)
+                 .run_sync();
+    if (rc != 0) return {};
+    out.resize(n);
+    return out;
+}
+
+}  // namespace
+
+// Several threads, each with its own queue pair, overwrite the device a few
+// times over: segments must be reclaimed by GC (whose own I/O runs on its
+// thread's queue pair) while writers wait for space, and everything,
+// relocated records included, must survive a reopen.
+TEST_F(SpdkStoreTest, ConcurrentOverwritesBeyondDeviceSize) {
+    constexpr int kThreads = 4;
+    constexpr int kKeysPerThread = 50;
+    constexpr size_t kVal = 60000;
+    const uint64_t dev = store_.io().get_size();
+    const int rounds = static_cast<int>(
+        3 * dev / (kThreads * kKeysPerThread * kVal)) + 1;
+
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::thread> threads;
+    std::vector<int> failures(kThreads, 0);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int r = 0; r < rounds; ++r)
+                for (int k = t * kKeysPerThread; k < (t + 1) * kKeysPerThread;
+                     ++k)
+                    if (store_.put("ow" + std::to_string(k),
+                                   value_for(k, r, kVal)).run_sync() != 0)
+                        ++failures[t];
+        });
+    }
+    for (auto& th : threads) th.join();
+    auto t1 = std::chrono::steady_clock::now();
+    for (int t = 0; t < kThreads; ++t) EXPECT_EQ(failures[t], 0) << t;
+
+    auto check = [&] {
+        for (int k = 0; k < kThreads * kKeysPerThread; ++k)
+            ASSERT_EQ(get_or_empty(store_, "ow" + std::to_string(k), kVal),
+                      value_for(k, rounds - 1, kVal)) << k;
+    };
+    check();
+    auto t2 = std::chrono::steady_clock::now();
+    store_.close();
+    ASSERT_EQ(store_.open(config_), 0);
+    auto t3 = std::chrono::steady_clock::now();
+    check();
+    using ms = std::chrono::milliseconds;
+    printf("puts=%d put=%lldms get=%lldms reopen=%lldms\n",
+           rounds * kThreads * kKeysPerThread,
+           (long long)std::chrono::duration_cast<ms>(t1 - t0).count(),
+           (long long)std::chrono::duration_cast<ms>(t2 - t1).count(),
+           (long long)std::chrono::duration_cast<ms>(t3 - t2).count());
 }

@@ -11,8 +11,10 @@
 # (traddr:trsvcid:subnqn), so the test binary needs no command-line change.
 #
 # Requirements: a build with -DUDEPOT_BUILD_SPDK=ON, a built SPDK tree under
-# extern/spdk, hugepages, and root (for hugepages and the target). CI runs
-# it under sudo.
+# extern/spdk, and root (for the target). Hugepages are used when they can be
+# reserved; otherwise both the target and the initiator run with --no-huge
+# (UDEPOT_SPDK_NO_HUGE=1), e.g. in containers without hugetlbfs. CI runs it
+# under sudo.
 #
 # Usage: scripts/spdk-nvmef-test.sh [build_dir]
 set -uo pipefail
@@ -24,6 +26,7 @@ RPC="$SPDK_DIR/scripts/rpc.py"
 TGT_BIN="$SPDK_DIR/build/bin/nvmf_tgt"
 DPDK_LIB="$SPDK_DIR/dpdk/build/lib"
 STORE_TEST="$HERE/$BUILD_DIR/spdk_store_test"
+IO_TEST="$HERE/$BUILD_DIR/spdk_test"
 
 NQN="nqn.2016-06.io.spdk:cnode1"
 TADDR="127.0.0.1"
@@ -37,6 +40,9 @@ SECTOR="512"
 TGT_LOG="$(mktemp /tmp/nvmf_tgt.XXXXXX.log)"
 TGT_PID=""
 HUGE_PREEXISTING="no"
+# SPDK_NVMEF_NO_HUGE=1 forces the --no-huge path even where hugepages work.
+NO_HUGE="no"
+[ "${SPDK_NVMEF_NO_HUGE:-0}" = "1" ] && NO_HUGE="yes"
 
 log() { echo "[spdk-nvmef-test] $*"; }
 fail() { echo "[spdk-nvmef-test] FAIL: $*" >&2; exit 1; }
@@ -45,9 +51,10 @@ cleanup() {
     local rc=$?
     [ -n "$TGT_PID" ] && kill "$TGT_PID" 2>/dev/null
     for _ in 1 2 3 4 5; do kill -0 "$TGT_PID" 2>/dev/null || break; sleep 0.3; done
-    kill -9 "$TGT_PID" 2>/dev/null
-    pkill -9 -f "nvmf_tgt" 2>/dev/null
-    if [ "$HUGE_PREEXISTING" = "no" ]; then
+    # By pid only: a pattern kill would also hit any shell whose command
+    # line mentions the target binary.
+    [ -n "$TGT_PID" ] && kill -9 "$TGT_PID" 2>/dev/null
+    if [ "$HUGE_PREEXISTING" = "no" ] && [ "$NO_HUGE" = "no" ]; then
         echo 0 > /proc/sys/vm/nr_hugepages 2>/dev/null || true
     fi
     [ $rc -ne 0 ] && [ -f "$TGT_LOG" ] && { echo "--- target log tail ---" >&2; tail -20 "$TGT_LOG" >&2; }
@@ -57,24 +64,36 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 [ -x "$STORE_TEST" ] || fail "$STORE_TEST not found -- build with -DUDEPOT_BUILD_SPDK=ON"
+[ -x "$IO_TEST" ]    || fail "$IO_TEST not found -- build with -DUDEPOT_BUILD_SPDK=ON"
 [ -x "$TGT_BIN" ]    || fail "$TGT_BIN not found -- build SPDK first"
 
 # ── hugepages ────────────────────────────────────────────────────────────────
 CUR_HUGE="$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)"
-if [ "$CUR_HUGE" -ge 512 ]; then
+if [ "$NO_HUGE" = "yes" ]; then
+    :
+elif [ "$CUR_HUGE" -ge 512 ]; then
     HUGE_PREEXISTING="yes"
 else
     log "reserving hugepages"
-    echo 1024 > /proc/sys/vm/nr_hugepages || fail "cannot reserve hugepages (need root)"
+    echo 1024 > /proc/sys/vm/nr_hugepages 2>/dev/null || true
+    [ "$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)" -ge 512 ] || NO_HUGE="yes"
 fi
-if ! mount | grep -q 'hugetlbfs'; then
+if [ "$NO_HUGE" = "no" ] && ! mount | grep -q 'hugetlbfs'; then
     mkdir -p /dev/hugepages
-    mount -t hugetlbfs nodev /dev/hugepages || fail "cannot mount hugetlbfs"
+    mount -t hugetlbfs nodev /dev/hugepages 2>/dev/null || NO_HUGE="yes"
+fi
+TGT_ARGS=(-m 0x1)
+INIT_ENV=()
+if [ "$NO_HUGE" = "yes" ]; then
+    log "no hugepages available: running target and initiator with --no-huge"
+    # The malloc bdev lives in the target's memory pool, so size it to fit.
+    TGT_ARGS+=(--no-huge -s 2048)
+    INIT_ENV=(UDEPOT_SPDK_NO_HUGE=1)
 fi
 
 # ── start the target (pinned to core 0) ─────────────────────────────────────
 log "starting nvmf_tgt"
-"$TGT_BIN" -m 0x1 > "$TGT_LOG" 2>&1 &
+"$TGT_BIN" "${TGT_ARGS[@]}" > "$TGT_LOG" 2>&1 &
 TGT_PID=$!
 # Wait until the RPC server actually answers.
 ready="no"
@@ -101,11 +120,17 @@ PIN=()
 if [ "$NCPU" -ge 3 ]; then
     PIN=(taskset -c "1-$((NCPU-1))")
 fi
-log "running spdk_store_test on ${NCPU} cpus"
-UDEPOT_NVMEF="$TADDR:$TPORT:$NQN" LD_LIBRARY_PATH="$DPDK_LIB" \
-    "${PIN[@]}" "$STORE_TEST"
-rc=$?
-[ $rc -eq 0 ] || fail "spdk_store_test failed (rc=$rc)"
+for t in "$IO_TEST" "$STORE_TEST"; do
+    log "running $(basename "$t") on ${NCPU} cpus"
+    # Bounded: a run normally takes well under a minute. A per-I/O stall
+    # (the initiator's EAL once pinned it onto the target's core, costing
+    # ~10 ms per I/O) shows up as a timeout, not as a slow pass.
+    env "${INIT_ENV[@]}" UDEPOT_NVMEF="$TADDR:$TPORT:$NQN" \
+        LD_LIBRARY_PATH="$DPDK_LIB" timeout "${TEST_TIMEOUT:-300}" \
+        "${PIN[@]}" "$t"
+    rc=$?
+    [ $rc -eq 0 ] || fail "$(basename "$t") failed (rc=$rc)"
+done
 
 # Keep-alive timeouts on the target mean the initiator stopped polling the
 # admin queue: the fabrics connection was dropped. A correct run has none.
