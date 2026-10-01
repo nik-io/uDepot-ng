@@ -690,14 +690,19 @@ void MemcacheServer<Store>::stop() {
 
     running_.store(false, std::memory_order_release);
 
-    if (listen_fd_ >= 0) {
+    // shutdown() wakes the accept thread; the fd is closed only once that
+    // thread is gone, since its number could otherwise be reused while
+    // accept_loop is still about to accept() on it.
+    if (listen_fd_ >= 0)
         shutdown(listen_fd_, SHUT_RDWR);
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-    }
 
     if (accept_thread_.joinable())
         accept_thread_.join();
+
+    if (listen_fd_ >= 0) {
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+    }
 
     // Force-close all tracked connection fds so handler coroutines unblock.
     {
