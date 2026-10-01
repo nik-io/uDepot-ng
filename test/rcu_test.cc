@@ -4,7 +4,14 @@
 #include "udepot/rcu.h"
 
 #include <atomic>
-#include <memory>
+#include <barrier>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <future>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -12,87 +19,142 @@
 
 using udepot::Rcu;
 
-TEST(Rcu, RegisterAndUnregister) {
-    Rcu rcu;
-    EXPECT_EQ(rcu.thread_count(), 0u);
-    auto t = rcu.register_thread();
-    EXPECT_TRUE(t.valid());
-    EXPECT_EQ(rcu.thread_count(), 1u);
-    rcu.unregister_thread(t);
+namespace {
+
+// Runs synchronize() and fails the whole binary if it does not return in
+// time: a hung grace period must fail the build, not stall CTest.
+void synchronize_or_die(Rcu& rcu, std::chrono::seconds limit) {
+    auto done = std::async(std::launch::async, [&] { rcu.synchronize(); });
+    if (done.wait_for(limit) != std::future_status::ready) {
+        std::fprintf(stderr, "synchronize() did not return within %llds\n",
+                     static_cast<long long>(limit.count()));
+        std::_Exit(1);
+    }
 }
+
+}  // namespace
 
 TEST(Rcu, ReadLockUnlock) {
     Rcu rcu;
-    auto t = rcu.register_thread();
-    rcu.read_lock(t);
-    rcu.read_unlock(t);
-    rcu.unregister_thread(t);
+    uint32_t idx = rcu.read_lock();
+    rcu.read_unlock(idx);
+    synchronize_or_die(rcu, std::chrono::seconds(10));
 }
 
 TEST(Rcu, NestedReadLocks) {
     Rcu rcu;
-    auto t = rcu.register_thread();
-    rcu.read_lock(t);
-    rcu.read_lock(t);
-    rcu.read_lock(t);
-    rcu.read_unlock(t);
-    rcu.read_unlock(t);
-    rcu.read_unlock(t);
-    rcu.unregister_thread(t);
+    uint32_t a = rcu.read_lock();
+    uint32_t b = rcu.read_lock();
+    uint32_t c = rcu.read_lock();
+    rcu.read_unlock(c);
+    rcu.read_unlock(b);
+    rcu.read_unlock(a);
+    synchronize_or_die(rcu, std::chrono::seconds(10));
 }
 
 TEST(Rcu, SynchronizeWithNoReaders) {
     Rcu rcu;
-    auto t = rcu.register_thread();
     rcu.synchronize();
-    rcu.unregister_thread(t);
-}
-
-TEST(Rcu, SynchronizeWaitsForReader) {
-    Rcu rcu;
-
-    auto writer_token = rcu.register_thread();
-    std::atomic<bool> reader_entered{false};
-    std::atomic<bool> sync_done{false};
-
-    std::thread reader([&] {
-        auto t = rcu.register_thread();
-        rcu.read_lock(t);
-        reader_entered.store(true, std::memory_order_release);
-
-        // Hold the read lock until the writer starts synchronize
-        while (!sync_done.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
-        // Small delay to ensure synchronize is actually waiting
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        rcu.read_unlock(t);
-        rcu.unregister_thread(t);
-    });
-
-    // Wait for reader to enter critical section
-    while (!reader_entered.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
-
-    sync_done.store(true, std::memory_order_release);
     rcu.synchronize();
-
-    // If we got here, the reader has exited its critical section
-    reader.join();
-    rcu.unregister_thread(writer_token);
 }
 
 TEST(Rcu, ReadGuardScoping) {
     Rcu rcu;
-    auto t = rcu.register_thread();
     {
-        Rcu::ReadGuard guard(rcu, t);
-        // Inside critical section
+        Rcu::ReadGuard guard(rcu);
     }
-    // Outside — synchronize should complete immediately
+    synchronize_or_die(rcu, std::chrono::seconds(10));
+}
+
+TEST(Rcu, SynchronizeWaitsForReader) {
+    Rcu rcu;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> released{false};
+
+    std::thread reader([&] {
+        uint32_t idx = rcu.read_lock();
+        entered.store(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        released.store(true);
+        rcu.read_unlock(idx);
+    });
+    while (!entered.load()) std::this_thread::yield();
+
     rcu.synchronize();
-    rcu.unregister_thread(t);
+    EXPECT_TRUE(released.load()) << "synchronize returned during a reader";
+    reader.join();
+}
+
+// A coroutine enters its critical section on its caller's thread and often
+// leaves it on an I/O poller. The grace period must cover it until then.
+TEST(Rcu, SynchronizeWaitsForReaderThatUnlocksOnAnotherThread) {
+    Rcu rcu;
+    uint32_t idx = rcu.read_lock();  // entered on this thread
+    std::atomic<bool> released{false};
+
+    std::thread finisher([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        released.store(true);
+        rcu.read_unlock(idx);  // left on another
+    });
+    std::thread writer([&] {
+        rcu.synchronize();
+        EXPECT_TRUE(released.load()) << "grace period ended early";
+    });
+    finisher.join();
+    writer.join();
+}
+
+// Regression: the previous RCU kept a per-thread nesting count that the
+// unlocking thread decremented. With many sections entered on one thread and
+// left on another (batched coroutines on an async backend) the two threads
+// raced on it; the count was lost, the entering thread looked like it was
+// in a critical section forever, and synchronize() -- called by close() --
+// hung.
+TEST(Rcu, CrossThreadUnlockUnderLoad) {
+    Rcu rcu;
+    constexpr int kSections = 200000;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<uint32_t> handoff;
+    bool done = false;
+
+    std::thread finisher([&] {
+        for (;;) {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return !handoff.empty() || done; });
+            if (handoff.empty()) return;
+            uint32_t idx = handoff.front();
+            handoff.pop_front();
+            lk.unlock();
+            rcu.read_unlock(idx);
+        }
+    });
+    std::atomic<bool> stop_writer{false};
+    std::thread writer([&] {
+        while (!stop_writer.load()) rcu.synchronize();
+    });
+
+    for (int i = 0; i < kSections; ++i) {
+        uint32_t idx = rcu.read_lock();
+        if (i % 3 == 0) {
+            rcu.read_unlock(idx);  // some finish on the entering thread
+            continue;
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        handoff.push_back(idx);
+        cv.notify_one();
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        done = true;
+        cv.notify_one();
+    }
+    finisher.join();
+    stop_writer.store(true);
+    writer.join();
+
+    synchronize_or_die(rcu, std::chrono::seconds(10));
 }
 
 TEST(Rcu, ConcurrentReadersDoNotBlock) {
@@ -104,16 +166,13 @@ TEST(Rcu, ConcurrentReadersDoNotBlock) {
     std::vector<std::thread> threads;
     for (int i = 0; i < kNumReaders; ++i) {
         threads.emplace_back([&] {
-            auto t = rcu.register_thread();
             for (int j = 0; j < kIterations; ++j) {
-                rcu.read_lock(t);
-                rcu.read_unlock(t);
+                uint32_t idx = rcu.read_lock();
+                rcu.read_unlock(idx);
             }
             completed.fetch_add(1, std::memory_order_relaxed);
-            rcu.unregister_thread(t);
         });
     }
-
     for (auto& th : threads) th.join();
     EXPECT_EQ(completed.load(), kNumReaders);
 }
@@ -122,128 +181,92 @@ TEST(Rcu, WriterSeesAllReaderExits) {
     Rcu rcu;
     constexpr int kNumReaders = 4;
     constexpr int kIterations = 1000;
+    // Each reader publishes the value it saw on entry and checks on exit
+    // that a writer which observed it inside has not yet "reclaimed" it.
+    std::atomic<int> generation{0};
+    std::atomic<int> violations{0};
 
-    std::atomic<int> phase{0};
     std::vector<std::thread> readers;
-
     for (int i = 0; i < kNumReaders; ++i) {
         readers.emplace_back([&] {
-            auto t = rcu.register_thread();
             for (int j = 0; j < kIterations; ++j) {
-                rcu.read_lock(t);
-                // Simulate work
+                uint32_t idx = rcu.read_lock();
+                int g = generation.load(std::memory_order_acquire);
                 std::this_thread::yield();
-                rcu.read_unlock(t);
+                // The writer alternates bump, synchronize. After our read,
+                // one bump can complete, but the synchronize that follows it
+                // began after we entered and must wait for us; so seeing
+                // g + 2 here means a grace period ended early.
+                if (generation.load(std::memory_order_acquire) >= g + 2)
+                    violations.fetch_add(1);
+                rcu.read_unlock(idx);
             }
-            rcu.unregister_thread(t);
         });
     }
-
-    // Writer thread does synchronize repeatedly
-    auto wt = rcu.register_thread();
     for (int j = 0; j < 100; ++j) {
+        generation.fetch_add(1, std::memory_order_release);
         rcu.synchronize();
-        phase.fetch_add(1, std::memory_order_relaxed);
+        generation.fetch_add(1, std::memory_order_release);
+        rcu.synchronize();
     }
-    rcu.unregister_thread(wt);
-
     for (auto& th : readers) th.join();
-    EXPECT_GE(phase.load(), 100);
+    EXPECT_EQ(violations.load(), 0);
 }
 
-TEST(Rcu, MultipleTokensPerThread) {
+// Regression: a thread's slot was never released when it exited, so a
+// server creating threads per connection ran out of them.
+TEST(Rcu, ThreadChurnReleasesSlots) {
     Rcu rcu;
-    auto t1 = rcu.register_thread();
-    auto t2 = rcu.register_thread();
-    EXPECT_EQ(rcu.thread_count(), 2u);
-    rcu.read_lock(t1);
-    rcu.read_lock(t2);
-    rcu.read_unlock(t2);
-    rcu.read_unlock(t1);
-    rcu.unregister_thread(t1);
-    rcu.unregister_thread(t2);
-}
-
-// Regression: register_thread formerly used a monotonic counter and
-// never reused slots.  After kMaxThreads cumulative registrations (even
-// with only a few concurrent threads) the assert fired.  The fix scans
-// for freed slots under a mutex before allocating new ones.
-TEST(Rcu, SlotReuseDoesNotExhaust) {
-    Rcu rcu;
-    // Register and unregister more than kMaxThreads times, but only
-    // one thread at a time — this would have crashed before the fix.
-    for (uint32_t i = 0; i < Rcu::kMaxThreads + 100; ++i) {
-        auto t = rcu.register_thread();
-        ASSERT_TRUE(t.valid()) << "iteration " << i;
-        rcu.read_lock(t);
-        rcu.read_unlock(t);
-        rcu.unregister_thread(t);
+    for (uint32_t i = 0; i < 2 * Rcu::kMaxThreads; ++i) {
+        std::thread th([&] {
+            Rcu::ReadGuard guard(rcu);
+        });
+        th.join();
     }
-    // High-water mark stays at 1 since we reused the same slot each time.
-    EXPECT_EQ(rcu.thread_count(), 1u);
+    EXPECT_LE(rcu.thread_count(), 2u);
+    synchronize_or_die(rcu, std::chrono::seconds(10));
 }
 
-// Regression: verify slot reuse with concurrent threads registering and
-// unregistering.  The mutex must serialize slot allocation correctly.
-TEST(Rcu, ConcurrentSlotReuse) {
+// With more threads than slots, the rest share one atomically updated slot;
+// grace periods must still cover all of them.
+TEST(Rcu, MoreThreadsThanSlots) {
     Rcu rcu;
-    constexpr int kThreads = 8;
-    constexpr int kCycles = 200;
-    std::atomic<int> completed{0};
+    constexpr int kThreads = Rcu::kMaxThreads + 16;
+    std::barrier inside(kThreads + 1);
+    std::atomic<bool> release{false};
+    std::atomic<int> still_inside{0};
 
     std::vector<std::thread> threads;
-    for (int i = 0; i < kThreads; ++i) {
+    for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&] {
-            for (int c = 0; c < kCycles; ++c) {
-                auto t = rcu.register_thread();
-                ASSERT_TRUE(t.valid());
-                rcu.read_lock(t);
-                std::this_thread::yield();
-                rcu.read_unlock(t);
-                rcu.unregister_thread(t);
-            }
-            completed.fetch_add(1, std::memory_order_relaxed);
+            uint32_t idx = rcu.read_lock();
+            still_inside.fetch_add(1);
+            inside.arrive_and_wait();
+            while (!release.load()) std::this_thread::yield();
+            still_inside.fetch_sub(1);
+            rcu.read_unlock(idx);
         });
     }
+    inside.arrive_and_wait();
+    EXPECT_EQ(rcu.thread_count(), Rcu::kMaxThreads);
+
+    std::thread writer([&] {
+        rcu.synchronize();
+        EXPECT_EQ(still_inside.load(), 0) << "grace period ended early";
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    release.store(true);
+    writer.join();
     for (auto& th : threads) th.join();
-    EXPECT_EQ(completed.load(), kThreads);
-    // High-water mark should be at most kThreads (the peak concurrency).
-    EXPECT_LE(rcu.thread_count(), static_cast<uint32_t>(kThreads));
 }
 
-// Regression: exhausting the slots used to be an assert, compiled out in
-// release builds, after which register_thread wrote past threads_. It now
-// returns an invalid token.
-TEST(Rcu, ExhaustionReturnsInvalidToken) {
-    Rcu rcu;
-    std::vector<Rcu::Token> tokens;
-    for (uint32_t i = 0; i < Rcu::kMaxThreads; ++i) {
-        tokens.push_back(rcu.register_thread());
-        ASSERT_TRUE(tokens.back().valid()) << i;
+TEST(Rcu, ReaderFenceModeIsReported) {
+    // Exercised in both modes by CTest (rcu_test and rcu_test_reader_fence).
+    const char* force = std::getenv("UDEPOT_RCU_READER_FENCE");
+    if (force && force[0] == '1') {
+        EXPECT_TRUE(Rcu::reader_fence());
     }
-    EXPECT_FALSE(rcu.register_thread().valid());
-
-    rcu.unregister_thread(tokens.back());
-    tokens.pop_back();
-    auto again = rcu.register_thread();
-    EXPECT_TRUE(again.valid()) << "a freed slot must be reusable";
-    tokens.push_back(again);
-    for (auto t : tokens) rcu.unregister_thread(t);
-}
-
-// unregister_if_alive is how a thread's tokens are released at thread
-// exit, which can happen after the Rcu instance is gone.
-TEST(Rcu, UnregisterIfAliveFreesSlotOnlyWhileAlive) {
-    Rcu rcu;
-    auto t = rcu.register_thread();
-    Rcu::unregister_if_alive(rcu.id(), t);
-    auto t2 = rcu.register_thread();
-    EXPECT_EQ(rcu.thread_count(), 1u) << "slot was not freed";
-    rcu.unregister_thread(t2);
-
-    auto dead = std::make_unique<Rcu>();
-    uint64_t dead_id = dead->id();
-    auto dead_tok = dead->register_thread();
-    dead.reset();
-    Rcu::unregister_if_alive(dead_id, dead_tok);  // must not touch it
+#if !defined(__linux__)
+    EXPECT_TRUE(Rcu::reader_fence());
+#endif
 }

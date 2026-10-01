@@ -58,7 +58,7 @@ These are foundational constraints. Every change must preserve them.
    DMA buffers (`rte_malloc`) only at the SPDK boundary where hardware
    requires them.
 2. **No global locking**: The directory uses userspace RCU (per-thread
-   epoch, zero shared-line atomic RMW on the read path). Hash tables use
+   counters, zero shared-line atomic RMW on the read path). Hash tables use
    lock-free reads and 1024 stripe locks for writes.
 3. **Minimal amplification**: No indirection layers, journaling, or metadata
    overhead beyond what the log-structured allocator needs.

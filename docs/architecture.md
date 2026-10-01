@@ -33,61 +33,78 @@ Inherited from uDepot — non-negotiable.
 ### 1. RCU-Protected Hash Directory
 
 The hash directory (mapping from hash prefix to hash table) is protected by a
-hand-rolled, epoch-based userspace RCU with per-thread thread-local state.
+hand-rolled userspace RCU with per-thread counters (the sleepable-RCU
+algorithm).
 
 **Why**: The original uDepot drains all readers before a grow operation can
 proceed (a write lock on a `BRLock` with 128 per-thread RWLocks), stalling the
 entire store. RCU eliminates this: readers never block, and the writer defers
 reclamation of the old directory until a grace period elapses.
 
-**Per-thread RCU state** (one cache line per registered thread):
+**Per-thread slot** (one cache line, written only by the thread that owns it):
 
 ```cpp
-struct alignas(64) RcuThreadState {
-    std::atomic<uint64_t> epoch;  // odd = active, even/0 = quiescent
-    uint32_t nesting;             // concurrent coroutines on same thread
+struct alignas(64) Slot {
+    std::atomic<uint64_t> lock[2];    // sections entered, per index
+    std::atomic<uint64_t> unlock[2];  // sections left, per index
 };
 ```
 
-**Reader path** (zero shared-line atomic RMW):
+**Reader path** (zero shared-line atomic RMW, no shared-line writes):
 
 ```cpp
-void rcu_read_lock() {
-    if (tls_rcu->nesting++ == 0)
-        tls_rcu->epoch.store(global_epoch_.load(std::memory_order_relaxed) | 1,
-                             std::memory_order_release);
+uint32_t read_lock() {
+    Slot& s = this_thread_slot();
+    uint32_t idx = gp_idx_.load(relaxed) & 1;
+    s.lock[idx].store(s.lock[idx].load(relaxed) + 1, relaxed);
+    compiler_barrier();   // full fence where membarrier is unavailable
+    return idx;
 }
 
-void rcu_read_unlock() {
-    if (--tls_rcu->nesting == 0)
-        tls_rcu->epoch.store(0, std::memory_order_release);
+void read_unlock(uint32_t idx) {   // may run on a different thread
+    Slot& s = this_thread_slot();
+    s.unlock[idx].store(s.unlock[idx].load(relaxed) + 1, release);
 }
 ```
 
-Cost: two thread-local stores, one global load (read-shared, rarely written).
+A section is counted in on the thread that enters it and counted out on the
+thread that leaves it. They differ routinely: a coroutine starts on its
+caller's thread and finishes on an I/O backend's poller. Because only the
+sums matter, that is correct by construction, and each bump is a plain load
+and store on the bumping thread's own slot.
 
-**Writer path** (grow):
+**Writer path** (grow, close):
 
 ```cpp
-void synchronize_rcu() {
-    uint64_t target = global_epoch_.fetch_add(2, std::memory_order_acq_rel);
-    for (auto& ts : all_thread_states_) {
-        while (true) {
-            uint64_t e = ts.epoch.load(std::memory_order_acquire);
-            if (e == 0 || e > target) break;  // quiescent or past target
-            // spin/yield
-        }
-    }
+void synchronize() {
+    heavy_barrier();
+    wait_until_drained(other index);   // stragglers from the previous flip
+    flip gp_idx_;
+    heavy_barrier();
+    wait_until_drained(old index);     // sum(unlock) == sum(lock), all slots
+    heavy_barrier();
 }
 ```
+
+**Ordering.** A reader's lock bump must be visible before its protected loads
+(a StoreLoad ordering, which x86 and arm64 both relax). On Linux (x86-64 and
+arm64) `heavy_barrier()` is `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)`,
+which executes a full barrier on every running thread, so readers need only a
+compiler barrier, the trade the Linux kernel's `srcu_read_lock_lite` makes with
+`synchronize_rcu()`. On macOS, and on kernels without membarrier, readers issue
+a full fence instead (`dmb ish` on arm64). `UDEPOT_RCU_READER_FENCE=1` forces
+that path; CTest runs `rcu_test` both ways.
+
+Slots are claimed per thread on first use and released when the thread exits.
+Counts only grow, so a reused slot keeps counting. Beyond 256 concurrent
+threads, the rest share one slot updated with atomic RMW: slower, still
+correct.
 
 **RCU critical section spans the entire KV operation**, including I/O. This is
 correct: the grace period is bounded by the slowest in-flight I/O (milliseconds
 on NVMe), and grows are rare. This means **no separate table refcounting** —
-RCU alone guarantees that no reader references a freed table.
-
-Nesting handles multiple coroutines on the same thread: the thread goes
-quiescent only when all coroutines have exited their critical sections.
+RCU alone guarantees that no reader references a freed table. `close()` uses
+the same grace period to wait for operations in flight.
 
 ### 2. Lock-Free Reads, Stripe-Locked Writes
 
@@ -264,7 +281,7 @@ uDepot-ng/
 │   ├── hash_table.h             # hopscotch table (lock-free reads)
 │   ├── hash_table.cc
 │   ├── hash_entry.h             # 8-byte packed hash entry
-│   ├── rcu.h                    # per-thread epoch-based userspace RCU
+│   ├── rcu.h                    # per-thread-counter userspace RCU
 │   ├── rcu.cc
 │   ├── buffer.h                 # IoBuffer, allocator tags
 │   ├── coro.h                   # CoroTask (eager start, symmetric transfer)
@@ -366,7 +383,7 @@ not the persistent format.
 ## Implementation Order
 
 1. **`coro.h`** — CoroTask with eager start, `run_sync()`.
-2. **`rcu.h`** — per-thread epoch-based RCU.
+2. **`rcu.h`** — per-thread-counter RCU.
 3. **`buffer.h`** — IoBuffer with allocator tags.
 4. **`io/posix.h`** — synchronous pread/pwrite backend.
 5. **`hash_entry.h`, `hash_table.h`** — hopscotch table with lock-free

@@ -181,6 +181,10 @@ if(UDEPOT_BUILD_TESTS)
 
     udepot_add_test(coro_test       test/coro_test.cc)
     udepot_add_test(rcu_test        test/rcu_test.cc)
+    # The reader-fence path, which macOS and kernels without membarrier use.
+    add_test(NAME rcu_test_reader_fence COMMAND rcu_test)
+    set_tests_properties(rcu_test_reader_fence PROPERTIES TIMEOUT 60
+                         ENVIRONMENT UDEPOT_RCU_READER_FENCE=1)
     udepot_add_test(buffer_test     test/buffer_test.cc)
     udepot_add_test(posix_test      test/io/posix_test.cc)
     udepot_add_test(hash_table_test test/hash_table_test.cc)

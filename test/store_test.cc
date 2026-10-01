@@ -246,11 +246,9 @@ TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
     // first put does not necessarily land at grain 0).
     uint64_t hash = store_.hash_key(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>("crc_key"), 7));
-    auto tok = store_.rcu().register_thread();
-    store_.rcu().read_lock(tok);
+    uint32_t rcu_idx = store_.rcu().read_lock();
     udepot::HashEntry entry = store_.directory().lookup(hash);
-    store_.rcu().read_unlock(tok);
-    store_.rcu().unregister_thread(tok);
+    store_.rcu().read_unlock(rcu_idx);
     ASSERT_FALSE(entry.empty());
 
     off_t offset = static_cast<off_t>(entry.pba()) * store_.grain_size();
@@ -401,8 +399,7 @@ TEST_F(StoreTest, PutOverwriteDoesNotLeaveOldValue) {
     uint64_t hash = store_.hash_key(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>("dup"), 3));
 
-    auto tok = store_.rcu().register_thread();
-    store_.rcu().read_lock(tok);
+    uint32_t rcu_idx = store_.rcu().read_lock();
 
     int count = 0;
     for (uint32_t start = 0; ; ) {
@@ -412,8 +409,7 @@ TEST_F(StoreTest, PutOverwriteDoesNotLeaveOldValue) {
         ++count;
     }
 
-    store_.rcu().read_unlock(tok);
-    store_.rcu().unregister_thread(tok);
+    store_.rcu().read_unlock(rcu_idx);
 
     EXPECT_EQ(count, 1) << "overwrite must not create duplicate entries";
 }
@@ -500,11 +496,9 @@ TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
 
     // Look up the PBA from the directory.
     uint64_t hash = store_.hash_key(key_span);
-    auto tok = store_.rcu().register_thread();
-    store_.rcu().read_lock(tok);
+    uint32_t rcu_idx = store_.rcu().read_lock();
     udepot::HashEntry entry = store_.directory().lookup(hash);
-    store_.rcu().read_unlock(tok);
-    store_.rcu().unregister_thread(tok);
+    store_.rcu().read_unlock(rcu_idx);
     ASSERT_FALSE(entry.empty());
 
     off_t offset = static_cast<off_t>(entry.pba()) * store_.grain_size();

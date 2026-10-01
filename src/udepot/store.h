@@ -154,7 +154,6 @@ private:
     // Salsa segment allocator.
     salsa::Scm* scm_ = nullptr;
     uint64_t seg_md_grains_ = 0;
-    Rcu::Token gc_rcu_token_{};
 
     // Crash recovery metadata.
     uint64_t seed_ = 0;
@@ -197,13 +196,6 @@ private:
     off_t grain_to_offset(uint64_t grain) const {
         return static_cast<off_t>(grain) * grain_size_;
     }
-
-    // Per-thread RCU token.  Each calling thread lazily registers with
-    // the RCU subsystem on first use.  Tokens are cleaned up when the
-    // thread exits (thread_local destructor).  Safe only when coroutines
-    // are driven by run_sync() on the calling thread — a coroutine that
-    // migrates threads would need a different scheme.
-    Rcu::Token thread_token();
 
     // Persist segment metadata for the segment containing `grain` if it
     // has not been written yet.  Called from coroutine context (put/del).
