@@ -202,7 +202,9 @@ TEST(HashTable, ConcurrentReadsWhileWriting) {
     for (int r = 0; r < kNumReaders; ++r) {
         readers.emplace_back([&, r] {
             uint64_t local_reads = 0;
-            while (!stop.load(std::memory_order_relaxed)) {
+            // do-while: under load the writers can finish before a reader
+            // is first scheduled, and the test must still exercise reads.
+            do {
                 uint64_t bucket = (r * 1000 + local_reads) % table.num_buckets();
                 uint8_t tag = static_cast<uint8_t>((local_reads % 254) + 1);
                 uint64_t hash = make_hash(bucket, tag, table.index_bits());
@@ -213,7 +215,7 @@ TEST(HashTable, ConcurrentReadsWhileWriting) {
                     EXPECT_EQ(entry.key_tag(), tag);
                 }
                 ++local_reads;
-            }
+            } while (!stop.load(std::memory_order_relaxed));
             reads.fetch_add(local_reads, std::memory_order_relaxed);
         });
     }

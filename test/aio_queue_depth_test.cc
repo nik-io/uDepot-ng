@@ -5,6 +5,7 @@
 #include "udepot/io/aio.h"
 
 #include <algorithm>
+#include <iterator>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -181,7 +182,7 @@ static double median(std::vector<double>& v) {
 
 TEST_F(AioQueueDepthTest, DeeperQueueFasterReads) {
     constexpr int kKeys = 64;
-    constexpr int kIterations = 3;
+    constexpr int kIterations = 9;
 
     for (int i = 0; i < kKeys; ++i) {
         std::string key = make_key(i);
@@ -195,10 +196,15 @@ TEST_F(AioQueueDepthTest, DeeperQueueFasterReads) {
     };
     std::vector<DepthResult> results;
 
-    for (int depth : {1, 2, 4, 8, 16, 32}) {
-        std::vector<double> times;
+    // Depths are interleaved within each iteration so machine drift over
+    // the run hits every depth alike instead of skewing late ones.
+    constexpr int kDepths[] = {1, 2, 4, 8, 16, 32};
+    constexpr size_t kNumDepths = std::size(kDepths);
+    std::vector<std::vector<double>> times(kNumDepths);
 
-        for (int iter = 0; iter < kIterations; ++iter) {
+    for (int iter = 0; iter < kIterations; ++iter) {
+        for (size_t d = 0; d < kNumDepths; ++d) {
+            const int depth = kDepths[d];
             struct ReadCtx {
                 uint8_t val[128];
                 size_t val_size = 0;
@@ -230,13 +236,15 @@ TEST_F(AioQueueDepthTest, DeeperQueueFasterReads) {
                 }
             }
 
-            times.push_back(now_secs() - t0);
+            times[d].push_back(now_secs() - t0);
         }
+    }
 
-        double med = median(times);
-        results.push_back({depth, med});
+    for (size_t d = 0; d < kNumDepths; ++d) {
+        double med = median(times[d]);
+        results.push_back({kDepths[d], med});
         fprintf(stderr, "  GET  depth=%-2d  median=%.6fs  (%.1f Kops/s)\n",
-                depth, med, kKeys / (med * 1000));
+                kDepths[d], med, kKeys / (med * 1000));
     }
 
     // Assert: depth >= 4 is faster than depth == 1.  Depth 2 is
@@ -255,7 +263,7 @@ TEST_F(AioQueueDepthTest, DeeperQueueFasterReads) {
 
 TEST_F(AioQueueDepthTest, DeeperQueueFasterWrites) {
     constexpr int kKeys = 64;
-    constexpr int kIterations = 3;
+    constexpr int kIterations = 9;
 
     struct DepthResult {
         int depth;
@@ -263,10 +271,14 @@ TEST_F(AioQueueDepthTest, DeeperQueueFasterWrites) {
     };
     std::vector<DepthResult> results;
 
-    for (int depth : {1, 2, 4, 8, 16, 32}) {
-        std::vector<double> times;
+    // Interleaved, as in DeeperQueueFasterReads.
+    constexpr int kDepths[] = {1, 2, 4, 8, 16, 32};
+    constexpr size_t kNumDepths = std::size(kDepths);
+    std::vector<std::vector<double>> times(kNumDepths);
 
-        for (int iter = 0; iter < kIterations; ++iter) {
+    for (int iter = 0; iter < kIterations; ++iter) {
+        for (size_t d = 0; d < kNumDepths; ++d) {
+            const int depth = kDepths[d];
             // Each iteration writes a distinct set of keys so upsert
             // doesn't confound the measurement with lookup-before-write
             // on the second iteration.
@@ -293,13 +305,15 @@ TEST_F(AioQueueDepthTest, DeeperQueueFasterWrites) {
                 }
             }
 
-            times.push_back(now_secs() - t0);
+            times[d].push_back(now_secs() - t0);
         }
+    }
 
-        double med = median(times);
-        results.push_back({depth, med});
+    for (size_t d = 0; d < kNumDepths; ++d) {
+        double med = median(times[d]);
+        results.push_back({kDepths[d], med});
         fprintf(stderr, "  PUT  depth=%-2d  median=%.6fs  (%.1f Kops/s)\n",
-                depth, med, kKeys / (med * 1000));
+                kDepths[d], med, kKeys / (med * 1000));
     }
 
     double serial = results[0].median_secs;

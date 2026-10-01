@@ -154,6 +154,7 @@ TEST_F(DirectoryTest, ConcurrentReadsAndGrow) {
 
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> reads{0};
+    std::atomic<int> started{0};
 
     // Reader threads doing lookups concurrently with grow.
     std::vector<std::thread> readers;
@@ -161,7 +162,7 @@ TEST_F(DirectoryTest, ConcurrentReadsAndGrow) {
         readers.emplace_back([&, r] {
             Rcu::Token tok = rcu_.register_thread();
             uint64_t local = 0;
-            while (!stop.load(std::memory_order_relaxed)) {
+            do {
                 rcu_.read_lock(tok);
                 int idx = (r * 100 + local) % kEntries;
                 uint64_t hash = make_hash(
@@ -172,14 +173,16 @@ TEST_F(DirectoryTest, ConcurrentReadsAndGrow) {
                               static_cast<uint64_t>(idx + 1000));
                 }
                 rcu_.read_unlock(tok);
-                ++local;
-            }
+                if (++local == 1) started.fetch_add(1);
+            } while (!stop.load(std::memory_order_relaxed));
             reads.fetch_add(local, std::memory_order_relaxed);
             rcu_.unregister_thread(tok);
         });
     }
 
-    // Grow while readers are active.
+    // Grow while readers are active. Wait for all of them first: under load
+    // the grows could otherwise finish before any reader is scheduled.
+    while (started.load() < 4) std::this_thread::yield();
     EXPECT_EQ(dir.grow(), 0);
     EXPECT_EQ(dir.grow(), 0);
 

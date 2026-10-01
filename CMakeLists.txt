@@ -193,7 +193,10 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(concurrent_aio_store_test test/concurrent_aio_store_test.cc)
     set_tests_properties(concurrent_aio_store_test PROPERTIES TIMEOUT 180)
     udepot_add_test(aio_queue_depth_test test/aio_queue_depth_test.cc)
-    set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 180)
+    # Asserts that deeper queues beat serial, measured within the run; CPU
+    # contention from tests running alongside it makes that a coin flip.
+    set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 180
+                         RUN_SERIAL TRUE)
     udepot_add_test(net_test test/io/net_test.cc)
 
     if(UDEPOT_BUILD_NET)
