@@ -37,11 +37,17 @@ void* uDepotOpen(const char* fname, uint64_t size, int force_destroy) {
     return static_cast<void*>(store);
 }
 
+// Closes without freeing: another thread may still be inside a call on
+// this handle (ctypes releases the GIL), and the store must outlive it.
+// Calls after close fail with -ESHUTDOWN. uDepotFree releases the memory
+// once no caller can hold the handle.
 void uDepotClose(void* kv) {
     if (!kv) return;
-    auto* store = static_cast<Store*>(kv);
-    store->close();
-    delete store;
+    static_cast<Store*>(kv)->close();
+}
+
+void uDepotFree(void* kv) {
+    delete static_cast<Store*>(kv);
 }
 
 int uDepotGet(void* kv, const uint8_t key[], uint32_t key_size,

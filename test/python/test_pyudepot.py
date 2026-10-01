@@ -105,3 +105,54 @@ class TestBinaryKeys:
         out = np.zeros(4, dtype=np.uint8)
         assert store.get(key, out)
         np.testing.assert_array_equal(out, val)
+
+
+class TestClose:
+    """Regression: closing freed the store under other callers.
+
+    _cleanup() set the handle to None, so a later call passed NULL to the
+    C library (a crash), and the C close deleted the store while another
+    thread could still be inside a call (ctypes releases the GIL). Close
+    now leaves the store allocated and calls fail cleanly.
+    """
+
+    def test_calls_after_close_fail_cleanly(self, tmp_path):
+        kv = pyudepot.uDepot(file_name=str(tmp_path / "closed"),
+                             size=STORE_SIZE, force_destroy=True)
+        assert kv.put(_key("k"), _val("v"))
+        kv._cleanup()
+        assert not kv.put(_key("k"), _val("v"))
+        assert not kv.get(_key("k"), np.zeros(8, dtype=np.uint8))
+        assert not kv.delete(_key("k"))
+        assert kv.exists(_key("k")) is None
+
+    def test_close_while_threads_use_store(self, tmp_path):
+        import threading
+
+        kv = pyudepot.uDepot(file_name=str(tmp_path / "racing"),
+                             size=STORE_SIZE, force_destroy=True)
+        started = threading.Barrier(5)
+        stop = threading.Event()
+
+        def worker(tid):
+            out = np.zeros(16, dtype=np.uint8)
+            started.wait()
+            i = 0
+            while not stop.is_set():
+                key = _key(f"t{tid}_{i % 32}")
+                if i % 2:
+                    kv.put(key, key)
+                else:
+                    kv.get(key, out)
+                i += 1
+
+        threads = [threading.Thread(target=worker, args=(t,))
+                   for t in range(4)]
+        for t in threads:
+            t.start()
+        started.wait()
+        kv._cleanup()
+        stop.set()
+        for t in threads:
+            t.join()
+        assert not kv.put(_key("after"), _val("close"))

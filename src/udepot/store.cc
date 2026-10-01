@@ -595,11 +595,17 @@ int UDepot<IO>::open(const StoreConfig& config) {
         return -rc;
     }
 
+    open_.store(true, std::memory_order_release);
     return 0;
 }
 
 template <typename IO>
 void UDepot<IO>::close() {
+    // Operations check open_ inside their RCU read section, so once the
+    // grace period ends none is still running and none can start.
+    open_.store(false, std::memory_order_release);
+    rcu_.synchronize();
+
     if (scm_) {
         scm_->exit_threads();
 
@@ -888,6 +894,7 @@ CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
         co_return -EINVAL;
 
     Rcu::ReadGuard guard(rcu_);
+    if (!open_.load(std::memory_order_acquire)) co_return -ESHUTDOWN;
 
     // Build the on-disk entry.  Must happen before any co_await so that
     // key/val data is copied while the caller's buffers are still alive.
@@ -1006,6 +1013,7 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
 
     uint64_t hash = hash_key(key);
     Rcu::ReadGuard guard(rcu_);
+    if (!open_.load(std::memory_order_acquire)) co_return -ESHUTDOWN;
 
     // Iterate through all tag-matching entries to handle collisions.
     for (uint32_t start = 0; ; ) {
@@ -1133,6 +1141,7 @@ CoroTask<int> UDepot<IO>::del(std::span<const uint8_t> key,
 
     uint64_t hash = hash_key(key);
     Rcu::ReadGuard guard(rcu_);
+    if (!open_.load(std::memory_order_acquire)) co_return -ESHUTDOWN;
 
     const uint64_t tomb_grains = kv_total_grains(key.size(), 0);
     uint64_t tomb = UINT64_MAX;
@@ -1176,6 +1185,7 @@ CoroTask<int> UDepot<IO>::exists(std::span<const uint8_t> key,
 
     uint64_t hash = hash_key(key);
     Rcu::ReadGuard guard(rcu_);
+    if (!open_.load(std::memory_order_acquire)) co_return -ESHUTDOWN;
 
     for (uint32_t start = 0; ; ) {
         HashEntry entry = directory_->lookup(hash, start);

@@ -11,6 +11,7 @@ extern "C" {
 
 DLLOUT void* uDepotOpen(const char* fname, uint64_t size, int force_destroy);
 DLLOUT void  uDepotClose(void* kv);
+DLLOUT void  uDepotFree(void* kv);
 DLLOUT int   uDepotGet(void* kv, const uint8_t key[], uint32_t key_size,
                         uint8_t val_buf[], uint64_t val_buf_size);
 DLLOUT int   uDepotPut(void* kv, const uint8_t key[], uint32_t key_size,

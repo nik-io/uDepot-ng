@@ -13,7 +13,11 @@
 
 using Store = udepot::UDepot<udepot::AioIO>;
 
-static Store* g_store = nullptr;
+// Never freed: Java threads call get/put/del without taking g_mtx, so
+// shutdown() closes the store (calls then fail with -ESHUTDOWN) but must
+// not destroy it under them.
+static Store g_store;
+static bool g_open = false;  // guarded by g_mtx
 static std::mutex g_mtx;
 
 JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_init(
@@ -24,15 +28,9 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_init(
     if (!path) return ENOMEM;
 
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (g_store) {
+    if (g_open) {
         env->ReleaseStringUTFChars(fname, path);
         return 0;
-    }
-
-    g_store = new (std::nothrow) Store();
-    if (!g_store) {
-        env->ReleaseStringUTFChars(fname, path);
-        return ENOMEM;
     }
 
     udepot::StoreConfig config;
@@ -42,23 +40,18 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_init(
     config.initial_tables = 4;
     config.index_bits = 14;
 
-    int rc = g_store->open(config);
+    int rc = g_store.open(config);
     env->ReleaseStringUTFChars(fname, path);
-
-    if (rc != 0) {
-        delete g_store;
-        g_store = nullptr;
-    }
+    g_open = (rc == 0);
     return rc;
 }
 
 JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_shutdown(
     JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (g_store) {
-        g_store->close();
-        delete g_store;
-        g_store = nullptr;
+    if (g_open) {
+        g_store.close();
+        g_open = false;
     }
     return 0;
 }
@@ -66,8 +59,6 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_shutdown(
 JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_get(
     JNIEnv* env, jobject, jbyteArray key, jlong key_size,
     jbyteArray val, jlong val_size) {
-    if (!g_store) return -EINVAL;
-
     auto* key_ptr = static_cast<jbyte*>(
         env->GetPrimitiveArrayCritical(key, nullptr));
     if (!key_ptr) return -ENOMEM;
@@ -83,7 +74,7 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_get(
         static_cast<size_t>(key_size));
 
     size_t val_size_read = 0;
-    int rc = g_store->get(key_span,
+    int rc = g_store.get(key_span,
                           reinterpret_cast<uint8_t*>(val_ptr),
                           static_cast<size_t>(val_size),
                           &val_size_read).run_sync();
@@ -98,8 +89,6 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_get(
 JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_put(
     JNIEnv* env, jobject, jbyteArray key, jlong key_size,
     jbyteArray val, jlong val_size) {
-    if (!g_store) return EINVAL;
-
     auto* key_ptr = static_cast<jbyte*>(
         env->GetPrimitiveArrayCritical(key, nullptr));
     if (!key_ptr) return ENOMEM;
@@ -117,7 +106,7 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_put(
         reinterpret_cast<const uint8_t*>(val_ptr),
         static_cast<size_t>(val_size));
 
-    int rc = g_store->put(key_span, val_span).run_sync();
+    int rc = g_store.put(key_span, val_span).run_sync();
 
     env->ReleasePrimitiveArrayCritical(val, val_ptr, 0);
     env->ReleasePrimitiveArrayCritical(key, key_ptr, 0);
@@ -126,16 +115,15 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_put(
 
 JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_del(
     JNIEnv* env, jobject, jbyteArray key, jlong key_size) {
-    if (!g_store) return EINVAL;
-
     auto* key_ptr = static_cast<jbyte*>(
         env->GetPrimitiveArrayCritical(key, nullptr));
+    if (!key_ptr) return ENOMEM;
 
     auto key_span = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(key_ptr),
         static_cast<size_t>(key_size));
 
-    int rc = g_store->del(key_span).run_sync();
+    int rc = g_store.del(key_span).run_sync();
 
     env->ReleasePrimitiveArrayCritical(key, key_ptr, 0);
     return rc;
@@ -143,13 +131,13 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_del(
 
 JNIEXPORT jlong JNICALL Java_com_ibm_udepot_uDepotJNI_getSize(
     JNIEnv*, jobject) {
-    if (!g_store) return 0;
     // TODO: track KV utilization bytes when crash recovery is added.
     return 0;
 }
 
 JNIEXPORT jlong JNICALL Java_com_ibm_udepot_uDepotJNI_getRawDeviceCapacity(
     JNIEnv*, jobject) {
-    if (!g_store) return 0;
-    return static_cast<jlong>(g_store->io().get_size());
+    std::lock_guard<std::mutex> lock(g_mtx);
+    if (!g_open) return 0;
+    return static_cast<jlong>(g_store.io().get_size());
 }
