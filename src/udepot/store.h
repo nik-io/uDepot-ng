@@ -107,32 +107,30 @@ public:
                          size_t* val_size_out);
 
     // Convenience overloads for string keys/values.
-    CoroTask<int> put(std::string_view key, std::string_view val) {
-        return put(
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(key.data()), key.size()),
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(val.data()), val.size()));
+    static std::span<const uint8_t> as_bytes(std::string_view s) {
+        return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
+    }
+
+    CoroTask<int> put(std::string_view key, std::string_view val,
+                      PutMode mode = PutMode::kUpsert,
+                      uint64_t if_version = kAnyVersion) {
+        return put(as_bytes(key), as_bytes(val), mode, if_version);
     }
 
     CoroTask<int> get(std::string_view key, uint8_t* val_out,
-                      size_t val_buf_size, size_t* val_size_out) {
-        return get(
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(key.data()), key.size()),
-            val_out, val_buf_size, val_size_out);
+                      size_t val_buf_size, size_t* val_size_out,
+                      uint64_t* version_out = nullptr) {
+        return get(as_bytes(key), val_out, val_buf_size, val_size_out,
+                   version_out);
     }
 
-    CoroTask<int> del(std::string_view key) {
-        return del(std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(key.data()), key.size()));
+    CoroTask<int> del(std::string_view key,
+                      uint64_t if_version = kAnyVersion) {
+        return del(as_bytes(key), if_version);
     }
 
     CoroTask<int> exists(std::string_view key, size_t* val_size_out) {
-        return exists(
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(key.data()), key.size()),
-            val_size_out);
+        return exists(as_bytes(key), val_size_out);
     }
 
     uint64_t hash_key(std::span<const uint8_t> key) const {

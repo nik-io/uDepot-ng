@@ -4,6 +4,7 @@
 #include "udepot/store.h"
 #include "udepot/io/posix.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -529,4 +530,65 @@ TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
 
     EXPECT_EQ(suffix.crc16, ref_crc)
         << "On-disk CRC covers only the 14-byte header (matching uDepot)";
+}
+
+TEST_F(StoreTest, PutCreateFailsIfKeyExists) {
+    EXPECT_EQ(store_.put("k", "v1", udepot::PutMode::kCreate).run_sync(), 0);
+    EXPECT_EQ(store_.put("k", "v2", udepot::PutMode::kCreate).run_sync(),
+              -EEXIST);
+    char val[8];
+    size_t n = 0;
+    ASSERT_EQ(store_.get("k", reinterpret_cast<uint8_t*>(val), sizeof(val),
+                         &n).run_sync(), 0);
+    EXPECT_EQ(std::string_view(val, n), "v1");
+}
+
+TEST_F(StoreTest, PutReplaceFailsIfKeyMissing) {
+    EXPECT_EQ(store_.put("k", "v", udepot::PutMode::kReplace).run_sync(),
+              -ENOENT);
+    size_t n = 0;
+    EXPECT_EQ(store_.get("k", nullptr, 0, &n).run_sync(), -ENOENT);
+    ASSERT_EQ(store_.put("k", "v1").run_sync(), 0);
+    EXPECT_EQ(store_.put("k", "v2", udepot::PutMode::kReplace).run_sync(), 0);
+}
+
+TEST_F(StoreTest, VersionChangesOnEveryPut) {
+    uint64_t v1 = udepot::kAnyVersion, v2 = udepot::kAnyVersion;
+    size_t n = 0;
+    ASSERT_EQ(store_.put("k", "a").run_sync(), 0);
+    ASSERT_EQ(store_.get("k", nullptr, 0, &n, &v1).run_sync(), 0);
+    ASSERT_EQ(store_.put("k", "a").run_sync(), 0);
+    ASSERT_EQ(store_.get("k", nullptr, 0, &n, &v2).run_sync(), 0);
+    EXPECT_NE(v1, udepot::kAnyVersion);
+    EXPECT_NE(v1, v2);
+}
+
+TEST_F(StoreTest, PutIfVersionRejectsStaleVersion) {
+    uint64_t v1 = 0, v2 = 0;
+    size_t n = 0;
+    ASSERT_EQ(store_.put("k", "a").run_sync(), 0);
+    ASSERT_EQ(store_.get("k", nullptr, 0, &n, &v1).run_sync(), 0);
+    ASSERT_EQ(store_.put("k", "b", udepot::PutMode::kUpsert, v1).run_sync(), 0);
+    // v1 is gone now; a second writer holding it must lose.
+    EXPECT_EQ(store_.put("k", "c", udepot::PutMode::kUpsert, v1).run_sync(),
+              -ESTALE);
+    char val[8];
+    ASSERT_EQ(store_.get("k", reinterpret_cast<uint8_t*>(val), sizeof(val),
+                         &n, &v2).run_sync(), 0);
+    EXPECT_EQ(std::string_view(val, n), "b");
+    // A version check implies the key must exist.
+    EXPECT_EQ(store_.put("missing", "x", udepot::PutMode::kUpsert, v2)
+                  .run_sync(), -ENOENT);
+}
+
+TEST_F(StoreTest, DelIfVersion) {
+    uint64_t v1 = 0, v2 = 0;
+    size_t n = 0;
+    ASSERT_EQ(store_.put("k", "a").run_sync(), 0);
+    ASSERT_EQ(store_.get("k", nullptr, 0, &n, &v1).run_sync(), 0);
+    ASSERT_EQ(store_.put("k", "b").run_sync(), 0);
+    EXPECT_EQ(store_.del("k", v1).run_sync(), -ESTALE);
+    ASSERT_EQ(store_.get("k", nullptr, 0, &n, &v2).run_sync(), 0);
+    EXPECT_EQ(store_.del("k", v2).run_sync(), 0);
+    EXPECT_EQ(store_.get("k", nullptr, 0, &n).run_sync(), -ENOENT);
 }
