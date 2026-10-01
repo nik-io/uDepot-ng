@@ -55,18 +55,28 @@ public:
         Token token_;
     };
 
-    Rcu() noexcept = default;
+    Rcu();
+    ~Rcu();
+
+    Rcu(const Rcu&) = delete;
+    Rcu& operator=(const Rcu&) = delete;
 
     uint64_t id() const noexcept { return id_; }
 
     // Register the calling thread. Returns a Token for use with
     // read_lock/read_unlock. Must be called before any RCU operations
-    // on this thread.
+    // on this thread. Returns an invalid Token if all kMaxThreads slots
+    // are in use.
     Token register_thread() noexcept;
 
     // Unregister a previously registered thread. The thread must not be
     // inside a read-side critical section.
     void unregister_thread(Token t) noexcept;
+
+    // Unregister `t` from the Rcu instance with this id, if it still
+    // exists. For thread-exit cleanup, which may outlive the instance:
+    // instances deregister under the same lock when destroyed.
+    static void unregister_if_alive(uint64_t id, Token t) noexcept;
 
     // Enter a read-side critical section. The thread must be registered.
     void read_lock(Token t) noexcept;

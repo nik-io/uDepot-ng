@@ -5,8 +5,42 @@
 
 #include <cassert>
 #include <thread>
+#include <unordered_map>
 
 namespace udepot {
+
+namespace {
+
+// Live instances by id, for thread-exit cleanup. Only taken when an Rcu is
+// created or destroyed and when a thread that used one exits.
+std::mutex& live_mu() {
+    static std::mutex mu;
+    return mu;
+}
+
+std::unordered_map<uint64_t, Rcu*>& live() {
+    static std::unordered_map<uint64_t, Rcu*> map;
+    return map;
+}
+
+}  // namespace
+
+Rcu::Rcu() {
+    std::lock_guard<std::mutex> lock(live_mu());
+    live()[id_] = this;
+}
+
+Rcu::~Rcu() {
+    std::lock_guard<std::mutex> lock(live_mu());
+    live().erase(id_);
+}
+
+void Rcu::unregister_if_alive(uint64_t id, Token t) noexcept {
+    std::lock_guard<std::mutex> lock(live_mu());
+    auto it = live().find(id);
+    if (it != live().end() && t.valid())
+        it->second->unregister_thread(t);
+}
 
 uint64_t Rcu::next_id() noexcept {
     static std::atomic<uint64_t> counter{1};
@@ -24,7 +58,7 @@ Rcu::Token Rcu::register_thread() noexcept {
             return Token{i};
         }
     }
-    assert(count < kMaxThreads && "too many concurrent RCU threads");
+    if (count == kMaxThreads) return Token{};
     threads_[count].registered.store(true, std::memory_order_relaxed);
     threads_[count].epoch.store(0, std::memory_order_relaxed);
     threads_[count].nesting = 0;

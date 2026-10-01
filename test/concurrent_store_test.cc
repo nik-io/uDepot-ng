@@ -423,3 +423,24 @@ TEST_F(ConcurrentStoreTest, ConcurrentPutsOfOneKeySurviveReopen) {
     }
     EXPECT_EQ(changed, 0) << "values changed across reopen";
 }
+
+// Regression: a thread's RCU slot was never released when it exited, so a
+// server that creates threads per connection (memcache: two each) ran the
+// store out of its 256 slots after ~128 connections and then wrote past
+// the slot array. Thread exit now releases them.
+TEST_F(ConcurrentStoreTest, ThreadChurnDoesNotLeakRcuSlots) {
+    constexpr int kThreads = 2 * udepot::Rcu::kMaxThreads;
+    int errors = 0;
+    for (int t = 0; t < kThreads; ++t) {
+        std::thread th([&, t] {
+            std::string key = "churn_" + std::to_string(t);
+            if (store_.put(key, "v").run_sync() != 0) ++errors;
+            size_t n = 0;
+            if (store_.get(key, nullptr, 0, &n).run_sync() != 0) ++errors;
+        });
+        th.join();
+    }
+    EXPECT_EQ(errors, 0);
+    // The test thread, the GC token and one churn thread at a time.
+    EXPECT_LE(store_.rcu().thread_count(), 4u);
+}

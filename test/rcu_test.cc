@@ -4,6 +4,7 @@
 #include "udepot/rcu.h"
 
 #include <atomic>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -208,4 +209,41 @@ TEST(Rcu, ConcurrentSlotReuse) {
     EXPECT_EQ(completed.load(), kThreads);
     // High-water mark should be at most kThreads (the peak concurrency).
     EXPECT_LE(rcu.thread_count(), static_cast<uint32_t>(kThreads));
+}
+
+// Regression: exhausting the slots used to be an assert, compiled out in
+// release builds, after which register_thread wrote past threads_. It now
+// returns an invalid token.
+TEST(Rcu, ExhaustionReturnsInvalidToken) {
+    Rcu rcu;
+    std::vector<Rcu::Token> tokens;
+    for (uint32_t i = 0; i < Rcu::kMaxThreads; ++i) {
+        tokens.push_back(rcu.register_thread());
+        ASSERT_TRUE(tokens.back().valid()) << i;
+    }
+    EXPECT_FALSE(rcu.register_thread().valid());
+
+    rcu.unregister_thread(tokens.back());
+    tokens.pop_back();
+    auto again = rcu.register_thread();
+    EXPECT_TRUE(again.valid()) << "a freed slot must be reusable";
+    tokens.push_back(again);
+    for (auto t : tokens) rcu.unregister_thread(t);
+}
+
+// unregister_if_alive is how a thread's tokens are released at thread
+// exit, which can happen after the Rcu instance is gone.
+TEST(Rcu, UnregisterIfAliveFreesSlotOnlyWhileAlive) {
+    Rcu rcu;
+    auto t = rcu.register_thread();
+    Rcu::unregister_if_alive(rcu.id(), t);
+    auto t2 = rcu.register_thread();
+    EXPECT_EQ(rcu.thread_count(), 1u) << "slot was not freed";
+    rcu.unregister_thread(t2);
+
+    auto dead = std::make_unique<Rcu>();
+    uint64_t dead_id = dead->id();
+    auto dead_tok = dead->register_thread();
+    dead.reset();
+    Rcu::unregister_if_alive(dead_id, dead_tok);  // must not touch it
 }

@@ -33,8 +33,16 @@ struct TokenEntry {
     Rcu::Token token;
 };
 
+// A thread's tokens are released when it exits; otherwise every thread
+// that ever touched a store keeps an RCU slot, and a server that churns
+// threads runs out of them.
 struct TokenStore {
     std::vector<TokenEntry> entries;
+
+    ~TokenStore() {
+        for (auto& e : entries)
+            Rcu::unregister_if_alive(e.rcu_id, e.token);
+    }
 };
 
 thread_local TokenStore tl_tokens;
@@ -120,12 +128,15 @@ Rcu::Token UDepot<IO>::thread_token() {
     for (auto& e : entries) {
         if (e.rcu != &rcu_) continue;
         if (e.rcu_id == rcu_.id()) return e.token;
-        e.token = rcu_.register_thread();
+        // A previous instance at this address; its slot died with it.
+        auto tok = rcu_.register_thread();
+        if (!tok.valid()) return tok;
+        e.token = tok;
         e.rcu_id = rcu_.id();
-        return e.token;
+        return tok;
     }
     auto tok = rcu_.register_thread();
-    entries.push_back({&rcu_, rcu_.id(), tok});
+    if (tok.valid()) entries.push_back({&rcu_, rcu_.id(), tok});
     return tok;
 }
 
@@ -627,8 +638,14 @@ int UDepot<IO>::open(const StoreConfig& config) {
         }
     }
 
-    rc = scm_->init_threads();
+    // Used by gc_callback on salsa's GC thread.
+    gc_rcu_token_ = rcu_.register_thread();
+    rc = gc_rcu_token_.valid() ? scm_->init_threads() : EMFILE;
     if (rc != 0) {
+        if (gc_rcu_token_.valid()) {
+            rcu_.unregister_thread(gc_rcu_token_);
+            gc_rcu_token_ = Rcu::Token{};
+        }
         salsa::SalsaCtlr::shutdown();
         delete scm_;
         scm_ = nullptr;
@@ -713,9 +730,6 @@ void UDepot<IO>::invalidate_grains(uint64_t grain, uint64_t count) {
 // hash directory so no dangling references remain.
 template <typename IO>
 int UDepot<IO>::gc_callback(u64 grain_start, u64 grain_nr) {
-    if (!gc_rcu_token_.valid())
-        gc_rcu_token_ = rcu_.register_thread();
-
     // Net segment excludes the per-segment metadata grains at the tail.
     uint64_t end_grain = grain_start + grain_nr - seg_md_grains_;
     uint64_t grain = grain_start;
