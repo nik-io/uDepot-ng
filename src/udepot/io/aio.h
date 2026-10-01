@@ -24,6 +24,8 @@ public:
     AioIO& operator=(const AioIO&) = delete;
 
     int open(const char* path, size_t size);
+    // Completes all I/O already submitted, then tears down. No new I/O may
+    // be submitted once close() has begun (UDepot::close guarantees this).
     void close();
 
     CoroTask<ssize_t> pread(void* buf, size_t count, off_t offset);
@@ -38,6 +40,8 @@ private:
     aio_context_t ctx_ = 0;
     std::thread poller_;
     std::atomic<bool> running_{false};
+    // Submitted and not yet completed; kept off the read-mostly fields.
+    alignas(64) std::atomic<size_t> pending_{0};
 
     void poller_loop();
 };

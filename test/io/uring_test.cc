@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <filesystem>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -130,5 +131,68 @@ TEST_F(UringIOTest, MultipleSequentialOps) {
         uint32_t readback = 0;
         std::memcpy(&readback, rbuf.data, sizeof(readback));
         EXPECT_EQ(readback, val);
+    }
+}
+
+// Write real blocks first: reads of never-written (unwritten-extent) blocks
+// complete inline without device I/O, so nothing would stay in flight.
+static void fill_blocks(UringIO& io, size_t block, int blocks) {
+    auto buf = io.alloc_buffer(block * blocks);
+    ASSERT_NE(buf.data, nullptr);
+    std::memset(buf.data, 0x5a, block * blocks);
+    ASSERT_EQ(io.pwrite(buf.data, block * blocks, 0).run_sync(),
+              static_cast<ssize_t>(block * blocks));
+}
+
+// More I/Os in flight than the completion queue (2 x 1024) holds, all
+// submitted from one thread without waiting. Every one must complete with
+// the full length: a submit the kernel refuses (EBUSY/EAGAIN) is retried,
+// never handed back as an I/O error while its SQE sits in the ring.
+TEST_F(UringIOTest, MoreInFlightThanCompletionQueue) {
+    constexpr int kInFlight = 8192;
+    constexpr int kBlocks = 1024;
+    constexpr size_t kBlock = 4096;
+    UringIO io;
+    ASSERT_EQ(io.open(path_.c_str(), kBlock * kBlocks), 0);
+    fill_blocks(io, kBlock, kBlocks);
+
+    auto buf = io.alloc_buffer(kBlock * kInFlight);
+    ASSERT_NE(buf.data, nullptr);
+    std::vector<udepot::CoroTask<ssize_t>> tasks;
+    tasks.reserve(kInFlight);
+    for (int i = 0; i < kInFlight; ++i)
+        tasks.push_back(io.pread(static_cast<char*>(buf.data) + i * kBlock,
+                                 kBlock, (i % kBlocks) * kBlock));
+    int bad = 0;
+    for (auto& t : tasks)
+        if (t.run_sync() != static_cast<ssize_t>(kBlock)) ++bad;
+    EXPECT_EQ(bad, 0);
+}
+
+// close() with I/O in flight must complete it rather than stop the poller
+// and leave those coroutines suspended forever.
+TEST_F(UringIOTest, CloseCompletesInFlightIo) {
+    constexpr int kInFlight = 4096;
+    constexpr int kBlocks = 1024;
+    constexpr size_t kBlock = 4096;
+    UringIO io;
+    ASSERT_EQ(io.open(path_.c_str(), kBlock * kBlocks), 0);
+    fill_blocks(io, kBlock, kBlocks);
+
+    auto buf = io.alloc_buffer(kBlock * kInFlight);
+    ASSERT_NE(buf.data, nullptr);
+    std::vector<udepot::CoroTask<ssize_t>> tasks;
+    tasks.reserve(kInFlight);
+    for (int i = 0; i < kInFlight; ++i)
+        tasks.push_back(io.pread(static_cast<char*>(buf.data) + i * kBlock,
+                                 kBlock, (i % kBlocks) * kBlock));
+    io.close();
+
+    int stranded = 0;
+    for (auto& t : tasks)
+        if (!t.done()) ++stranded;
+    EXPECT_EQ(stranded, 0) << "I/O left in flight by close()";
+    if (stranded == 0) {
+        for (auto& t : tasks) EXPECT_EQ(t.run_sync(), ssize_t{kBlock});
     }
 }

@@ -4,10 +4,13 @@
 #include "udepot/io/uring.h"
 
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <coroutine>
 #include <cstring>
 #include <fcntl.h>
 #include <mutex>
+#include <thread>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -38,11 +41,11 @@ struct UringSubmitAwaitable {
 
         std::lock_guard<std::mutex> lock(*sq_mutex);
 
-        struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
-        if (!sqe) {
-            req->result = -EBUSY;
-            return false;
-        }
+        // The SQ is empty between submitters (each submits what it queues),
+        // so a full SQ is transient: push it to the kernel and retry.
+        struct io_uring_sqe* sqe;
+        while (!(sqe = io_uring_get_sqe(ring)))
+            submit_queued(ring);
 
         if (is_write)
             io_uring_prep_write(sqe, fd, buf, static_cast<unsigned>(count), offset);
@@ -52,13 +55,29 @@ struct UringSubmitAwaitable {
         io_uring_sqe_set_data(sqe, req);
         pending->fetch_add(1, std::memory_order_release);
 
-        int rc = io_uring_submit(ring);
-        if (rc < 0) {
-            pending->fetch_sub(1, std::memory_order_relaxed);
-            req->result = rc;
-            return false;
-        }
+        // From here the SQE belongs to the ring and will reach the kernel,
+        // which completes it into req; so this must not resume the caller
+        // with an error, or req and buf would be freed under it.
+        submit_queued(ring);
         return true;
+    }
+
+    // Submit until the kernel has taken every queued SQE. liburing has
+    // already published them to the ring when io_uring_submit fails, so
+    // they cannot be withdrawn. EBUSY/EAGAIN clear as the poller reaps
+    // completions (it does not take sq_mutex); anything else means the ring
+    // itself is unusable.
+    static void submit_queued(struct io_uring* ring) noexcept {
+        while (io_uring_sq_ready(ring) > 0) {
+            int rc = io_uring_submit(ring);
+            if (rc >= 0) continue;
+            if (rc == -EBUSY || rc == -EAGAIN || rc == -EINTR) {
+                std::this_thread::yield();
+                continue;
+            }
+            fprintf(stderr, "io_uring_submit: %s\n", strerror(-rc));
+            abort();
+        }
     }
 
     ssize_t await_resume() noexcept { return req->result; }
@@ -146,7 +165,11 @@ void UringIO::poller_loop() {
     static constexpr int kMaxCqes = 64;
     struct io_uring_cqe* cqes[kMaxCqes];
 
-    while (running_.load(std::memory_order_acquire)) {
+    // After close() clears running_, keep going until every submitted I/O
+    // has completed; returning earlier would leave those coroutines
+    // suspended forever.
+    while (running_.load(std::memory_order_acquire) ||
+           pending_.load(std::memory_order_acquire) > 0) {
         int n = io_uring_peek_batch_cqe(&ring_, cqes, kMaxCqes);
         if (n == 0) {
             if (pending_.load(std::memory_order_acquire) > 0) {
@@ -159,20 +182,6 @@ void UringIO::poller_loop() {
             continue;
         }
 
-        for (int i = 0; i < n; ++i) {
-            auto* req = static_cast<UringRequest*>(
-                io_uring_cqe_get_data(cqes[i]));
-            req->result = cqes[i]->res;
-            io_uring_cqe_seen(&ring_, cqes[i]);
-            pending_.fetch_sub(1, std::memory_order_relaxed);
-            req->handle.resume();
-        }
-    }
-
-    // Drain remaining completions on shutdown.
-    for (;;) {
-        int n = io_uring_peek_batch_cqe(&ring_, cqes, kMaxCqes);
-        if (n <= 0) break;
         for (int i = 0; i < n; ++i) {
             auto* req = static_cast<UringRequest*>(
                 io_uring_cqe_get_data(cqes[i]));
