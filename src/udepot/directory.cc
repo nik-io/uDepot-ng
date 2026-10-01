@@ -2,10 +2,22 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "udepot/directory.h"
+#include "udepot/tsan.h"
 
 #include <bit>
 #include <cerrno>
 #include <thread>
+
+#if defined(UDEPOT_TSAN)
+// grow() holds every stripe lock of the directory at once (by design: it is
+// what stops a write from landing in a table being copied). TSAN's lock-order
+// deadlock detector caps a thread at 64 held locks; beyond that it fails an
+// internal CHECK and then hangs on exit. Race detection is unaffected. Weak,
+// so a program that sets its own TSAN options keeps them.
+extern "C" __attribute__((weak)) const char* __tsan_default_options() {
+    return "detect_deadlocks=0";
+}
+#endif
 
 namespace udepot {
 
