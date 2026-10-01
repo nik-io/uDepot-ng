@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "udepot/io/uring.h"
+#include "udepot/tsan.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -54,6 +55,7 @@ struct UringSubmitAwaitable {
 
         io_uring_sqe_set_data(sqe, req);
         pending->fetch_add(1, std::memory_order_release);
+        tsan_release_to_kernel(req);
 
         // From here the SQE belongs to the ring and will reach the kernel,
         // which completes it into req; so this must not resume the caller
@@ -185,6 +187,7 @@ void UringIO::poller_loop() {
         for (int i = 0; i < n; ++i) {
             auto* req = static_cast<UringRequest*>(
                 io_uring_cqe_get_data(cqes[i]));
+            tsan_acquire_from_kernel(req);
             req->result = cqes[i]->res;
             io_uring_cqe_seen(&ring_, cqes[i]);
             pending_.fetch_sub(1, std::memory_order_relaxed);

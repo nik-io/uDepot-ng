@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "udepot/io/aio.h"
+#include "udepot/tsan.h"
 
 #include <cerrno>
 #include <coroutine>
@@ -98,6 +99,7 @@ struct AioSubmitAwaitable {
         // Counted before submitting: the completion can arrive, and be
         // counted down, before io_submit returns.
         pending->fetch_add(1, std::memory_order_release);
+        tsan_release_to_kernel(req);
         int rc = sys_io_submit(ctx, 1, cbs);
         if (rc != 1) {
             req->result = (rc < 0) ? -errno : -EIO;
@@ -228,6 +230,7 @@ void AioIO::poller_loop() {
 
         for (int i = 0; i < n; ++i) {
             auto* req = reinterpret_cast<AioRequest*>(events[i].data);
+            tsan_acquire_from_kernel(req);
             if (events[i].res2 != 0) {
                 req->result = -EIO;
             } else {
