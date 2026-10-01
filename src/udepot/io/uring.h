@@ -13,6 +13,7 @@
 
 #include "udepot/buffer.h"
 #include "udepot/coro.h"
+#include "udepot/io/fd_io.h"
 
 namespace udepot {
 
@@ -31,6 +32,10 @@ public:
 
     CoroTask<ssize_t> pread(void* buf, size_t count, off_t offset);
     CoroTask<ssize_t> pwrite(const void* buf, size_t count, off_t offset);
+
+    ssize_t pwrite_sync(const void* buf, size_t count, off_t offset) {
+        return pwrite_full_fd(fd_, buf, count, offset);
+    }
 
     size_t get_size() const noexcept { return size_; }
     IoBuffer alloc_buffer(size_t size);

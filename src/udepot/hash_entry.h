@@ -16,7 +16,10 @@ namespace udepot {
 //   [50:40] kv_size        (11 bits, key+value size in grains)
 //   [39: 0] pba            (40 bits, physical block address in grains)
 //
-// An entry is empty when all 64 bits are zero.
+// As in uDepot, a slot is unused when its pba is all ones, and an entry with
+// kv_size 0 is deleted: it keeps the key's tombstone pba so the key's
+// ordering against later writes survives, and crash recovery and GC can
+// find it. A live entry is at least one grain.
 class HashEntry {
 public:
     static constexpr int kBucketOffsetBits = 5;
@@ -37,7 +40,8 @@ public:
         kPbaBits + kKvSizeBits + kKeyTagBits;
 
     static constexpr uint32_t kHopRange = 1U << kBucketOffsetBits;  // 32
-    static constexpr uint64_t kEmpty = 0;
+    static constexpr uint64_t kEmpty = ~uint64_t{0};
+    static constexpr uint64_t kUnusedPba = kPbaMask;
 
     HashEntry() noexcept = default;
 
@@ -68,7 +72,8 @@ public:
         return (raw_ >> kPbaShift) & kPbaMask;
     }
 
-    bool empty() const noexcept { return raw_ == kEmpty; }
+    bool empty() const noexcept { return pba() == kUnusedPba; }
+    bool deleted() const noexcept { return !empty() && kv_size() == 0; }
     uint64_t raw() const noexcept { return raw_; }
 
     // Atomic access for lock-free reads.

@@ -5,12 +5,17 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -166,14 +171,44 @@ private:
     uint64_t seed_ = 0;
     uint64_t num_segments_ = 0;
     std::unique_ptr<std::atomic<uint64_t>[]> seg_timestamps_;
-    std::unique_ptr<std::atomic<bool>[]> seg_md_dirty_;
+    // Whether the segment's metadata reached the device (written at
+    // allocation, in seg_md_callback).
+    std::unique_ptr<std::atomic<bool>[]> seg_md_ok_;
+    // Segments holding data: allocated (or restored) and not yet reclaimed
+    // by GC. GC uses it to tell whether a tombstone can still matter.
+    std::unique_ptr<std::atomic<bool>[]> seg_live_;
+
+    // Waiting for free space. When salsa has no segment staged, an
+    // operation suspends here instead of blocking its thread (which may be
+    // an I/O poller that GC's own I/O needs), outside its read-side section
+    // (GC needs a grace period to free a segment). The waker resumes
+    // waiters to retry, as uDepot's tasks yielded to the TRT scheduler.
+    struct SpaceWait {
+        UDepot* store;
+        bool await_ready() noexcept { return false; }
+        bool await_suspend(std::coroutine_handle<> h);
+        void await_resume() noexcept {}
+    };
+    void space_waker_loop();
+    void stop_space_waker();
+    std::mutex space_mu_;
+    std::condition_variable space_cv_;
+    std::vector<std::coroutine_handle<>> space_waiters_;  // space_mu_
+    bool space_stop_ = false;                             // space_mu_
+    std::thread space_waker_;
 
     // SalsaCtlr overrides — called from salsa's GC thread.
     int gc_callback(u64 grain_start, u64 grain_nr) override;
     void seg_md_callback(u64 grain_start, u64 grain_nr) override;
 
-    uint64_t allocate_grains(uint64_t count);
-    void invalidate_grains(uint64_t grain, uint64_t count);
+    // Never blocks: 0, -EAGAIN (no segment staged yet), -ENOSPC, or -EIO
+    // if the segment's metadata write failed.
+    int try_allocate_grains(uint64_t count, uint64_t* grain);
+    void invalidate_grains(uint64_t grain, uint64_t count, bool reloc = false);
+    // As uDepot: every allocation is released once its write has been
+    // committed or invalidated. Salsa seals a segment, making it a GC
+    // candidate, only when all of its grains are released.
+    void release_grains(uint64_t grain, uint64_t count, bool reloc = false);
 
     static uint16_t compute_crc16(const KvHeader& hdr);
     static uint32_t compute_crc32(uint32_t seed, const uint8_t* data,
@@ -188,8 +223,14 @@ private:
     int persist_seg_md(uint64_t grain_start, uint64_t timestamp);
     bool validate_seg_md(const salsa::salsa_seg_md& md) const;
 
+    // Read `grains` grains from `grain` into buf (reallocated if too
+    // small). Returns 0 or -errno.
+    int read_segment(uint64_t grain, uint64_t grains, IoBuffer& buf);
+
     // Full crash recovery: scan all segments, rebuild directory.
     int crash_recovery();
+    int recover_record(uint64_t hash, std::span<const uint8_t> key,
+                       uint64_t grain, uint16_t kv_grains, bool tombstone);
 
     size_t kv_total_bytes(size_t key_size, size_t val_size) const {
         return sizeof(KvHeader) + key_size + val_size + sizeof(KvSuffix);
@@ -203,10 +244,6 @@ private:
     off_t grain_to_offset(uint64_t grain) const {
         return static_cast<off_t>(grain) * grain_size_;
     }
-
-    // Persist segment metadata for the segment containing `grain` if it
-    // has not been written yet.  Called from coroutine context (put/del).
-    CoroTask<int> ensure_seg_md(uint64_t grain);
 
     // Read the on-disk header at a given PBA and verify the key matches.
     // Returns 0 if the key matches, ENOENT if it doesn't.
@@ -245,10 +282,11 @@ private:
     static constexpr int kRewrite = 2;     // our write is not newer than
                                            // the entry (reported out)
     static constexpr int kNeedTomb = 3;    // del: write the tombstone
+    static constexpr int kTableFull = 4;   // put: grow the directory
 
     int commit_put(uint64_t hash, const KeyProbe& probe, PutMode mode,
                    uint64_t if_version, uint16_t kv_grains, uint64_t pba,
-                   HashEntry* replaced);
+                   HashEntry* replaced, const DirSnapshot** full);
     int commit_del(uint64_t hash, const KeyProbe& probe, uint64_t if_version,
                    uint64_t tomb_pba, HashEntry* removed);
 
@@ -256,8 +294,22 @@ private:
     // crash recovery uses (segment timestamp, then grain).
     bool newer_than(uint64_t new_pba, uint64_t old_pba) const;
 
+    // Allocate, waiting for space if needed (see SpaceWait). While
+    // waiting, `guard` is released and `probe` is cleared: an unprotected
+    // probe's classifications could go stale through pba reuse.
+    CoroTask<int> allocate_or_wait(uint64_t count, uint64_t* grain,
+                                   std::optional<Rcu::ReadGuard>& guard,
+                                   KeyProbe* probe);
+
     CoroTask<int> write_tombstone(std::span<const uint8_t> key,
-                                  uint64_t* tomb_out);
+                                  uint64_t* tomb_out,
+                                  std::optional<Rcu::ReadGuard>& guard,
+                                  KeyProbe* probe);
+
+    // GC: move one record still referenced by the directory to a new
+    // location, or drop it if it is a tombstone that can no longer matter.
+    int gc_record(uint64_t grain, uint64_t entry_grains, const uint8_t* rec,
+                  bool drop_tombstones);
 };
 
 }  // namespace udepot

@@ -13,6 +13,22 @@
 
 namespace udepot {
 
+// Completion polling for backends whose completions must be harvested by
+// the submitting thread (SPDK's per-thread queue pairs), as each uDepot TRT
+// thread ran its own poller task. A backend installs the hook on a thread
+// when that thread first submits; run_sync() then drives it while waiting.
+// The hook resumes completed coroutines and returns whether I/O submitted
+// from this thread is still outstanding.
+using ThreadPollFn = bool (*)();
+inline thread_local ThreadPollFn tl_thread_poll = nullptr;
+
+inline void set_thread_poll(ThreadPollFn fn) noexcept { tl_thread_poll = fn; }
+
+// Poll once if this thread has a poller. Returns whether work is pending.
+inline bool poll_this_thread() {
+    return tl_thread_poll ? tl_thread_poll() : false;
+}
+
 template <typename T = int>
 class [[nodiscard]] CoroTask {
 public:
@@ -97,8 +113,10 @@ public:
     // once we have real device latency measurements.
     T run_sync() {
         while (handle_.promise().continuation_.load(std::memory_order_acquire)
-               != completed_tag())
-            std::this_thread::yield();
+               != completed_tag()) {
+            if (!tl_thread_poll || !tl_thread_poll())
+                std::this_thread::yield();
+        }
         T result = handle_.promise().result_;
         destroy();
         return result;

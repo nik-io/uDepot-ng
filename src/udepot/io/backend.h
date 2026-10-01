@@ -20,6 +20,10 @@ concept IoBackend = requires(T io, void* buf, const void* cbuf, size_t n,
     { io.close() } -> std::same_as<void>;
     { io.pread(buf, n, off) } -> std::same_as<CoroTask<ssize_t>>;
     { io.pwrite(cbuf, n, off) } -> std::same_as<CoroTask<ssize_t>>;
+    // Blocking write usable from any thread, including an I/O poller's
+    // (salsa allocates segments inline and persists their metadata from
+    // there, as uDepot did with its blocking pwrite).
+    { io.pwrite_sync(cbuf, n, off) } -> std::same_as<ssize_t>;
     { io.get_size() } -> std::same_as<size_t>;
     { io.alloc_buffer(n) } -> std::same_as<IoBuffer>;
 };
