@@ -11,6 +11,7 @@
 #include "libos/os-thread.h"
 
 #include <asm-generic/errno.h>
+#include <pthread.h>
 
 #include "libos/os-atomic.h"
 #include "libos/os-debug.h"
@@ -35,6 +36,13 @@ int os_init_thread(
 	ERR_CHK_PRNT_GOTO(unlikely(0 != err), fail1,
 			"thread creation failed for name=%s tid=%u with %d",
 			name, tid, err);
+	/*
+	 * Nothing joins these threads: their owners wait for *done instead,
+	 * which each thread sets as its last access to shared state. Detach
+	 * so the thread is reclaimed when it exits rather than leaked on
+	 * every init/exit cycle.
+	 */
+	pthread_detach(*thread);
 	assert(0 == err);
 	return 0;
 fail1:

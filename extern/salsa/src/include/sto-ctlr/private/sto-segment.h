@@ -212,7 +212,8 @@ __attribute__((pure))
 static inline u32 segment_get_private(
         const struct segment *const seg)
 {
-	return seg->priv;
+	/* A lock-free hint, set by the destage path under a gc queue lock. */
+	return __atomic_load_n(&seg->priv, __ATOMIC_ACQUIRE);
 }
 
 static inline void segment_set_private(
@@ -220,14 +221,15 @@ static inline void segment_set_private(
         const u32        priv)
 {
 	assert(priv <= SALSA_MAX_PRIVATE_ID);
-	seg->priv = priv;
+	__atomic_store_n(&seg->priv, (u8) priv, __ATOMIC_RELEASE);
 }
 
 __attribute__((pure))
 static inline u32 segment_get_state(
 	const struct segment *const seg)
 {
-	return seg->state;
+	/* As priv: read under the segment lock, written under a queue lock. */
+	return __atomic_load_n(&seg->state, __ATOMIC_ACQUIRE);
 }
 
 static inline void segment_set_state(
@@ -235,6 +237,6 @@ static inline void segment_set_state(
 	const enum segment_state state)
 {
 	assert(state < SEG_STATE_LAST);
-	seg->state = state;
+	__atomic_store_n(&seg->state, (u8) state, __ATOMIC_RELEASE);
 }
 #endif	/* _SALSA_STO_SEGMENT_H_ */
