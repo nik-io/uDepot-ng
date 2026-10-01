@@ -37,7 +37,8 @@ static int setnonblocking(int fd) {
 // LocalSingleAsyncObj wakeup with direct coroutine_handle resumption.
 // ─────────────────────────────────────────────────────────────────────────────
 bool EpollOpAwaitable::await_ready() noexcept {
-    if (es_->state_ == EpollState::State::kDraining) {
+    if (es_->state_.load(std::memory_order_acquire) ==
+        EpollState::State::kDraining) {
         errno = ESHUTDOWN;
         ret_ = -1;
         ready_ = true;
@@ -54,35 +55,41 @@ bool EpollOpAwaitable::await_ready() noexcept {
 }
 
 bool EpollOpAwaitable::await_suspend(std::coroutine_handle<> h) noexcept {
-    assert(es_->state_ == EpollState::State::kReady);
-
     handle_ = h;
 
-    {
-        std::lock_guard<std::mutex> lock(es_->fds_mu_);
-        auto entry = es_->fds_.find(fd_);
-        assert(entry != es_->fds_.end());
-
-        switch (ty_) {
-            case EpollOpType::kIn:
-                assert(!entry->second.handle_in_);
-                entry->second.handle_in_ = h;
-                break;
-            case EpollOpType::kOut:
-                assert(!entry->second.handle_out_);
-                entry->second.handle_out_ = h;
-                break;
-        }
+    std::lock_guard<std::mutex> lock(es_->fds_mu_);
+    auto entry = es_->fds_.find(fd_);
+    // Checked under fds_mu_: shutdown_all collects waiters under it, so a
+    // waiter is either published before that or not at all.
+    if (es_->state_.load(std::memory_order_acquire) !=
+            EpollState::State::kReady ||
+        entry == es_->fds_.end()) {
+        ret_ = -1;
+        errno_ = ESHUTDOWN;
+        return false;
     }
+
+    EpollOpAwaitable** slot = ty_ == EpollOpType::kIn
+                                  ? &entry->second.waiter_in_
+                                  : &entry->second.waiter_out_;
+    assert(*slot == nullptr);
+    // Counted before publishing: once published, the poller may complete
+    // and destroy this awaitable before await_suspend returns.
     es_->pending_waits_.fetch_add(1, std::memory_order_relaxed);
+    published_ = true;
+    *slot = this;
     return true;
 }
 
 ssize_t EpollOpAwaitable::await_resume() noexcept {
     if (ready_) return ret_;
 
-    es_->pending_waits_.fetch_sub(1, std::memory_order_relaxed);
-    ret_ = syscall_();
+    if (published_)
+        es_->pending_waits_.fetch_sub(1, std::memory_order_relaxed);
+    if (ret_ < 0) {
+        errno = errno_;
+        return ret_;
+    }
     if (ret_ > 0 && reg_) es_->register_fd(static_cast<int>(ret_), EPOLLIN);
     return ret_;
 }
@@ -98,7 +105,7 @@ EpollState::~EpollState() {
 }
 
 int EpollState::init() {
-    if (state_ != State::kUninitialized)
+    if (state_.load(std::memory_order_acquire) != State::kUninitialized)
         return -EINVAL;
 
     epfd_ = epoll_create1(EPOLL_CLOEXEC);
@@ -107,17 +114,18 @@ int EpollState::init() {
         return -errno;
     }
 
-    state_ = State::kReady;
+    state_.store(State::kReady, std::memory_order_release);
     running_.store(true, std::memory_order_relaxed);
     poller_ = std::thread(&EpollState::poller_loop, this);
     return 0;
 }
 
 void EpollState::stop() {
-    if (state_ != State::kReady)
+    State expected = State::kReady;
+    if (!state_.compare_exchange_strong(expected, State::kDraining,
+                                        std::memory_order_acq_rel))
         return;
 
-    state_ = State::kDraining;
     running_.store(false, std::memory_order_release);
 
     if (poller_.joinable())
@@ -127,7 +135,7 @@ void EpollState::stop() {
 
     ::close(epfd_);
     epfd_ = -1;
-    state_ = State::kDone;
+    state_.store(State::kDone, std::memory_order_release);
 }
 
 void EpollState::register_fd(int fd, uint32_t event_mask) {
@@ -157,7 +165,8 @@ int EpollState::deregister_fd(int fd) {
         std::lock_guard<std::mutex> lock(fds_mu_);
         auto iter = fds_.find(fd);
         if (iter == fds_.end())
-            return state_ == State::kDone ? 0 : -ENOENT;
+            return state_.load(std::memory_order_acquire) == State::kDone
+                       ? 0 : -ENOENT;
         fds_.erase(iter);
     }
     epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
@@ -178,47 +187,53 @@ int EpollState::close_fd(int fd) {
 }
 
 void EpollState::notify_maybe(int fd, EpollOpType ty) {
-    std::coroutine_handle<> h;
+    EpollOpAwaitable* w;
     {
         std::lock_guard<std::mutex> lock(fds_mu_);
         auto entry = fds_.find(fd);
         if (entry == fds_.end()) return;
 
-        std::coroutine_handle<>* hptr;
-        switch (ty) {
-            case EpollOpType::kIn:  hptr = &entry->second.handle_in_;  break;
-            case EpollOpType::kOut: hptr = &entry->second.handle_out_; break;
-            default: abort();
-        }
+        EpollOpAwaitable** slot = ty == EpollOpType::kIn
+                                      ? &entry->second.waiter_in_
+                                      : &entry->second.waiter_out_;
+        w = *slot;
+        if (!w) return;
 
-        h = *hptr;
-        if (!h) return;
-        *hptr = {};
+        // Complete the operation here rather than in the resumed coroutine:
+        // this event may be stale, its data consumed by an await_ready() that
+        // ran on another thread after epoll_wait returned. Then the syscall
+        // fails with EAGAIN and the waiter keeps waiting. Done under fds_mu_
+        // so the slot cannot change; the syscall is non-blocking.
+        ssize_t r = w->syscall_();
+        if (r == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        w->ret_ = r;
+        w->errno_ = errno;
+        *slot = nullptr;
     }
     // Resume outside the lock — the coroutine may re-enter fds_ via
     // await_suspend or register_fd.
-    h.resume();
+    w->handle_.resume();
 }
 
 void EpollState::shutdown_all() {
-    // Called after the poller thread has been joined, so no lock needed
-    // for the iteration itself. Individual handles are extracted and
-    // resumed one at a time.
-    for (auto iter = fds_.begin(); iter != fds_.end();) {
-        auto& info = iter->second;
-        if (info.handle_in_) {
-            auto h = info.handle_in_;
-            info.handle_in_ = {};
-            h.resume();
+    // Take every waiter first, then resume: a resumed coroutine may call
+    // close_fd/deregister_fd, which must not run during the iteration.
+    std::vector<EpollOpAwaitable*> waiters;
+    {
+        std::lock_guard<std::mutex> lock(fds_mu_);
+        for (auto& [fd, info] : fds_) {
+            for (EpollOpAwaitable* w : {info.waiter_in_, info.waiter_out_}) {
+                if (!w) continue;
+                w->ret_ = -1;
+                w->errno_ = ESHUTDOWN;
+                waiters.push_back(w);
+            }
+            epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
         }
-        if (info.handle_out_) {
-            auto h = info.handle_out_;
-            info.handle_out_ = {};
-            h.resume();
-        }
-        epoll_ctl(epfd_, EPOLL_CTL_DEL, iter->first, nullptr);
-        iter = fds_.erase(iter);
+        fds_.clear();
     }
+    for (EpollOpAwaitable* w : waiters)
+        w->handle_.resume();
 }
 
 void EpollState::poller_loop() {
@@ -248,7 +263,7 @@ void EpollState::poller_loop() {
 // ─────────────────────────────────────────────────────────────────────────────
 EpollOpAwaitable EpollState::accept(int sockfd, struct sockaddr* addr,
                                     socklen_t* addrlen) {
-    if (state_ == State::kDraining) {
+    if (state_.load(std::memory_order_acquire) == State::kDraining) {
         return {this, sockfd, EpollOpType::kIn, [=]() -> ssize_t {
             errno = ESHUTDOWN; return -1;
         }};
@@ -260,7 +275,7 @@ EpollOpAwaitable EpollState::accept(int sockfd, struct sockaddr* addr,
 
 EpollOpAwaitable EpollState::accept_ll(int sockfd, struct sockaddr* addr,
                                        socklen_t* addrlen) {
-    if (state_ == State::kDraining) {
+    if (state_.load(std::memory_order_acquire) == State::kDraining) {
         return {this, sockfd, EpollOpType::kIn, [=]() -> ssize_t {
             errno = ESHUTDOWN; return -1;
         }};
