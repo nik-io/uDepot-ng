@@ -71,6 +71,13 @@ public:
     // Remove under stripe lock. Caller must hold an RCU read lock.
     bool remove(uint64_t hash, uint64_t pba);
 
+    // The table that owns `hash` in the current snapshot, for callers that
+    // need a check-then-act under HashTable::lock_for(). The reference is
+    // valid for the caller's RCU read-side critical section.
+    HashTable& table_for_hash(uint64_t hash) noexcept {
+        return current_.load(std::memory_order_acquire)->table_for_hash(hash);
+    }
+
     // Double the directory by splitting each table into two.
     // Single-writer (serialized by grow_mutex_). Waits for an RCU
     // grace period before freeing the old directory.

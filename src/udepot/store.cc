@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <thread>
 
 #include "udepot/io/aio.h"
 #include "udepot/io/posix.h"
@@ -684,11 +685,21 @@ void UDepot<IO>::close() {
 
 template <typename IO>
 uint64_t UDepot<IO>::allocate_grains(uint64_t count) {
+    // EAGAIN is transient: salsa's allocator thread has not staged the next
+    // segment yet, which happens under CPU load. Legacy retries it without
+    // bound; this is bounded because GC cannot yet reclaim segments here
+    // (nothing calls release_grains), so a store out of free segments would
+    // otherwise hang instead of failing.
+    static constexpr int kMaxAttempts = 16;
     u64 grain_out = 0;
-    int rc = salsa::SalsaCtlr::allocate_grains(
-        static_cast<u64>(count), &grain_out);
-    if (rc != 0) return UINT64_MAX;
-    return grain_out;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        int rc = salsa::SalsaCtlr::allocate_grains(
+            static_cast<u64>(count), &grain_out);
+        if (rc == 0) return grain_out;
+        if (rc != EAGAIN) break;
+        std::this_thread::yield();
+    }
+    return UINT64_MAX;
 }
 
 template <typename IO>
@@ -838,8 +849,83 @@ CoroTask<int> UDepot<IO>::ensure_seg_md(uint64_t grain) {
 }
 
 template <typename IO>
+bool UDepot<IO>::newer_than(uint64_t new_pba, uint64_t old_pba) const {
+    uint64_t old_seg = scm_->grain_to_seg_idx(old_pba);
+    uint64_t new_seg = scm_->grain_to_seg_idx(new_pba);
+    if (old_seg != new_seg)
+        return seg_timestamps_[old_seg].load(std::memory_order_acquire) <
+               seg_timestamps_[new_seg].load(std::memory_order_acquire);
+    return old_pba < new_pba;
+}
+
+template <typename IO>
+CoroTask<int> UDepot<IO>::probe_key(uint64_t hash,
+                                    std::span<const uint8_t> key,
+                                    KeyProbe& probe) {
+    for (uint32_t start = 0; ; ) {
+        HashEntry entry = directory_->lookup(hash, start);
+        if (entry.empty()) break;
+        start = entry.bucket_offset() + 1;
+        if (probe.find(entry.pba())) continue;
+
+        int vrc = co_await verify_key_at_pba(
+            entry.pba(), entry.kv_size(), key, nullptr);
+        if (vrc != 0 && vrc != -ENOENT) co_return vrc;
+        // A neighborhood holds at most kHopRange entries; a full array
+        // means some recorded pbas left it, so start the record over.
+        if (probe.n == probe.seen.size()) probe.n = 0;
+        probe.seen[probe.n++] = {entry.pba(), vrc == 0};
+    }
+    co_return 0;
+}
+
+template <typename IO>
+bool UDepot<IO>::probe_settled(const HashTable& table, uint64_t hash,
+                               const KeyProbe& probe, HashEntry* match) {
+    *match = HashEntry{};
+    for (uint32_t start = 0; ; ) {
+        HashEntry entry = table.lookup(hash, start);
+        if (entry.empty()) return true;
+        start = entry.bucket_offset() + 1;
+        const auto* seen = probe.find(entry.pba());
+        if (!seen) return false;
+        if (seen->match && match->empty()) *match = entry;
+    }
+}
+
+template <typename IO>
+int UDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
+                           PutMode mode, uint64_t if_version,
+                           uint16_t kv_grains, uint64_t pba,
+                           HashEntry* replaced) {
+    HashTable& table = directory_->table_for_hash(hash);
+    auto lock = table.lock_for(hash);
+
+    HashEntry match;
+    if (!probe_settled(table, hash, probe, &match)) return kRetryProbe;
+
+    if (match.empty()) {
+        if (mode == PutMode::kReplace || if_version != kAnyVersion)
+            return -ENOENT;
+        return table.insert_locked(hash, kv_grains, pba) == 0 ? 0 : -ENOSPC;
+    }
+    if (mode == PutMode::kCreate) return -EEXIST;
+    if (if_version != kAnyVersion && match.pba() != if_version)
+        return -ESTALE;
+    // Recovery keeps the newer of two copies of a key, so the copy the
+    // directory ends up pointing to must be the newer one (legacy
+    // is_pba_order_equal_to_total_order).
+    *replaced = match;
+    if (!newer_than(pba, match.pba())) return kRewrite;
+
+    table.update_locked(hash, match.pba(), kv_grains, pba);
+    return 0;
+}
+
+template <typename IO>
 CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
-                              std::span<const uint8_t> val) {
+                              std::span<const uint8_t> val,
+                              PutMode mode, uint64_t if_version) {
     if (key.empty() || key.size() > UINT16_MAX)
         co_return -EINVAL;
     if (val.size() > UINT32_MAX)
@@ -851,37 +937,22 @@ CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
     if (grains_needed > HashEntry::kKvSizeMask)
         co_return -EINVAL;
 
-    // Allocate space on device.
-    uint64_t grain = allocate_grains(grains_needed);
-    if (grain == UINT64_MAX) co_return -ENOSPC;
+    Rcu::Token tok = thread_token();
+    if (!tok.valid()) co_return -EMFILE;
+    Rcu::ReadGuard guard(rcu_, tok);
 
     // Build the on-disk entry.  Must happen before any co_await so that
     // key/val data is copied while the caller's buffers are still alive.
     size_t total = grains_needed * grain_size_;
     IoBuffer buf = io_.alloc_buffer(total);
-    if (!buf.data) {
-        invalidate_grains(grain, grains_needed);
-        co_return -ENOMEM;
-    }
+    if (!buf.data) co_return -ENOMEM;
 
     auto* p = static_cast<uint8_t*>(buf.data);
     KvHeader hdr;
     hdr.key_size = static_cast<uint16_t>(key.size());
     hdr.val_size = static_cast<uint32_t>(val.size());
-    {
-        uint64_t seg_idx = scm_->grain_to_seg_idx(grain);
-        hdr.timestamp = seg_timestamps_[seg_idx].load(
-            std::memory_order_acquire);
-    }
-
-    std::memcpy(p, &hdr, sizeof(hdr));
     std::memcpy(p + sizeof(hdr), key.data(), key.size());
     std::memcpy(p + sizeof(hdr) + key.size(), val.data(), val.size());
-
-    KvSuffix suffix;
-    suffix.crc16 = compute_crc16(hdr);
-    std::memcpy(p + sizeof(hdr) + key.size() + val.size(),
-                &suffix, sizeof(suffix));
 
     // Zero any padding between the suffix and the end of the grain-aligned
     // region.
@@ -891,67 +962,56 @@ CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
 
     buf.length = total;
 
-    // Persist segment metadata if this is the first write to a new segment.
-    co_await ensure_seg_md(grain);
+    KeyProbe probe;
+    for (;;) {
+        uint64_t grain = allocate_grains(grains_needed);
+        if (grain == UINT64_MAX) co_return -ENOSPC;
 
-    // Write to device.
-    ssize_t written = co_await io_.pwrite(buf.data, total,
-                                          grain_to_offset(grain));
-    if (written != static_cast<ssize_t>(total)) {
-        invalidate_grains(grain, grains_needed);
-        co_return (written < 0) ? static_cast<int>(written) : -EIO;
-    }
+        hdr.timestamp = seg_timestamps_[scm_->grain_to_seg_idx(grain)].load(
+            std::memory_order_acquire);
+        std::memcpy(p, &hdr, sizeof(hdr));
+        KvSuffix suffix;
+        suffix.crc16 = compute_crc16(hdr);
+        std::memcpy(p + sizeof(hdr) + key.size() + val.size(),
+                    &suffix, sizeof(suffix));
 
-    // Lookup-before-write: check if the key already exists in the
-    // directory and update in place if so (upsert semantics, matching
-    // legacy uDepot's local_put_mbuff / lookup_mbuff_put).
-    Rcu::Token tok = thread_token();
-    rcu_.read_lock(tok);
+        // Persist segment metadata if this is the first write to a new
+        // segment.
+        co_await ensure_seg_md(grain);
 
-    uint64_t old_pba = UINT64_MAX;
-    uint16_t old_kv_grains = 0;
-
-    for (uint32_t start = 0; ; ) {
-        HashEntry entry = directory_->lookup(hash, start);
-        if (entry.empty()) break;
-
-        start = entry.bucket_offset() + 1;
-
-        int vrc = co_await verify_key_at_pba(
-            entry.pba(), entry.kv_size(), key, nullptr);
-        if (vrc == 0) {
-            old_pba = entry.pba();
-            old_kv_grains = entry.kv_size();
-            break;
+        ssize_t written = co_await io_.pwrite(buf.data, total,
+                                              grain_to_offset(grain));
+        if (written != static_cast<ssize_t>(total)) {
+            invalidate_grains(grain, grains_needed);
+            co_return (written < 0) ? static_cast<int>(written) : -EIO;
         }
-    }
 
-    int rc;
-    if (old_pba != UINT64_MAX) {
-        // Key exists — atomically update the directory entry.
-        bool updated = directory_->update(
-            hash, old_pba,
-            static_cast<uint16_t>(grains_needed), grain);
-        if (updated) {
-            rcu_.read_unlock(tok);
-            invalidate_grains(old_pba, old_kv_grains);
+        int rc;
+        HashEntry replaced;
+        do {
+            rc = co_await probe_key(hash, key, probe);
+            if (rc == 0)
+                rc = commit_put(hash, probe, mode, if_version,
+                                static_cast<uint16_t>(grains_needed), grain,
+                                &replaced);
+        } while (rc == kRetryProbe);
+
+        if (rc == 0) {
+            if (!replaced.empty())
+                invalidate_grains(replaced.pba(), replaced.kv_size());
             co_return 0;
         }
-        // Entry was concurrently removed — fall through to insert.
-    }
 
-    rc = directory_->insert(hash,
-                            static_cast<uint16_t>(grains_needed),
-                            grain);
-
-    rcu_.read_unlock(tok);
-
-    if (rc != 0) {
         invalidate_grains(grain, grains_needed);
-        co_return -ENOSPC;
-    }
+        if (rc != kRewrite) co_return rc;
 
-    co_return 0;
+        // A concurrent put of this key was allocated after us but committed
+        // first. Write again at a newer location; if it sits in another
+        // segment, close ours so the next allocation is newer still.
+        if (scm_->grain_to_seg_idx(grain) !=
+            scm_->grain_to_seg_idx(replaced.pba()))
+            salsa::SalsaCtlr::drain_remaining_grains();
+    }
 }
 
 template <typename IO>
@@ -960,11 +1020,13 @@ CoroTask<int> UDepot<IO>::verify_key_at_pba(
     std::span<const uint8_t> key, KvHeader* hdr_out) {
 
     size_t read_size = sizeof(KvHeader) + key.size();
+    // An entry too small to hold this key cannot be it.
+    if (kv_total_bytes(key.size(), 0) >
+        static_cast<size_t>(kv_grains) * grain_size_)
+        co_return -ENOENT;
     // Round up to grain boundary for the read.
     size_t aligned_size = ((read_size + grain_size_ - 1) / grain_size_) *
                           grain_size_;
-    if (aligned_size > static_cast<size_t>(kv_grains) * grain_size_)
-        aligned_size = static_cast<size_t>(kv_grains) * grain_size_;
 
     IoBuffer buf = io_.alloc_buffer(aligned_size);
     if (!buf.data) co_return -ENOMEM;
@@ -991,11 +1053,12 @@ CoroTask<int> UDepot<IO>::verify_key_at_pba(
 template <typename IO>
 CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
                               uint8_t* val_out, size_t val_buf_size,
-                              size_t* val_size_out) {
+                              size_t* val_size_out, uint64_t* version_out) {
     if (key.empty()) co_return -EINVAL;
 
     uint64_t hash = hash_key(key);
     Rcu::Token tok = thread_token();
+    if (!tok.valid()) co_return -EMFILE;
 
     rcu_.read_lock(tok);
 
@@ -1048,6 +1111,7 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
 #endif
 
         if (val_size_out) *val_size_out = hdr.val_size;
+        if (version_out) *version_out = pba;
         if (val_out && val_buf_size > 0) {
             size_t to_copy = std::min(val_buf_size,
                                       static_cast<size_t>(hdr.val_size));
@@ -1063,73 +1127,111 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::del(std::span<const uint8_t> key) {
-    if (key.empty()) co_return -EINVAL;
+CoroTask<int> UDepot<IO>::write_tombstone(std::span<const uint8_t> key,
+                                          uint64_t* tomb_out) {
+    uint64_t tomb_grains = kv_total_grains(key.size(), 0);
+    uint64_t tomb_grain = allocate_grains(tomb_grains);
+    if (tomb_grain == UINT64_MAX) co_return -ENOSPC;
+
+    size_t tomb_total = tomb_grains * grain_size_;
+    IoBuffer tomb_buf = io_.alloc_buffer(tomb_total);
+    if (!tomb_buf.data) {
+        invalidate_grains(tomb_grain, tomb_grains);
+        co_return -ENOMEM;
+    }
+    auto* tp = static_cast<uint8_t*>(tomb_buf.data);
+    KvHeader tomb_hdr;
+    tomb_hdr.key_size = static_cast<uint16_t>(key.size());
+    tomb_hdr.val_size = 0;
+    tomb_hdr.timestamp =
+        seg_timestamps_[scm_->grain_to_seg_idx(tomb_grain)].load(
+            std::memory_order_acquire);
+    std::memcpy(tp, &tomb_hdr, sizeof(tomb_hdr));
+    std::memcpy(tp + sizeof(tomb_hdr), key.data(), key.size());
+    KvSuffix suffix;
+    suffix.crc16 = compute_crc16(tomb_hdr);
+    std::memcpy(tp + sizeof(tomb_hdr) + key.size(), &suffix, sizeof(suffix));
+    size_t used = kv_total_bytes(key.size(), 0);
+    if (tomb_total > used)
+        std::memset(tp + used, 0, tomb_total - used);
+    tomb_buf.length = tomb_total;
+
+    co_await ensure_seg_md(tomb_grain);
+    ssize_t w = co_await io_.pwrite(tomb_buf.data, tomb_total,
+                                    grain_to_offset(tomb_grain));
+    if (w != static_cast<ssize_t>(tomb_total)) {
+        invalidate_grains(tomb_grain, tomb_grains);
+        co_return (w < 0) ? static_cast<int>(w) : -EIO;
+    }
+    *tomb_out = tomb_grain;
+    co_return 0;
+}
+
+template <typename IO>
+int UDepot<IO>::commit_del(uint64_t hash, const KeyProbe& probe,
+                           uint64_t if_version, uint64_t tomb_pba,
+                           HashEntry* removed) {
+    HashTable& table = directory_->table_for_hash(hash);
+    auto lock = table.lock_for(hash);
+
+    HashEntry match;
+    if (!probe_settled(table, hash, probe, &match)) return kRetryProbe;
+    if (match.empty()) return -ENOENT;
+    if (if_version != kAnyVersion && match.pba() != if_version)
+        return -ESTALE;
+    *removed = match;
+    if (tomb_pba == UINT64_MAX) return kNeedTomb;
+    // As in commit_put: recovery must see the tombstone as newer than the
+    // value it deletes.
+    if (!newer_than(tomb_pba, match.pba())) return kRewrite;
+
+    table.remove_locked(hash, match.pba());
+    return 0;
+}
+
+template <typename IO>
+CoroTask<int> UDepot<IO>::del(std::span<const uint8_t> key,
+                              uint64_t if_version) {
+    if (key.empty() || key.size() > UINT16_MAX) co_return -EINVAL;
 
     uint64_t hash = hash_key(key);
     Rcu::Token tok = thread_token();
+    if (!tok.valid()) co_return -EMFILE;
+    Rcu::ReadGuard guard(rcu_, tok);
 
-    rcu_.read_lock(tok);
+    const uint64_t tomb_grains = kv_total_grains(key.size(), 0);
+    uint64_t tomb = UINT64_MAX;
+    KeyProbe probe;
+    for (;;) {
+        HashEntry removed;
+        int rc = co_await probe_key(hash, key, probe);
+        if (rc == 0)
+            rc = commit_del(hash, probe, if_version, tomb, &removed);
 
-    for (uint32_t start = 0; ; ) {
-        HashEntry entry = directory_->lookup(hash, start);
-        if (entry.empty()) break;
-
-        start = entry.bucket_offset() + 1;
-
-        uint64_t pba = entry.pba();
-        uint16_t kv_grains = entry.kv_size();
-
-        int rc = co_await verify_key_at_pba(pba, kv_grains, key, nullptr);
-        if (rc != 0) continue;
-
-        // Write a tombstone (val_size=0) so crash recovery knows
-        // this key was deleted.
-        uint64_t tomb_grains = kv_total_grains(key.size(), 0);
-        uint64_t tomb_grain = allocate_grains(tomb_grains);
-        if (tomb_grain != UINT64_MAX) {
-            size_t tomb_total = tomb_grains * grain_size_;
-            IoBuffer tomb_buf = io_.alloc_buffer(tomb_total);
-            if (tomb_buf.data) {
-                auto* tp = static_cast<uint8_t*>(tomb_buf.data);
-                KvHeader tomb_hdr;
-                tomb_hdr.key_size = static_cast<uint16_t>(key.size());
-                tomb_hdr.val_size = 0;
-                {
-                    uint64_t si = scm_->grain_to_seg_idx(tomb_grain);
-                    tomb_hdr.timestamp = seg_timestamps_[si].load(
-                        std::memory_order_acquire);
-                }
-                std::memcpy(tp, &tomb_hdr, sizeof(tomb_hdr));
-                std::memcpy(tp + sizeof(tomb_hdr), key.data(), key.size());
-                KvSuffix suffix;
-                suffix.crc16 = compute_crc16(tomb_hdr);
-                std::memcpy(tp + sizeof(tomb_hdr) + key.size(),
-                            &suffix, sizeof(suffix));
-                size_t used = kv_total_bytes(key.size(), 0);
-                if (tomb_total > used)
-                    std::memset(tp + used, 0, tomb_total - used);
-                tomb_buf.length = tomb_total;
-                co_await ensure_seg_md(tomb_grain);
-                co_await io_.pwrite(tomb_buf.data, tomb_total,
-                                    grain_to_offset(tomb_grain));
-            }
-        }
-
-        bool removed = directory_->remove(hash, pba);
-
-        rcu_.read_unlock(tok);
-
-        if (removed) {
-            invalidate_grains(pba, kv_grains);
+        if (rc == kRetryProbe) continue;
+        if (rc == 0) {
+            invalidate_grains(removed.pba(), removed.kv_size());
             co_return 0;
         }
+        if (rc == kNeedTomb) {
+            // Written unlocked; commit_del re-checks the entry it deletes.
+            rc = co_await write_tombstone(key, &tomb);
+            if (rc != 0) co_return rc;
+            continue;
+        }
 
-        co_return -ENOENT;
+        // The tombstone is not needed (key gone, version changed) or not
+        // newer than the entry it would delete (kRewrite).
+        if (tomb != UINT64_MAX) {
+            invalidate_grains(tomb, tomb_grains);
+            if (rc == kRewrite &&
+                scm_->grain_to_seg_idx(tomb) !=
+                    scm_->grain_to_seg_idx(removed.pba()))
+                salsa::SalsaCtlr::drain_remaining_grains();
+            tomb = UINT64_MAX;
+        }
+        if (rc != kRewrite) co_return rc;
     }
-
-    rcu_.read_unlock(tok);
-    co_return -ENOENT;
 }
 
 template <typename IO>
@@ -1139,6 +1241,7 @@ CoroTask<int> UDepot<IO>::exists(std::span<const uint8_t> key,
 
     uint64_t hash = hash_key(key);
     Rcu::Token tok = thread_token();
+    if (!tok.valid()) co_return -EMFILE;
 
     rcu_.read_lock(tok);
 

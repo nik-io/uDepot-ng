@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -59,6 +60,18 @@ struct StoreConfig {
     bool force_destroy = false;
 };
 
+// Condition a put() must satisfy, checked atomically with the write.
+enum class PutMode {
+    kUpsert,   // insert or overwrite
+    kCreate,   // fail with -EEXIST if the key exists
+    kReplace,  // fail with -ENOENT if the key does not exist
+};
+
+// A version identifies one stored value of a key; every successful put
+// yields a new one. get() reports it, and put()/del() accept it to act only
+// if the key still holds that value (-ESTALE otherwise).
+inline constexpr uint64_t kAnyVersion = UINT64_MAX;
+
 // High-performance KV store, parameterized on the I/O backend.
 //
 // Uses RCU-protected directory for lock-free reads, salsa for grain
@@ -75,14 +88,20 @@ public:
     int open(const StoreConfig& config);
     void close();
 
+    // A non-default if_version implies kReplace: -ENOENT if the key is
+    // missing, -ESTALE if it holds a different version.
     CoroTask<int> put(std::span<const uint8_t> key,
-                      std::span<const uint8_t> val);
+                      std::span<const uint8_t> val,
+                      PutMode mode = PutMode::kUpsert,
+                      uint64_t if_version = kAnyVersion);
 
     CoroTask<int> get(std::span<const uint8_t> key,
                       uint8_t* val_out, size_t val_buf_size,
-                      size_t* val_size_out);
+                      size_t* val_size_out,
+                      uint64_t* version_out = nullptr);
 
-    CoroTask<int> del(std::span<const uint8_t> key);
+    CoroTask<int> del(std::span<const uint8_t> key,
+                      uint64_t if_version = kAnyVersion);
 
     CoroTask<int> exists(std::span<const uint8_t> key,
                          size_t* val_size_out);
@@ -197,6 +216,51 @@ private:
     CoroTask<int> verify_key_at_pba(uint64_t pba, uint16_t kv_grains,
                                     std::span<const uint8_t> key,
                                     KvHeader* hdr_out);
+
+    // Lookup-before-write (legacy lookup_mbuff_put). Tags are a filter, so
+    // finding a key's entry takes a key-verify read per tag match. That I/O
+    // runs unlocked (probe_key), and the write then re-checks under the
+    // table lock that every tag-matching entry is one already verified
+    // (probe_settled); a new one sends it back to probe_key. The decision
+    // and the directory write are therefore one critical section.
+    struct KeyProbe {
+        struct Seen {
+            uint64_t pba;
+            bool match;
+        };
+        std::array<Seen, HashEntry::kHopRange> seen{};
+        uint32_t n = 0;
+
+        const Seen* find(uint64_t pba) const noexcept {
+            for (uint32_t i = 0; i < n; ++i)
+                if (seen[i].pba == pba) return &seen[i];
+            return nullptr;
+        }
+    };
+
+    CoroTask<int> probe_key(uint64_t hash, std::span<const uint8_t> key,
+                            KeyProbe& probe);
+    static bool probe_settled(const HashTable& table, uint64_t hash,
+                              const KeyProbe& probe, HashEntry* match);
+
+    // Results of commit_put/commit_del besides 0 and -errno.
+    static constexpr int kRetryProbe = 1;  // unverified entry appeared
+    static constexpr int kRewrite = 2;     // our write is not newer than
+                                           // the entry (reported out)
+    static constexpr int kNeedTomb = 3;    // del: write the tombstone
+
+    int commit_put(uint64_t hash, const KeyProbe& probe, PutMode mode,
+                   uint64_t if_version, uint16_t kv_grains, uint64_t pba,
+                   HashEntry* replaced);
+    int commit_del(uint64_t hash, const KeyProbe& probe, uint64_t if_version,
+                   uint64_t tomb_pba, HashEntry* removed);
+
+    // Whether data at new_pba is newer than data at old_pba in the order
+    // crash recovery uses (segment timestamp, then grain).
+    bool newer_than(uint64_t new_pba, uint64_t old_pba) const;
+
+    CoroTask<int> write_tombstone(std::span<const uint8_t> key,
+                                  uint64_t* tomb_out);
 };
 
 }  // namespace udepot

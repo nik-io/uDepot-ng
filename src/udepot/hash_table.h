@@ -40,8 +40,16 @@ public:
     // past a previous match. Returns the next matching entry.
     HashEntry lookup(uint64_t hash, uint32_t start_offset = 0) const noexcept;
 
-    // Insert an entry under the stripe lock. Returns 0 on success, -1 if
-    // the neighborhood is full (table needs to grow).
+    // The write lock covering every slot a write for `hash` can touch.
+    // Hold it across a check-then-act sequence (lookup, then
+    // insert_locked/update_locked/remove_locked). Never hold it across a
+    // co_await: a coroutine can resume on another thread.
+    std::unique_lock<std::mutex> lock_for(uint64_t /*hash*/) {
+        return std::unique_lock<std::mutex>(write_mu_);
+    }
+
+    // Insert an entry. Returns 0 on success, -1 if the neighborhood is
+    // full (table needs to grow).
     int insert(uint64_t hash, uint16_t kv_size, uint64_t pba);
 
     // Atomically replace the entry at (hash, old_pba) with a new entry
@@ -51,9 +59,15 @@ public:
     bool update(uint64_t hash, uint64_t old_pba,
                 uint16_t new_kv_size, uint64_t new_pba);
 
-    // Remove the entry matching (hash, pba) under the stripe lock.
-    // Returns true if found and removed.
+    // Remove the entry matching (hash, pba). Returns true if found and
+    // removed.
     bool remove(uint64_t hash, uint64_t pba);
+
+    // As above, for callers already holding lock_for(hash).
+    int insert_locked(uint64_t hash, uint16_t kv_size, uint64_t pba);
+    bool update_locked(uint64_t hash, uint64_t old_pba,
+                       uint16_t new_kv_size, uint64_t new_pba);
+    bool remove_locked(uint64_t hash, uint64_t pba);
 
     uint32_t index_bits() const noexcept { return index_bits_; }
     uint64_t num_buckets() const noexcept { return num_buckets_; }
