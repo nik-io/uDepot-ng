@@ -2,22 +2,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "udepot/directory.h"
-#include "udepot/tsan.h"
 
 #include <bit>
 #include <cerrno>
 #include <thread>
-
-#if defined(UDEPOT_TSAN)
-// grow() holds every stripe lock of the directory at once (by design: it is
-// what stops a write from landing in a table being copied). TSAN's lock-order
-// deadlock detector caps a thread at 64 held locks; beyond that it fails an
-// internal CHECK and then hangs on exit. Race detection is unaffected. Weak,
-// so a program that sets its own TSAN options keeps them.
-extern "C" __attribute__((weak)) const char* __tsan_default_options() {
-    return "detect_deadlocks=0";
-}
-#endif
 
 namespace udepot {
 
@@ -34,9 +22,14 @@ uint32_t table_bits_for(uint32_t tables) {
 Directory::Directory(Rcu& rcu, uint32_t initial_tables, uint32_t index_bits)
     : rcu_(rcu),
       index_bits_(index_bits),
-      current_(new DirSnapshot(table_bits_for(initial_tables), index_bits)) {}
+      current_(new DirSnapshot(table_bits_for(initial_tables), index_bits,
+                               0)) {}
 
-Directory::~Directory() { delete current_.load(std::memory_order_relaxed); }
+Directory::~Directory() {
+    // Snapshots retired by grow() are freed by RCU callbacks.
+    rcu_.barrier();
+    delete current_.load(std::memory_order_relaxed);
+}
 
 HashEntry Directory::lookup(uint64_t hash, uint32_t start_offset,
                             bool include_deleted) const noexcept {
@@ -46,53 +39,67 @@ HashEntry Directory::lookup(uint64_t hash, uint32_t start_offset,
 }
 
 Directory::Locked Directory::lock_for(uint64_t hash) {
-    for (;;) {
-        DirSnapshot* snap = current_.load(std::memory_order_acquire);
-        HashTable& table = snap->table_for_hash(hash);
-        auto lock = table.lock_for(hash);
-        // grow() marks a table retired, after publishing its replacement,
-        // while holding all of its stripes; seeing it unretired here means
-        // no grow has copied it yet, and none can until we unlock.
-        if (!table.retired()) return Locked{&table, snap, std::move(lock)};
-    }
+    DirSnapshot* snap = current_.load(std::memory_order_acquire);
+    HashTable& table = snap->table_for_hash(hash);
+    auto lock = table.lock_for(hash);
+    // Checked inside the caller's read section: a writer that sees false
+    // here is one grow()'s synchronize() waits for, so its write is in the
+    // tables before they are copied.
+    if (snap->frozen.load(std::memory_order_acquire))
+        return Locked{nullptr, snap, {}};
+    return Locked{&table, snap, std::move(lock)};
+}
+
+void Directory::wait_for_grow(uint64_t generation) {
+    std::unique_lock<std::mutex> lock(grown_mu_);
+    grown_cv_.wait(lock, [&] {
+        // A snapshot is freed once replaced; read it inside a section.
+        Rcu::ReadGuard guard(rcu_);
+        return current_.load(std::memory_order_acquire)->generation !=
+               generation;
+    });
 }
 
 int Directory::insert(uint64_t hash, uint16_t kv_size, uint64_t pba) {
-    for (;;) {
-        auto locked = lock_for(hash);
-        if (locked.table->insert_locked(hash, kv_size, pba) == 0) return 0;
-        const DirSnapshot* seen = locked.snapshot;
-        locked.lock = HashTable::WriteLock{};
-        if (grow(seen) != 0) return -ENOSPC;
-    }
+    auto locked = lock_for(hash);
+    assert(!locked.frozen());
+    return locked.table->insert_locked(hash, kv_size, pba) == 0 ? 0 : -ENOSPC;
 }
 
 bool Directory::update(uint64_t hash, uint64_t old_pba,
                        uint16_t new_kv_size, uint64_t new_pba) {
     auto locked = lock_for(hash);
+    assert(!locked.frozen());
     return locked.table->update_locked(hash, old_pba, new_kv_size, new_pba);
 }
 
 bool Directory::remove(uint64_t hash, uint64_t pba) {
     auto locked = lock_for(hash);
+    assert(!locked.frozen());
     return locked.table->remove_locked(hash, pba);
 }
 
-int Directory::grow(const DirSnapshot* seen) {
+int Directory::grow(uint64_t seen) {
     std::lock_guard<std::mutex> lock(grow_mutex_);
 
+    // Only grow() replaces current_, and it holds grow_mutex_: the snapshot
+    // cannot be freed under us.
     DirSnapshot* old_snap = current_.load(std::memory_order_acquire);
-    if (seen && seen != old_snap) return 0;  // someone else grew it
+    if (seen != kAnyGeneration && seen != old_snap->generation)
+        return 0;  // someone else grew it
     if (old_snap->table_bits >= DirSnapshot::kMaxTableBits) return -ENOSPC;
 
-    auto* new_snap = new DirSnapshot(old_snap->table_bits + 1, index_bits_);
+    // Allocated before freezing: writers stall only for the copy.
+    auto* new_snap = new DirSnapshot(old_snap->table_bits + 1, index_bits_,
+                                     old_snap->generation + 1);
 
-    // Hold every stripe of the old snapshot until it is replaced and
-    // retired: writes wait, then retry on the new snapshot.
-    std::vector<std::vector<std::unique_lock<std::mutex>>> held;
-    held.reserve(old_snap->size());
-    for (auto& t : old_snap->tables) held.push_back(t->lock_all());
+    // As uDepot's rwpflock write_enter + write_wait_readers, for writers
+    // only: new writers see the flag and back off, and the grace period
+    // waits out every one that did not. Readers carry on.
+    old_snap->frozen.store(true, std::memory_order_seq_cst);
+    rcu_.synchronize();
 
+    // Nothing writes the old tables now; the new ones are unpublished.
     for (auto& old_table : old_snap->tables) {
         for (uint64_t s = 0; s < old_table->total_slots(); ++s) {
             HashEntry entry = old_table->load_slot(s);
@@ -111,19 +118,19 @@ int Directory::grow(const DirSnapshot* seen) {
     }
 
     current_.store(new_snap, std::memory_order_release);
-    for (auto& t : old_snap->tables) t->retire();
-    held.clear();
+    {
+        std::lock_guard<std::mutex> g(grown_mu_);
+    }
+    grown_cv_.notify_all();
 
-    // Readers may still be in the old snapshot. This can run inside a
-    // caller's own read-side section (put grows on a full table), so it
-    // cannot wait for a grace period; the old snapshot lives as long as the
-    // directory. Their sizes halve going back, so together they never
-    // exceed the current one.
-    retired_.emplace_back(old_snap);
+    // Readers may still be in the old snapshot: free it after a grace
+    // period, off this path (call_rcu).
+    rcu_.call([old_snap] { delete old_snap; });
     return 0;
 }
 
 uint32_t Directory::num_tables() const noexcept {
+    Rcu::ReadGuard guard(rcu_);
     return current_.load(std::memory_order_acquire)->size();
 }
 

@@ -300,6 +300,59 @@ TEST_F(StoreGcTest, DirectoryGrowsUnderConcurrentPuts) {
     check();
 }
 
+// A put that finds its table full while running on the AIO poller (where
+// its coroutine resumes after the data write) must not grow the directory
+// there: the grow waits for a grace period, which reads in flight on that
+// same poller hold. It suspends, the waker thread grows, and it retries.
+TEST(StoreGcAioTest, DirectoryGrowsFromPollerThread) {
+    auto path = std::filesystem::temp_directory_path() /
+                ("udepot_store_grow_aio_" + std::to_string(getpid()));
+    StoreConfig config = gc_config(path);
+    config.initial_tables = 1;
+    config.index_bits = 6;
+    UDepot<AioIO> store;
+    ASSERT_EQ(store.open(config), 0);
+
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 1024;
+    constexpr int kBatch = 32;
+    std::atomic<int> errors{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int base = 0; base < kPerThread; base += kBatch) {
+                // In flight together, so commits run on the poller while
+                // other puts' reads are outstanding.
+                std::vector<std::string> keys, vals;
+                for (int i = base; i < base + kBatch; ++i) {
+                    keys.push_back("p" + std::to_string(t) + "_" +
+                                   std::to_string(i));
+                    vals.push_back(value_for(i, t, 100));
+                }
+                std::vector<udepot::CoroTask<int>> ops;
+                for (int j = 0; j < kBatch; ++j)
+                    ops.push_back(store.put(keys[j], vals[j]));
+                for (auto& op : ops)
+                    if (op.run_sync() != 0) errors.fetch_add(1);
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    EXPECT_EQ(errors.load(), 0);
+    EXPECT_GT(store.directory().num_tables(), 1u);
+
+    int missing = 0;
+    for (int t = 0; t < kThreads; ++t)
+        for (int i = 0; i < kPerThread; ++i)
+            if (get_or_empty(store, "p" + std::to_string(t) + "_" +
+                                        std::to_string(i)) !=
+                value_for(i, t, 100))
+                ++missing;
+    EXPECT_EQ(missing, 0);
+    store.close();
+    std::filesystem::remove(path);
+}
+
 // Regression: recovery looked at only the first tag-matching entry. With
 // another key of the same tag ahead of it in the neighborhood, a key's
 // newer record was inserted as a second entry instead of replacing the

@@ -67,16 +67,6 @@ public:
     };
     WriteLock lock_for(uint64_t hash);
 
-    // Every stripe, for directory grow.
-    std::vector<std::unique_lock<std::mutex>> lock_all();
-
-    // Set by a grow, with every stripe held, once this table's contents
-    // live in a newer snapshot. Writers check it after locking.
-    bool retired() const noexcept {
-        return retired_.load(std::memory_order_relaxed);
-    }
-    void retire() noexcept { retired_.store(true, std::memory_order_relaxed); }
-
     // Insert a live entry. Returns 0, or -1 if no free slot is within reach
     // (the directory needs to grow).
     int insert(uint64_t hash, uint16_t kv_size, uint64_t pba);
@@ -128,7 +118,6 @@ private:
 
     std::unique_ptr<std::atomic<uint64_t>[]> slots_;
     std::unique_ptr<Stripe[]> stripes_;
-    std::atomic<bool> retired_{false};
 
     uint64_t hash_to_bucket(uint64_t hash) const noexcept {
         return hash & bucket_mask_;

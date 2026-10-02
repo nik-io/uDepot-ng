@@ -106,9 +106,14 @@ on NVMe). This means **no separate table refcounting** — RCU alone guarantees
 that no reader references a freed table, and that GC does not reuse a segment
 a reader may still be reading (GC waits a grace period before handing a
 segment back). `close()` uses the same grace period to wait for operations in
-flight. The one exception is waiting for free space (see *Space management*):
-an operation leaves its section while it waits, so a stalled writer can never
-hold up the grace period GC needs to free the space it is waiting for.
+flight. The exceptions are waiting for free space (see *Space management*)
+and waiting for a directory grow: an operation leaves its section while it
+waits, so it can never hold up the grace period that GC or the grow needs to
+let it continue.
+
+`Rcu::call(fn)` (call_rcu) runs `fn` after a grace period on a reclaimer
+thread, batching callbacks behind one `synchronize()`; `Rcu::barrier()` waits
+for those queued. The directory frees replaced snapshots this way.
 
 ### 2. Lock-Free Reads, Stripe-Locked Writes
 
@@ -145,14 +150,26 @@ reproduces the order writes were acknowledged in.
 
 **Directory.** As in uDepot's `hash_to_map`, a key's table is chosen by the
 top bits of its tag and its bucket by the low bits of its hash. `grow()`
-doubles the number of tables online: it locks every stripe of the current
-snapshot, copies live and deleted entries, publishes the new snapshot, and
-marks the old tables retired before unlocking. A writer waiting on an old
-stripe sees it retired and retries on the new snapshot, so no write is lost to
-a grow, and readers are never blocked. Because a put grows from inside its own
-read-side section, `grow()` cannot wait for a grace period; retired snapshots
-are freed when the store closes. Their total size is less than the current
-directory's.
+doubles the number of tables. Legacy excluded every operation for the grow
+(`rwpflock.write_enter()` + `write_wait_readers()`); uDepot-ng keeps that for
+writers only, using RCU:
+
+1. Set the snapshot's `frozen` flag. A writer checks it under its stripe
+   lock, inside its read section, and backs off if set.
+2. `synchronize()`: every writer that missed the flag has finished, so its
+   write is in the old tables, and none can start.
+3. Copy live and deleted entries into the new tables, holding no lock.
+4. Publish the new snapshot and wake the writers that backed off; they
+   retry on it.
+5. Free the old snapshot with `Rcu::call()` (call_rcu): once a grace period
+   has passed, on the RCU reclaimer thread, off the grow path.
+
+Readers never block: they keep reading the frozen tables during the copy.
+Grow is rare, so ordinary writes pay only a flag load under their stripe lock.
+Because `grow()` waits for a grace period it never runs inside a read section
+or on an I/O poller thread (which in-flight reads may be waiting on): a
+writer that finds its table full leaves its section and suspends, and the
+store's waker thread runs the grow.
 
 ### 3. Eager-Start C++23 Coroutines
 

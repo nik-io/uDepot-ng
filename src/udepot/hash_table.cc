@@ -71,14 +71,6 @@ HashTable::WriteLock HashTable::lock_for(uint64_t hash) {
     return WriteLock(&stripes_[s1].mu, s2 != s1 ? &stripes_[s2].mu : nullptr);
 }
 
-std::vector<std::unique_lock<std::mutex>> HashTable::lock_all() {
-    std::vector<std::unique_lock<std::mutex>> locks;
-    locks.reserve(num_stripes_);
-    for (uint64_t s = 0; s < num_stripes_; ++s)
-        locks.emplace_back(stripes_[s].mu);
-    return locks;
-}
-
 int HashTable::insert(uint64_t hash, uint16_t kv_size, uint64_t pba) {
     auto lock = lock_for(hash);
     return insert_locked(hash, kv_size, pba);

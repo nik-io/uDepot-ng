@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <ctime>
 #include <thread>
@@ -210,15 +211,18 @@ int UDepot<IO>::recover_record(uint64_t hash, std::span<const uint8_t> key,
         HashEntry match;
         uint16_t match_grains = 0;
         {
+            // Recovery runs alone, before any other thread: no grow can
+            // race it, and it holds no read section, so it may grow inline.
             auto locked = directory_->lock_for(hash);
+            assert(!locked.frozen());
             bool settled = probe_settled(*locked.table, hash, probe, &match);
-            assert(settled);  // recovery is single-threaded
+            assert(settled);
             (void)settled;
             uint16_t new_kv = tombstone ? 0 : kv_grains;
             if (match.empty()) {
                 if (locked.table->insert_locked(hash, new_kv, grain) == 0)
                     return 0;
-                const DirSnapshot* seen = locked.snapshot;
+                uint64_t seen = locked.snapshot->generation;
                 locked.lock = HashTable::WriteLock{};
                 if (directory_->grow(seen) != 0) return -ENOSPC;
                 continue;
@@ -571,15 +575,56 @@ template <typename IO>
 bool UDepot<IO>::SpaceWait::await_suspend(std::coroutine_handle<> h) {
     std::lock_guard<std::mutex> lock(store->space_mu_);
     if (store->space_stop_) return false;  // closing: retry, see it closed
+    if (grow != Directory::kAnyGeneration)
+        store->grow_request_ =
+            std::max(store->grow_request_.value_or(0), grow);
     store->space_waiters_.push_back(h);
     store->space_cv_.notify_one();
     return true;
 }
 
 template <typename IO>
+CoroTask<int> UDepot<IO>::wait_for_grow(uint64_t gen, bool grow,
+                                        std::optional<Rcu::ReadGuard>& guard,
+                                        KeyProbe* probe) {
+    // The grow waits for read sections, so leave ours first.
+    guard.reset();
+    if (probe) probe->n = 0;
+    co_await SpaceWait{this, grow ? gen : Directory::kAnyGeneration};
+    guard.emplace(rcu_);
+    if (!open_.load(std::memory_order_acquire)) co_return -ESHUTDOWN;
+    co_return 0;
+}
+
+// Resume every waiter, with space_mu_ released. Called with it held.
+template <typename IO>
+void UDepot<IO>::resume_waiters(std::unique_lock<std::mutex>& lock) {
+    auto waiters = std::move(space_waiters_);
+    space_waiters_.clear();
+    lock.unlock();
+    for (auto h : waiters) h.resume();
+    // Resumed operations may have submitted I/O from this thread; on a
+    // backend that completes on the submitting thread, see it through.
+    while (poll_this_thread()) {}
+    lock.lock();
+}
+
+template <typename IO>
 void UDepot<IO>::space_waker_loop() {
     std::unique_lock<std::mutex> lock(space_mu_);
     while (!space_stop_) {
+        if (grow_request_) {
+            // Grows run here, never on an operation's thread: they wait for
+            // a grace period, which an I/O poller could be holding up. This
+            // thread holds no read section and no I/O is pending on it.
+            uint64_t gen = *grow_request_;
+            grow_request_.reset();
+            lock.unlock();
+            directory_->grow(gen);  // -ENOSPC: commit_put reports it
+            lock.lock();
+            resume_waiters(lock);
+            continue;
+        }
         if (space_waiters_.empty()) {
             space_cv_.wait(lock);
             continue;
@@ -589,20 +634,10 @@ void UDepot<IO>::space_waker_loop() {
         lock.unlock();
         std::this_thread::sleep_for(std::chrono::microseconds(200));
         lock.lock();
-        auto waiters = std::move(space_waiters_);
-        space_waiters_.clear();
-        lock.unlock();
-        for (auto h : waiters) h.resume();
-        // Resumed operations may have submitted I/O from this thread; on a
-        // backend that completes on the submitting thread, see it through.
-        while (poll_this_thread()) {}
-        lock.lock();
+        resume_waiters(lock);
     }
-    auto waiters = std::move(space_waiters_);
-    space_waiters_.clear();
-    lock.unlock();
-    for (auto h : waiters) h.resume();  // they find the store closed
-    while (poll_this_thread()) {}
+    grow_request_.reset();
+    resume_waiters(lock);  // they find the store closed
 }
 
 template <typename IO>
@@ -650,12 +685,9 @@ int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
         // As uDepot purged deleted entries at GC; only when no older
         // segment remains, since an older copy of the key would otherwise
         // come back after a crash.
-        bool purged;
-        {
-            Rcu::ReadGuard guard(rcu_);
-            auto locked = directory_->lock_for(hash);
-            purged = locked.table->remove_locked(hash, grain);
-        }
+        bool purged = with_table_blocking(hash, [&](HashTable& table) {
+            return table.remove_locked(hash, grain);
+        });
         if (purged) invalidate_grains(grain, entry_grains, true);
         return 0;
     }
@@ -691,12 +723,9 @@ int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
         return EIO;
     }
 
-    bool moved;
-    {
-        Rcu::ReadGuard guard(rcu_);
-        auto locked = directory_->lock_for(hash);
-        moved = locked.table->update_locked(hash, grain, entry.kv_size(), dst);
-    }
+    bool moved = with_table_blocking(hash, [&](HashTable& table) {
+        return table.update_locked(hash, grain, entry.kv_size(), dst);
+    });
     release_grains(dst, entry_grains, true);
     if (moved)
         invalidate_grains(grain, entry_grains, true);
@@ -835,8 +864,12 @@ template <typename IO>
 int UDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
                            PutMode mode, uint64_t if_version,
                            uint16_t kv_grains, uint64_t pba,
-                           HashEntry* replaced, const DirSnapshot** full) {
+                           HashEntry* replaced, uint64_t* gen) {
     auto locked = directory_->lock_for(hash);
+    if (locked.frozen()) {
+        *gen = locked.snapshot->generation;
+        return kFrozen;
+    }
     HashTable& table = *locked.table;
 
     HashEntry match;
@@ -856,7 +889,9 @@ int UDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
 
     if (match.empty()) {
         if (table.insert_locked(hash, kv_grains, pba) == 0) return 0;
-        *full = locked.snapshot;
+        if (locked.snapshot->table_bits >= DirSnapshot::kMaxTableBits)
+            return -ENOSPC;
+        *gen = locked.snapshot->generation;
         return kTableFull;
     }
     // Recovery keeps the newer of two records of a key, tombstones
@@ -936,18 +971,16 @@ CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
         for (;;) {
             rc = co_await probe_key(hash, key, probe);
             if (rc != 0) break;
-            const DirSnapshot* full = nullptr;
+            uint64_t gen = 0;
             rc = commit_put(hash, probe, mode, if_version,
                             static_cast<uint16_t>(grains_needed), grain,
-                            &replaced, &full);
+                            &replaced, &gen);
             if (rc == kRetryProbe) continue;
-            if (rc != kTableFull) break;
-            // As in uDepot: a full table grows the directory and the
-            // write retries.
-            if (directory_->grow(full) != 0) {
-                rc = -ENOSPC;
-                break;
-            }
+            if (rc != kTableFull && rc != kFrozen) break;
+            // As in uDepot: a full table grows the directory, and a write
+            // that meets a grow waits for it; either way it then retries.
+            rc = co_await wait_for_grow(gen, rc == kTableFull, guard, &probe);
+            if (rc != 0) break;
         }
 
         if (rc == 0) {
@@ -1124,8 +1157,12 @@ CoroTask<int> UDepot<IO>::write_tombstone(
 template <typename IO>
 int UDepot<IO>::commit_del(uint64_t hash, const KeyProbe& probe,
                            uint64_t if_version, uint64_t tomb_pba,
-                           HashEntry* removed) {
+                           HashEntry* removed, uint64_t* gen) {
     auto locked = directory_->lock_for(hash);
+    if (locked.frozen()) {
+        *gen = locked.snapshot->generation;
+        return kFrozen;
+    }
     HashTable& table = *locked.table;
 
     HashEntry match;
@@ -1159,11 +1196,16 @@ CoroTask<int> UDepot<IO>::del(std::span<const uint8_t> key,
     KeyProbe probe;
     for (;;) {
         HashEntry removed;
+        uint64_t gen = 0;
         int rc = co_await probe_key(hash, key, probe);
         if (rc == 0)
-            rc = commit_del(hash, probe, if_version, tomb, &removed);
+            rc = commit_del(hash, probe, if_version, tomb, &removed, &gen);
 
         if (rc == kRetryProbe) continue;
+        if (rc == kFrozen) {
+            rc = co_await wait_for_grow(gen, false, guard, &probe);
+            if (rc == 0) continue;
+        }
         if (rc == 0) {
             invalidate_grains(removed.pba(), removed.kv_size());
             release_grains(tomb, tomb_grains);  // stays valid, referenced
