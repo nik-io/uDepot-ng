@@ -270,3 +270,40 @@ TEST(Rcu, ReaderFenceModeIsReported) {
     EXPECT_TRUE(Rcu::reader_fence());
 #endif
 }
+
+// call_rcu: a callback waits for every read section that began before it
+// was queued, including one still open on the queuing thread.
+TEST(Rcu, CallRunsOnlyAfterPreexistingReaders) {
+    Rcu rcu;
+    std::atomic<bool> ran{false};
+    uint32_t idx = rcu.read_lock();
+    rcu.call([&] { ran.store(true); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(ran.load());
+    rcu.read_unlock(idx);
+    rcu.barrier();
+    EXPECT_TRUE(ran.load());
+}
+
+TEST(Rcu, BarrierWaitsForEveryQueuedCallback) {
+    Rcu rcu;
+    std::atomic<int> count{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t)
+        threads.emplace_back([&] {
+            for (int i = 0; i < 1000; ++i)
+                rcu.call([&] { count.fetch_add(1); });
+        });
+    for (auto& t : threads) t.join();
+    rcu.barrier();
+    EXPECT_EQ(count.load(), 4000);
+}
+
+TEST(Rcu, DestructorRunsPendingCallbacks) {
+    std::atomic<int> count{0};
+    {
+        Rcu rcu;
+        for (int i = 0; i < 10; ++i) rcu.call([&] { count.fetch_add(1); });
+    }
+    EXPECT_EQ(count.load(), 10);
+}

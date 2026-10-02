@@ -5,8 +5,12 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 namespace udepot {
 
@@ -68,6 +72,16 @@ public:
     // call has ended. May spin.
     void synchronize() noexcept;
 
+    // Run fn once a grace period has elapsed (call_rcu): every read-side
+    // section that began before this call has ended. Never waits; callbacks
+    // run on a reclaimer thread, started on first use, which batches them
+    // behind one synchronize(). Callable from inside a read section.
+    void call(std::function<void()> fn);
+
+    // Wait until every callback queued before this call has run
+    // (rcu_barrier). Must not be called inside a read-side section.
+    void barrier();
+
     // Slots ever claimed (high-water mark).
     uint32_t thread_count() const noexcept {
         return slots_claimed_.load(std::memory_order_relaxed);
@@ -102,6 +116,16 @@ private:
     std::array<bool, kMaxThreads> in_use_{};  // guarded by slots_mu_
     std::mutex slots_mu_;
     std::mutex gp_mu_;  // serializes synchronize()
+
+    // Deferred callbacks (call/barrier).
+    void reclaim_loop();
+    std::mutex cb_mu_;
+    std::condition_variable cb_cv_;
+    std::vector<std::function<void()>> cb_queue_;  // cb_mu_
+    uint64_t cb_queued_ = 0;                       // cb_mu_
+    uint64_t cb_done_ = 0;                         // cb_mu_
+    bool cb_stop_ = false;                         // cb_mu_
+    std::thread reclaimer_;                        // started under cb_mu_
     uint64_t id_ = next_id();
 };
 

@@ -111,8 +111,49 @@ Rcu::Rcu() {
 }
 
 Rcu::~Rcu() {
+    // Run what is still queued, then stop the reclaimer.
+    {
+        std::lock_guard<std::mutex> lock(cb_mu_);
+        cb_stop_ = true;
+    }
+    cb_cv_.notify_all();
+    if (reclaimer_.joinable()) reclaimer_.join();
+
     std::lock_guard<std::mutex> lock(live_mu());
     live().erase(id_);
+}
+
+void Rcu::call(std::function<void()> fn) {
+    std::lock_guard<std::mutex> lock(cb_mu_);
+    cb_queue_.push_back(std::move(fn));
+    ++cb_queued_;
+    if (!reclaimer_.joinable())
+        reclaimer_ = std::thread(&Rcu::reclaim_loop, this);
+    cb_cv_.notify_all();
+}
+
+void Rcu::barrier() {
+    std::unique_lock<std::mutex> lock(cb_mu_);
+    const uint64_t target = cb_queued_;
+    cb_cv_.wait(lock, [&] { return cb_done_ >= target; });
+}
+
+void Rcu::reclaim_loop() {
+    std::unique_lock<std::mutex> lock(cb_mu_);
+    for (;;) {
+        cb_cv_.wait(lock, [&] { return cb_stop_ || !cb_queue_.empty(); });
+        if (cb_queue_.empty()) return;  // stopping, nothing left
+        auto batch = std::move(cb_queue_);
+        cb_queue_.clear();
+        lock.unlock();
+        // One grace period covers the whole batch: each callback was queued
+        // before this synchronize() began.
+        synchronize();
+        for (auto& fn : batch) fn();
+        lock.lock();
+        cb_done_ += batch.size();
+        cb_cv_.notify_all();
+    }
 }
 
 uint32_t Rcu::claim_slot() noexcept {
