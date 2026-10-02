@@ -548,3 +548,79 @@ TEST_F(StoreGcTest, GcRelocationRacingPutRecoversAsAcknowledged) {
     recovered.close();
     EXPECT_EQ(wrong, 0) << "of " << raced.load() << " raced relocations";
 }
+
+// Regression (PR #3 review, finding 5): salsa recycled a segment the moment
+// its last valid grain was invalidated, with no grace period. A get that had
+// looked a record up there just before it was overwritten could then read
+// the segment's next contents, and report a key that was there all along as
+// missing.
+TEST_F(StoreGcTest, GetSurvivesItsSegmentBeingRecycled) {
+    ASSERT_EQ(store_.open(config_), 0);
+    constexpr int kKeys = 50;
+    constexpr size_t kVal = 4000;
+    constexpr int kReads = 8;
+    for (int k = 0; k < kKeys; ++k)
+        ASSERT_EQ(store_.put("w" + std::to_string(k), value_for(k, 0, kVal))
+                      .run_sync(), 0);
+
+    static std::atomic<bool> armed{false};
+    static std::atomic<uint64_t> puts{0};
+    armed = false;
+    puts = 0;
+    UDepot<PosixIO>::get_read_test_hook = [](std::span<const uint8_t>) {
+        if (!armed.exchange(false)) return;
+        // Hold the read until the writer has wrapped around the device
+        // twice, so the record's segment is overwritten if it was freed, or
+        // until the writer stalls: with the fix, every segment it could
+        // reuse waits for this read's grace period.
+        using Clock = std::chrono::steady_clock;
+        constexpr uint64_t kWraps = 2 * kStoreSize / kVal;
+        const uint64_t target = puts.load() + kWraps;
+        uint64_t last = puts.load();
+        auto progress = Clock::now();
+        while (last < target) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            uint64_t now = puts.load();
+            if (now != last) {
+                last = now;
+                progress = Clock::now();
+            } else if (Clock::now() - progress >
+                       std::chrono::milliseconds(50)) {
+                break;
+            }
+        }
+    };
+    struct ResetHook {
+        ~ResetHook() { UDepot<PosixIO>::get_read_test_hook = nullptr; }
+    } reset_hook;
+
+    // Every key is rewritten each round, so whole segments go dead and are
+    // recycled without GC relocating anything.
+    std::atomic<bool> stop{false};
+    std::atomic<int> put_errors{0};
+    std::thread writer([&] {
+        for (int r = 1; !stop.load(); ++r) {
+            for (int k = 0; k < kKeys && !stop.load(); ++k) {
+                if (store_.put("w" + std::to_string(k),
+                               value_for(k, r, kVal)).run_sync() != 0)
+                    put_errors.fetch_add(1);
+                puts.fetch_add(1);
+            }
+        }
+    });
+
+    int bad = 0;
+    for (int i = 0; i < kReads; ++i) {
+        int k = (i * 7) % kKeys;
+        armed = true;
+        std::string got = get_or_empty(store_, "w" + std::to_string(k));
+        // Any round's value of this key is fine; anything else is not.
+        std::string prefix = "k" + std::to_string(k) + "_r";
+        if (got.size() != kVal || got.rfind(prefix, 0) != 0) ++bad;
+    }
+    stop = true;
+    writer.join();
+    UDepot<PosixIO>::get_read_test_hook = nullptr;
+    EXPECT_EQ(put_errors.load(), 0);
+    EXPECT_EQ(bad, 0) << "of " << kReads << " reads held across a recycle";
+}

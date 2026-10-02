@@ -236,6 +236,12 @@ public:
     inline static void (*gc_relocation_test_hook)(
         std::span<const uint8_t> key) = nullptr;
 
+    // Test seam, never set in production: a get calls it after looking up
+    // a record and before reading it, inside its read-side section. Tests
+    // use it to let writers recycle the record's segment meanwhile.
+    inline static void (*get_read_test_hook)(
+        std::span<const uint8_t> key) = nullptr;
+
     Directory& directory() { return *directory_; }
     const Directory& directory() const { return *directory_; }
     Rcu& rcu() { return rcu_; }
@@ -291,6 +297,9 @@ private:
 
     // SalsaCtlr overrides — called from salsa's GC thread.
     int gc_callback(u64 grain_start, u64 grain_nr) override;
+    // Salsa's defer_free_seg: frees a segment whose last grain was
+    // invalidated only after a grace period.
+    static void defer_free_seg(void* arg, struct segment* seg);
     void seg_md_callback(u64 grain_start, u64 grain_nr) override;
 
     // Never blocks: 0, -EAGAIN (no segment staged yet), -ENOSPC, or -EIO

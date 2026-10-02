@@ -488,6 +488,12 @@ int UDepot<IO>::open(const StoreConfig& config) {
         }
     }
 
+    // Salsa frees a segment as soon as its last valid grain is invalidated,
+    // but a get that found a record there before the overwrite may still be
+    // about to read it. Hold the segment back a grace period, as
+    // gc_callback does for the segments it cleans.
+    scm_->set_defer_free_seg(&UDepot::defer_free_seg, this);
+
     rc = scm_->init_threads();
     if (rc != 0) {
         salsa::SalsaCtlr::shutdown();
@@ -515,6 +521,9 @@ void UDepot<IO>::close() {
 
     if (scm_) {
         scm_->exit_threads();
+        // GC is stopped, so no more segments get deferred; return the
+        // deferred ones to salsa before it shuts down.
+        rcu_.barrier();
 
         // Persist device metadata before shutdown so the next open can
         // recover.
@@ -800,6 +809,14 @@ int UDepot<IO>::gc_callback(u64 grain_start, u64 grain_nr) {
     rcu_.synchronize();
     seg_live_[victim].store(false, std::memory_order_release);
     return 0;
+}
+
+template <typename IO>
+void UDepot<IO>::defer_free_seg(void* arg, struct segment* seg) {
+    auto* self = static_cast<UDepot*>(arg);
+    // seg_live_ stays set: the segment's metadata and old records stay on
+    // disk, and recoverable, until it is reused.
+    self->rcu_.call([self, seg] { self->scm_->put_free_seg(seg); });
 }
 
 template <typename IO>
@@ -1127,6 +1144,7 @@ CoroTask<int> UDepot<IO>::get_record(std::span<const uint8_t> key,
         IoBuffer buf = io_.alloc_buffer(read_bytes);
         if (!buf.data) co_return -ENOMEM;
 
+        if (get_read_test_hook) get_read_test_hook(key);
         ssize_t nread = co_await io_.pread(buf.data, read_bytes,
                                            grain_to_offset(pba));
         if (nread < static_cast<ssize_t>(sizeof(KvHeader)))
