@@ -368,14 +368,15 @@ TEST_F(StoreTest, ExistsWithTagCollisionFindsCorrectKey) {
 
 // --- CRC table-based vs bit-by-bit equivalence ---
 
-static uint16_t crc16_bitwise(const uint8_t* data, size_t len) {
-    uint16_t crc = 0xFFFF;
+// zlib's crc32(crc, buf, len), bit by bit, independent of the store's table.
+static uint32_t crc32_bitwise(uint32_t crc, const uint8_t* data, size_t len) {
+    crc = ~crc;
     for (size_t i = 0; i < len; ++i) {
-        crc ^= static_cast<uint16_t>(data[i]) << 8;
+        crc ^= data[i];
         for (int j = 0; j < 8; ++j)
-            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
     }
-    return crc;
+    return ~crc;
 }
 
 // --- Upsert (overwrite) ---
@@ -483,7 +484,9 @@ TEST_F(StoreTest, PutOverwriteExistsReportsNewSize) {
 TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
     // Put a key/value pair; read it back via raw I/O and verify the
     // on-disk CRC matches the reference bitwise implementation.
-    // The CRC covers only the 14-byte header (matching uDepot).
+    // As uDepot's checksum16(timestamp, md): a CRC32 seeded with the
+    // segment timestamp, over the header, then over the device seed,
+    // truncated to 16 bits.
     std::string key = "crc_check_key";
     std::vector<uint8_t> val(256);
     for (size_t i = 0; i < val.size(); ++i)
@@ -515,8 +518,14 @@ TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
                         .run_sync();
     ASSERT_EQ(nread, static_cast<ssize_t>(read_size));
 
-    // Reference CRC over the header only (14 bytes).
-    uint16_t ref_crc = crc16_bitwise(buf.data(), sizeof(udepot::KvHeader));
+    udepot::KvHeader hdr;
+    std::memcpy(&hdr, buf.data(), sizeof(hdr));
+    const uint64_t seed = store_.seed();
+    uint32_t crc = crc32_bitwise(static_cast<uint32_t>(hdr.timestamp),
+                                 buf.data(), sizeof(udepot::KvHeader));
+    crc = crc32_bitwise(crc, reinterpret_cast<const uint8_t*>(&seed),
+                        sizeof(seed));
+    uint16_t ref_crc = static_cast<uint16_t>(crc);
 
     // Read the stored CRC from the suffix.
     size_t suffix_offset = sizeof(udepot::KvHeader) + key.size() + val.size();
@@ -524,7 +533,7 @@ TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
     std::memcpy(&suffix, buf.data() + suffix_offset, sizeof(suffix));
 
     EXPECT_EQ(suffix.crc16, ref_crc)
-        << "On-disk CRC covers only the 14-byte header (matching uDepot)";
+        << "On-disk CRC is uDepot's checksum16 over the header and seed";
 }
 
 TEST_F(StoreTest, PutCreateFailsIfKeyExists) {

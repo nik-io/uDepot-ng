@@ -494,6 +494,25 @@ store can read each other. **Known divergences:**
   `dirmap_ftr` (below) with the table's size and its part number. uDepot
   sized every table to fill its segment, so it needed neither.
 
+### Record identity
+
+As uDepot's `checksum16(timestamp, md)`, a record's 2-byte checksum is a
+CRC32 seeded with its segment's timestamp, over the header, then over the
+device seed, truncated to 16 bits. Recovery and GC accept a record only if
+its header carries its segment's timestamp and the checksum matches. A store
+created over an earlier one (`force_destroy`) restarts its timestamps from
+the same values on the same segments; without the seed in the checksum, a
+crash brought back the earlier store's records left past what the new one
+had written. Each new store therefore needs its own seed: uDepot took the
+monotonic clock's seconds, which repeat for two stores created within a
+second or across reboots, so uDepot-ng draws it from `std::random_device`
+mixed with the real-time clock.
+
+Each segment's timestamp is the allocation count salsa gave that segment,
+passed to the metadata callback, so two streams staging segments at once
+get different ones (reading the counter in the callback after both had
+bumped it gave them the same, and recovery could not order their records).
+
 ### Device geometry
 
 As uDepot: the device is divided into segments of `segment_size` grains; the

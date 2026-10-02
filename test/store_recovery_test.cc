@@ -482,6 +482,43 @@ INSTANTIATE_TEST_SUITE_P(
 // Tests of the index itself, which only a clean shutdown writes.
 class StoreIndexTest : public StoreRecoveryTest {};
 
+// A store created over an earlier one (force_destroy) restarts its segment
+// timestamps from the same values, and its segments reuse the same places
+// on the device. A record's checksum was bound to neither its segment's
+// timestamp nor the device seed, so a crash brought back records the old
+// store had left past what the new one had written: keys it never put. As
+// uDepot's, the checksum now covers both, and each store gets a fresh seed
+// (the monotonic clock's seconds repeated for stores created within one).
+TEST_P(StoreIndexTest, RecreatedStoreDoesNotRecoverTheOldStoresRecords) {
+    config_.size = 32 * 1024 * 1024 + 4096;
+    config_.segment_size = 2048;  // 1 MiB
+    const std::string big(3000, 'o');
+    {
+        UDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        for (int i = 0; i < 5000; ++i)
+            ASSERT_EQ(store.put("old" + std::to_string(i), big).run_sync(), 0);
+        store.close();
+    }
+    {
+        UDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);  // force_destroy: a new store
+        for (int i = 0; i < 200; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        crash(store);
+    }
+    UDepot<PosixIO> store;
+    ASSERT_EQ(store.open(reopen_config()), 0);
+    int resurrected = 0;
+    for (int i = 0; i < 5000; ++i)
+        if (get_value(store, "old" + std::to_string(i))[0] != '<')
+            ++resurrected;
+    EXPECT_EQ(resurrected, 0) << "keys of the old store came back";
+    for (int i = 0; i < 200; ++i)
+        EXPECT_EQ(get_value(store, make_key(i)), make_val(i)) << make_key(i);
+    store.close();
+}
+
 // The open that restores an index clears it: after writes and a crash, the
 // log decides, not the older index. The old index's segments must outlive
 // the second session for this to show, so the first session churns the

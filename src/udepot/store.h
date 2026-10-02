@@ -254,6 +254,14 @@ public:
 
     // Test seam, never set in production: GC calls it when it drops a
     // deleted key's tombstone, with the timestamp of the victim segment.
+    // Test seams, never set in production: seg_md_enter_test_hook runs as
+    // a new KV segment's metadata callback starts, before it takes a
+    // timestamp; seg_md_test_hook is called with the timestamp it took.
+    using SegEnterHook = void (*)();
+    inline static std::atomic<SegEnterHook> seg_md_enter_test_hook{nullptr};
+    using SegTimestampHook = void (*)(uint64_t ts);
+    inline static std::atomic<SegTimestampHook> seg_md_test_hook{nullptr};
+
     using TombstoneDropHook = void (*)(std::span<const uint8_t> key,
                                        uint64_t victim_ts);
     inline static std::atomic<TombstoneDropHook> gc_tombstone_drop_test_hook{
@@ -270,6 +278,8 @@ public:
     Rcu& rcu() { return rcu_; }
     IO& io() { return io_; }
     uint32_t grain_size() const { return grain_size_; }
+    // The device seed: binds segment metadata and records to this store.
+    uint64_t seed() const noexcept { return seed_; }
 
 private:
     Rcu rcu_;
@@ -325,7 +335,8 @@ private:
     // Salsa's defer_free_seg: frees a segment whose last grain was
     // invalidated only after a grace period.
     static void defer_free_seg(void* arg, struct segment* seg);
-    void seg_md_callback(u64 grain_start, u64 grain_nr) override;
+    void seg_md_callback(u64 grain_start, u64 grain_nr,
+                         u64 alloc_nr) override;
 
     // Never blocks: 0, -EAGAIN (no segment staged yet), -ENOSPC, or -EIO
     // if the segment's metadata write failed.
@@ -336,7 +347,7 @@ private:
     // candidate, only when all of its grains are released.
     void release_grains(uint64_t grain, uint64_t count, bool reloc = false);
 
-    static uint16_t compute_crc16(const KvHeader& hdr);
+    uint16_t compute_crc16(const KvHeader& hdr) const;
     static uint32_t compute_crc32(uint32_t seed, const uint8_t* data,
                                   size_t len);
 
@@ -369,7 +380,7 @@ private:
         // Never holds anything GC could move (uDepot: "this should not
         // happen").
         int gc_callback(u64, u64) override { return ENOSYS; }
-        void seg_md_callback(u64 grain_start, u64) override {
+        void seg_md_callback(u64 grain_start, u64, u64) override {
             store_->index_seg_md_callback(grain_start);
         }
         UDepot* store_;

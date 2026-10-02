@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstring>
 #include <ctime>
+#include <random>
 #include <thread>
 
 #include "udepot/io/aio.h"
@@ -28,24 +29,6 @@
 #include "frontends/usalsa++/SalsaMD.hh"
 
 namespace udepot {
-
-// CRC-CCITT (0x1021) lookup table, computed at compile time.
-static constexpr auto kCrc16Table = [] {
-    std::array<uint16_t, 256> t{};
-    for (int i = 0; i < 256; ++i) {
-        uint16_t crc = static_cast<uint16_t>(i) << 8;
-        for (int j = 0; j < 8; ++j)
-            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
-        t[i] = crc;
-    }
-    return t;
-}();
-
-static uint16_t crc16_update(uint16_t crc, const uint8_t* data, size_t len) {
-    for (size_t i = 0; i < len; ++i)
-        crc = kCrc16Table[((crc >> 8) ^ data[i]) & 0xFF] ^ (crc << 8);
-    return crc;
-}
 
 // CRC32 (same polynomial as zlib) for device/segment metadata checksums.
 static constexpr auto kCrc32Table = [] {
@@ -68,12 +51,18 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
 
 static constexpr uint32_t kGlobalSeed = 0xDEADBEEF;
 
+// As uDepot's checksum16(timestamp, md): the record's checksum is bound to
+// its segment's timestamp and to the device seed, the segment metadata's
+// own identity. A record left on the device by an earlier store, whose
+// timestamps restart from the same values, then fails it.
 template <typename IO>
-uint16_t UDepot<IO>::compute_crc16(const KvHeader& hdr) {
-    uint16_t crc = 0xFFFF;
-    crc = crc16_update(crc, reinterpret_cast<const uint8_t*>(&hdr),
-                       sizeof(hdr));
-    return crc;
+uint16_t UDepot<IO>::compute_crc16(const KvHeader& hdr) const {
+    uint32_t crc = crc32_update(static_cast<uint32_t>(hdr.timestamp),
+                                reinterpret_cast<const uint8_t*>(&hdr),
+                                sizeof(hdr));
+    crc = crc32_update(crc, reinterpret_cast<const uint8_t*>(&seed_),
+                       sizeof(seed_));
+    return static_cast<uint16_t>(crc);
 }
 
 template <typename IO>
@@ -835,9 +824,16 @@ int UDepot<IO>::open(const StoreConfig& config) {
         seed_ = dev_md.seed;
         segment_size = dev_md.segment_size;
     } else {
+        // Every store on a device needs its own seed: records and segment
+        // metadata are only told apart from an earlier store's by it.
+        // uDepot used the monotonic clock's seconds, which repeats for two
+        // stores created within a second (or across reboots).
+        std::random_device rd;
         struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        seed_ = static_cast<uint64_t>(ts.tv_sec);
+        clock_gettime(CLOCK_REALTIME, &ts);
+        seed_ = (static_cast<uint64_t>(rd()) << 32 | rd()) ^
+                static_cast<uint64_t>(ts.tv_nsec) ^
+                (static_cast<uint64_t>(ts.tv_sec) << 20);
     }
 
     if (segment_size == 0)
@@ -1353,8 +1349,17 @@ void UDepot<IO>::defer_free_seg(void* arg, struct segment* seg) {
 }
 
 template <typename IO>
-void UDepot<IO>::seg_md_callback(u64 grain_start, u64 /*grain_nr*/) {
-    uint64_t ts = get_seg_alloc_nr();
+void UDepot<IO>::seg_md_callback(u64 grain_start, u64 /*grain_nr*/,
+                                 u64 alloc_nr) {
+    // The count this segment was given, not get_seg_alloc_nr(): two streams
+    // can stage segments at once, and reading the counter after both had
+    // bumped it gave them the same timestamp (PR #3 review, finding 10).
+    // Recovery and newer_than() order segments by timestamp.
+    if (auto hook = seg_md_enter_test_hook.load(std::memory_order_relaxed))
+        hook();
+    uint64_t ts = alloc_nr;
+    if (auto hook = seg_md_test_hook.load(std::memory_order_relaxed))
+        hook(ts);
     uint64_t seg_idx = scm_->grain_to_seg_idx(grain_start);
     if (seg_idx >= num_segments_) return;
     seg_timestamps_[seg_idx].store(ts, std::memory_order_release);

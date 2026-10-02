@@ -8,6 +8,7 @@
 #include "udepot/io/aio.h"
 #include "udepot/io/posix.h"
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <deque>
@@ -749,4 +750,58 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
     // Tombstones must still be reclaimed, or they would take space forever.
     EXPECT_GT(drops.load(), 0);
     EXPECT_EQ(unsafe.load(), 0) << "of " << drops.load() << " dropped";
+}
+
+// Regression (PR #3 review, finding 10): a segment's timestamp was read
+// from the allocation counter after the increment, so when the user and
+// the relocation stream staged segments at once, both could read the same
+// value. Recovery orders a key's records by segment timestamp; with a tie
+// it cannot tell which is newer. The test widens the window; this workload
+// (puts and deletes under GC, so both streams stage segments) then gave
+// duplicates in every run.
+TEST_F(StoreGcTest, SegmentTimestampsAreUnique) {
+    static std::mutex mu;
+    static std::vector<uint64_t> stamps;
+    stamps.clear();
+    UDepot<PosixIO>::seg_md_test_hook = [](uint64_t ts) {
+        std::lock_guard<std::mutex> lock(mu);
+        stamps.push_back(ts);
+    };
+    // Widen the window between the counter's increment and the stamp, so
+    // the two streams' stagings overlap.
+    UDepot<PosixIO>::seg_md_enter_test_hook = [] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    };
+    struct ResetHook {
+        ~ResetHook() {
+            UDepot<PosixIO>::seg_md_test_hook = nullptr;
+            UDepot<PosixIO>::seg_md_enter_test_hook = nullptr;
+        }
+    } reset_hook;
+
+    ASSERT_EQ(store_.open(config_), 0);
+    std::mt19937 rng(2);
+    const std::string val(2500, 'v');
+    constexpr int kKeys = 4000;
+    for (int i = 0; i < 60000; ++i) {
+        std::string key = "k" + std::to_string(rng() % kKeys);
+        if (rng() % 100 < 50) {
+            int rc = store_.del(key).run_sync();
+            ASSERT_TRUE(rc == 0 || rc == -ENOENT) << rc;
+        } else {
+            ASSERT_EQ(store_.put(key, val).run_sync(), 0);
+        }
+    }
+    store_.close();
+    UDepot<PosixIO>::seg_md_test_hook = nullptr;
+    UDepot<PosixIO>::seg_md_enter_test_hook = nullptr;
+
+    std::lock_guard<std::mutex> lock(mu);
+    std::vector<uint64_t> sorted = stamps;
+    std::sort(sorted.begin(), sorted.end());
+    int dups = 0;
+    for (size_t i = 1; i < sorted.size(); ++i)
+        if (sorted[i] == sorted[i - 1]) ++dups;
+    EXPECT_GT(sorted.size(), 64u);
+    EXPECT_EQ(dups, 0) << "of " << sorted.size() << " segments";
 }
