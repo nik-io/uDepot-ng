@@ -50,6 +50,21 @@ static_assert(sizeof(KvSuffix) == 2);
 
 inline constexpr size_t kKvOverhead = sizeof(KvHeader) + sizeof(KvSuffix);
 
+// A tombstone is a record whose val_size is kTombstoneValSize and that holds
+// no value bytes. Values may be empty (the uDepot paper, section 4: "no
+// minimum size"), so val_size 0 cannot mark a delete; the largest u32 can,
+// since no value that long can be stored (check_sizes).
+inline constexpr uint32_t kTombstoneValSize = UINT32_MAX;
+
+inline bool is_tombstone(const KvHeader& hdr) noexcept {
+    return hdr.val_size == kTombstoneValSize;
+}
+
+// Value bytes the record actually holds.
+inline size_t record_val_bytes(const KvHeader& hdr) noexcept {
+    return is_tombstone(hdr) ? 0 : hdr.val_size;
+}
+
 struct StoreConfig {
     const char* path = nullptr;
     size_t size = 0;
@@ -213,6 +228,13 @@ public:
         return CityHash64(reinterpret_cast<const char*>(key.data()),
                           key.size());
     }
+
+    // Test seam, never set in production: GC calls it after writing a
+    // relocated copy and before repointing the key's directory entry, with
+    // the key's stripes held. Tests use it to widen the window a racing put
+    // or del would fall into.
+    inline static void (*gc_relocation_test_hook)(
+        std::span<const uint8_t> key) = nullptr;
 
     Directory& directory() { return *directory_; }
     const Directory& directory() const { return *directory_; }

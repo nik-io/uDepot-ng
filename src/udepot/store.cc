@@ -328,7 +328,8 @@ int UDepot<IO>::crash_recovery() {
                 continue;
             }
 
-            uint64_t entry_grains = kv_total_grains(hdr.key_size, hdr.val_size);
+            const size_t val_bytes = record_val_bytes(hdr);
+            uint64_t entry_grains = kv_total_grains(hdr.key_size, val_bytes);
             if (entry_grains == 0 || entry_grains > HashEntry::kKvSizeMask ||
                 grain + entry_grains > seg_base + data_grains) {
                 skip(1);
@@ -337,7 +338,7 @@ int UDepot<IO>::crash_recovery() {
 
             KvSuffix suffix;
             std::memcpy(&suffix,
-                        ep + sizeof(KvHeader) + hdr.key_size + hdr.val_size,
+                        ep + sizeof(KvHeader) + hdr.key_size + val_bytes,
                         sizeof(suffix));
             if (suffix.crc16 != compute_crc16(hdr)) {
                 skip(1);
@@ -347,7 +348,7 @@ int UDepot<IO>::crash_recovery() {
             std::span<const uint8_t> key(ep + sizeof(KvHeader), hdr.key_size);
             int rc = recover_record(hash_key(key), key, grain,
                                     static_cast<uint16_t>(entry_grains),
-                                    hdr.val_size == 0);
+                                    is_tombstone(hdr));
             if (rc != 0) return rc;
             grain += entry_grains;
         }
@@ -665,69 +666,78 @@ int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
     KvHeader hdr;
     std::memcpy(&hdr, rec, sizeof(hdr));
     std::span<const uint8_t> key(rec + sizeof(KvHeader), hdr.key_size);
-    uint64_t hash = hash_key(key);
-    bool tombstone = hdr.val_size == 0;
+    const uint64_t hash = hash_key(key);
+    const size_t bytes = static_cast<size_t>(entry_grains) * grain_size_;
 
-    // Only records the directory still points at matter; anything else in
-    // the segment was overwritten, deleted or never committed.
-    HashEntry entry;
-    {
-        Rcu::ReadGuard guard(rcu_);
-        entry = directory_->entry_at(hash, grain);
-    }
-    if (entry.empty()) return 0;
+    // As uDepot's local_gc_callback: the key's stripes stay locked across
+    // the whole relocation (check, copy, repoint), so no put or del of the
+    // key can commit in between and leave the copy -- newer in recovery
+    // order -- to win after a crash. Holding the lock across I/O is safe
+    // only because the copy goes out with pwrite_sync, which needs no
+    // poller: a writer queued on these stripes on a poller thread cannot
+    // hold up the write it is waiting for.
+    return with_table_blocking(hash, [&](HashTable& table) -> int {
+        // Only records the directory still points at matter; anything else
+        // in the segment was overwritten, deleted or never committed.
+        const HashEntry entry = table.entry_at(hash, grain);
+        if (entry.empty()) return 0;
 
-    if (tombstone && drop_tombstones) {
-        // As uDepot purged deleted entries at GC; only when no older
-        // segment remains, since an older copy of the key would otherwise
-        // come back after a crash.
-        bool purged = with_table_blocking(hash, [&](HashTable& table) {
-            return table.remove_locked(hash, grain);
-        });
-        if (purged) invalidate_grains(grain, entry_grains, true);
-        return 0;
-    }
+        if (entry.deleted() && drop_tombstones) {
+            // As uDepot purged deleted entries at GC; only when no older
+            // segment remains, since an older copy of the key would
+            // otherwise come back after a crash.
+            table.remove_locked(hash, grain);
+            invalidate_grains(grain, entry_grains, true);
+            return 0;
+        }
 
-    // Relocate (uDepot's local_gc_callback): copy to the relocation stream
-    // with the new segment's timestamp, then repoint the entry if it still
-    // refers to this copy.
-    u64 dst = 0;
-    int rc = salsa::SalsaCtlr::allocate_grains(entry_grains, &dst, 0, true);
-    if (rc != 0) return rc;
+        // Relocate: copy to the relocation stream with the new segment's
+        // timestamp, then repoint the entry.
+        u64 dst = 0;
+        int rc = salsa::SalsaCtlr::allocate_grains(entry_grains, &dst, 0, true);
+        if (rc != 0) return rc;
+        auto drop_dst = [&] {
+            invalidate_grains(dst, entry_grains, true);
+            release_grains(dst, entry_grains, true);
+        };
+        // As for user writes (try_allocate_grains): crash recovery would
+        // not find a segment whose metadata write failed.
+        if (!seg_md_ok_[scm_->grain_to_seg_idx(dst)].load(
+                std::memory_order_acquire)) {
+            drop_dst();
+            return EIO;
+        }
 
-    size_t bytes = static_cast<size_t>(entry_grains) * grain_size_;
-    IoBuffer buf = io_.alloc_buffer(bytes);
-    if (!buf.data) {
-        invalidate_grains(dst, entry_grains, true);
+        IoBuffer buf = io_.alloc_buffer(bytes);
+        if (!buf.data) {
+            drop_dst();
+            return ENOMEM;
+        }
+        std::memcpy(buf.data, rec, bytes);
+        KvHeader moved_hdr = hdr;
+        moved_hdr.timestamp = seg_timestamps_[scm_->grain_to_seg_idx(dst)].load(
+            std::memory_order_acquire);
+        std::memcpy(buf.data, &moved_hdr, sizeof(moved_hdr));
+        KvSuffix suffix;
+        suffix.crc16 = compute_crc16(moved_hdr);
+        std::memcpy(static_cast<uint8_t*>(buf.data) + sizeof(KvHeader) +
+                        hdr.key_size + record_val_bytes(hdr),
+                    &suffix, sizeof(suffix));
+
+        if (io_.pwrite_sync(buf.data, bytes, grain_to_offset(dst)) !=
+            static_cast<ssize_t>(bytes)) {
+            drop_dst();
+            return EIO;
+        }
+
+        if (gc_relocation_test_hook) gc_relocation_test_hook(key);
+        bool moved = table.update_locked(hash, grain, entry.kv_size(), dst);
+        assert(moved);  // the stripes have been held since entry_at
+        (void)moved;
         release_grains(dst, entry_grains, true);
-        return ENOMEM;
-    }
-    std::memcpy(buf.data, rec, bytes);
-    hdr.timestamp = seg_timestamps_[scm_->grain_to_seg_idx(dst)].load(
-        std::memory_order_acquire);
-    std::memcpy(buf.data, &hdr, sizeof(hdr));
-    KvSuffix suffix;
-    suffix.crc16 = compute_crc16(hdr);
-    std::memcpy(static_cast<uint8_t*>(buf.data) + sizeof(KvHeader) +
-                    hdr.key_size + hdr.val_size,
-                &suffix, sizeof(suffix));
-
-    ssize_t w = io_.pwrite(buf.data, bytes, grain_to_offset(dst)).run_sync();
-    if (w != static_cast<ssize_t>(bytes)) {
-        invalidate_grains(dst, entry_grains, true);
-        release_grains(dst, entry_grains, true);
-        return EIO;
-    }
-
-    bool moved = with_table_blocking(hash, [&](HashTable& table) {
-        return table.update_locked(hash, grain, entry.kv_size(), dst);
-    });
-    release_grains(dst, entry_grains, true);
-    if (moved)
         invalidate_grains(grain, entry_grains, true);
-    else
-        invalidate_grains(dst, entry_grains, true);
-    return 0;
+        return 0;
+    });
 }
 
 // GC callback — called from salsa's GC thread when it reclaims a segment.
@@ -760,7 +770,8 @@ int UDepot<IO>::gc_callback(u64 grain_start, u64 grain_nr) {
         const uint8_t* rec = seg + (grain - grain_start) * grain_size_;
         KvHeader hdr;
         std::memcpy(&hdr, rec, sizeof(hdr));
-        uint64_t entry_grains = kv_total_grains(hdr.key_size, hdr.val_size);
+        const size_t val_bytes = record_val_bytes(hdr);
+        uint64_t entry_grains = kv_total_grains(hdr.key_size, val_bytes);
         // Grains not holding a record of this segment's life (never
         // written, or left over from its previous use) are skipped.
         if (hdr.key_size == 0 || hdr.timestamp != victim_ts ||
@@ -772,7 +783,7 @@ int UDepot<IO>::gc_callback(u64 grain_start, u64 grain_nr) {
 
         KvSuffix suffix;
         std::memcpy(&suffix,
-                    rec + sizeof(KvHeader) + hdr.key_size + hdr.val_size,
+                    rec + sizeof(KvHeader) + hdr.key_size + val_bytes,
                     sizeof(suffix));
         if (suffix.crc16 != compute_crc16(hdr)) {
             ++grain;
@@ -903,7 +914,7 @@ int UDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
 template <typename IO>
 int UDepot<IO>::check_sizes(size_t key_size, size_t val_size) const {
     if (key_size == 0 || key_size > UINT16_MAX) return -EINVAL;
-    if (val_size > UINT32_MAX) return -EINVAL;
+    if (val_size >= kTombstoneValSize) return -EINVAL;  // reserved
     if (kv_total_grains(key_size, val_size) > HashEntry::kKvSizeMask)
         return -EINVAL;
     return 0;
@@ -1183,7 +1194,7 @@ CoroTask<int> UDepot<IO>::write_tombstone(
     auto* tp = static_cast<uint8_t*>(tomb_buf.data);
     KvHeader tomb_hdr;
     tomb_hdr.key_size = static_cast<uint16_t>(key.size());
-    tomb_hdr.val_size = 0;
+    tomb_hdr.val_size = kTombstoneValSize;  // holds no value bytes
     tomb_hdr.timestamp =
         seg_timestamps_[scm_->grain_to_seg_idx(tomb_grain)].load(
             std::memory_order_acquire);

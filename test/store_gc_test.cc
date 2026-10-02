@@ -9,6 +9,10 @@
 #include "udepot/io/posix.h"
 
 #include <atomic>
+#include <mutex>
+#include <deque>
+#include <condition_variable>
+#include <chrono>
 #include <cerrno>
 #include <cstdint>
 #include <filesystem>
@@ -383,4 +387,164 @@ TEST_F(StoreGcTest, RecoveryDoesNotDuplicateKeysSharingATag) {
     EXPECT_EQ(get_or_empty(store_, b), "b-new");
     ASSERT_EQ(store_.del(b).run_sync(), 0);
     EXPECT_EQ(get_or_empty(store_, b), "") << "stale duplicate survived del";
+}
+
+// Values may be empty (paper, section 4: "no minimum size"); a record with
+// an empty value is not a tombstone. Recovery and GC used to treat
+// val_size 0 as one: an empty value vanished on reopen, and GC could purge
+// its live entry.
+TEST_F(StoreGcTest, EmptyValuesAreNotTombstones) {
+    ASSERT_EQ(store_.open(config_), 0);
+    constexpr int kKeys = 50;
+    auto check = [&] {
+        for (int k = 0; k < kKeys; ++k) {
+            uint8_t buf[8];
+            size_t n = 99;
+            ASSERT_EQ(store_.get("empty" + std::to_string(k), buf, sizeof(buf),
+                                 &n).run_sync(), 0) << k;
+            EXPECT_EQ(n, 0u) << k;
+        }
+    };
+    for (int k = 0; k < kKeys; ++k)
+        ASSERT_EQ(store_.put("empty" + std::to_string(k), "").run_sync(), 0);
+    check();
+
+    // Rewrite the device several times so GC passes over every segment,
+    // with tombstone dropping allowed.
+    constexpr size_t kVal = 3000;
+    const int rounds = static_cast<int>(6 * kStoreSize / (50 * kVal));
+    for (int r = 0; r < rounds; ++r)
+        for (int c = 0; c < 50; ++c)
+            ASSERT_EQ(store_.put("churn" + std::to_string(c),
+                                 value_for(c, r, kVal)).run_sync(), 0);
+    check();
+    reopen();
+    check();
+}
+
+TEST_F(StoreGcTest, TombstoneValueSizeIsReserved) {
+    ASSERT_EQ(store_.open(config_), 0);
+    EXPECT_FALSE(store_.alloc_put_buffer(4, udepot::kTombstoneValSize).valid());
+    EXPECT_TRUE(store_.alloc_put_buffer(4, 0).valid());
+}
+
+// GC relocating a record while a put of the same key commits: the
+// relocated copy can be newer in recovery order than the acknowledged put
+// (when GC's relocation segment was opened after the put's), so if the
+// copy is left on the device the log scan after a crash brings back the
+// older value. GC now holds the key's stripes across the whole relocation,
+// as uDepot does, so the put waits and commits after it.
+//
+// The test seam races every relocation: GC hands the key being moved to a
+// racer thread, which overwrites it while the relocation is in flight.
+TEST_F(StoreGcTest, GcRelocationRacingPutRecoversAsAcknowledged) {
+    ASSERT_EQ(store_.open(config_), 0);
+    // ~18 MiB long-lived plus ~3 MiB hot, of ~25 MiB usable: GC cannot
+    // get by on fully dead segments and has to move live records.
+    constexpr int kKeys = 9000;
+    // Enough hot keys that segments do not die whole: GC has to pick
+    // partly live ones and relocate.
+    constexpr int kHot = 1500;
+    constexpr size_t kVal = 2000;
+    constexpr int kChurn = 40000;
+    constexpr int kRaces = 500;
+
+    static std::mutex mu;
+    static std::condition_variable cv;
+    static std::deque<std::string> to_race;
+    static std::atomic<int> raced{0};
+    to_race.clear();
+    raced = 0;
+    static std::atomic<int> hooked{0};
+    hooked = 0;
+    UDepot<PosixIO>::gc_relocation_test_hook = [](std::span<const uint8_t> k) {
+        hooked.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            to_race.emplace_back(reinterpret_cast<const char*>(k.data()),
+                                 k.size());
+        }
+        cv.notify_one();
+        // Give the racer time to land its put inside the window. Never
+        // wait for it: with the fix, that put waits for this relocation.
+        std::this_thread::sleep_for(std::chrono::microseconds(300));
+    };
+    struct ResetHook {
+        ~ResetHook() { UDepot<PosixIO>::gc_relocation_test_hook = nullptr; }
+    } reset_hook;
+
+    // Interleaved, so every segment mixes long-lived records with ones
+    // about to die: GC victims then hold live data to move.
+    std::map<std::string, std::string> expect;
+    for (int k = 0; k < kKeys; ++k) {
+        std::string key = "g" + std::to_string(k);
+        ASSERT_EQ(store_.put(key, value_for(k, 0, kVal)).run_sync(), 0);
+        expect[key] = value_for(k, 0, kVal);
+        ASSERT_EQ(store_.put("h" + std::to_string(k % kHot),
+                             value_for(k, 0, kVal)).run_sync(), 0);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        to_race.clear();  // relocations from the fill phase: not raced
+    }
+    // Racer: overwrites each key GC is relocating. It is the only writer of
+    // the long-lived keys from here on, so `expect` stays exact.
+    std::atomic<bool> stop{false};
+    std::atomic<int> errors{0};
+    std::thread racer([&] {
+        int n = 0;
+        for (;;) {
+            std::string key;
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                cv.wait_for(lock, std::chrono::milliseconds(5), [] {
+                    return !to_race.empty();
+                });
+                if (to_race.empty()) {
+                    if (stop) return;
+                    continue;
+                }
+                key = std::move(to_race.front());
+                to_race.pop_front();
+            }
+            if (key[0] != 'g') continue;  // hot keys need no tracking
+            std::string val = value_for(++n, 1, kVal);
+            if (store_.put(key, val).run_sync() == 0) {
+                expect[key] = val;
+                raced.fetch_add(1);
+            } else {
+                errors.fetch_add(1);
+            }
+        }
+    });
+    // Churn the hot keys so GC keeps reclaiming the mixed segments, until
+    // enough relocations have been raced. Stopping early matters: GC only
+    // runs under allocation pressure, so once the churn stops it leaves
+    // the device alone, and a stale relocated copy is still there for the
+    // snapshot to catch rather than reclaimed first.
+    for (int i = 0; i < kChurn && raced.load() < kRaces; ++i)
+        ASSERT_EQ(store_.put("h" + std::to_string(i % kHot),
+                             value_for(i, 2, kVal)).run_sync(), 0);
+    stop = true;
+    racer.join();
+    UDepot<PosixIO>::gc_relocation_test_hook = nullptr;
+    ASSERT_EQ(errors.load(), 0);
+    ASSERT_GT(raced.load(), 0) << "no relocation was raced; hooked="
+                               << hooked.load();
+
+    // "Crash": the log scan must reproduce exactly what was acknowledged.
+    std::filesystem::copy_file(path_, snapshot_path(),
+                               std::filesystem::copy_options::overwrite_existing);
+    UDepot<PosixIO> recovered;
+    StoreConfig cfg = config_;
+    std::string snap = snapshot_path().string();
+    cfg.path = snap.c_str();
+    cfg.force_destroy = false;
+    ASSERT_EQ(recovered.open(cfg), 0);
+    int wrong = 0;
+    for (const auto& [key, val] : expect)
+        if (get_or_empty(recovered, key) != val) ++wrong;
+    recovered.close();
+    EXPECT_EQ(wrong, 0) << "of " << raced.load() << " raced relocations";
 }
