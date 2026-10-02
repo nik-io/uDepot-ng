@@ -472,14 +472,60 @@ future) is planned as a follow-up once the async backends are working.
 
 The intent is uDepot's format (segment layout, directory table layout, salsa
 metadata; see `docs/udepot-paper.md`, §4.4), so a uDepot-ng store and a uDepot
-store can read each other. **Two known divergences remain:**
+store can read each other. **Known divergences:**
 
 - The KV record header carries an 8-byte timestamp (`KvHeader`). uDepot's
   header is 6 bytes (key size, value size); it orders a record by its
   segment's timestamp, which the record's checksum is bound to.
-- Index segments: uDepot flushes the directory's tables at shutdown and
-  restores them on a clean start. uDepot-ng is adding this; until then every
-  open rebuilds the index from the log.
+- Index segment headers and footers extend uDepot's `dirmap_hdr` /
+  `dirmap_ftr` (below) with the table's size and its part number. uDepot
+  sized every table to fill its segment, so it needed neither.
+
+### Device geometry
+
+As uDepot: the device is divided into segments of `segment_size` grains; the
+last grain(s) of every segment hold salsa's per-segment metadata, and the
+device metadata lives in the tail past the last whole segment. There must be
+such a tail (uDepot's `check_dev_size`): a fresh store whose size is an exact
+multiple of the segment size gets the smaller segment size that leaves one
+and wastes least, and a restored store without one fails to open. Without
+the check, the device metadata sat inside the last segment, so filling the
+device overwrote it and the next open started an empty store.
+
+### Index segments (paper §4.4)
+
+`close()` flushes the directory to index segments, and an open after a clean
+shutdown restores it instead of scanning the log. After a crash the log scan
+decides, as the paper says: *"the persistent source of truth is the log"*.
+
+- **Allocation.** As uDepot's `uDepotDirectoryMap`, the index has a salsa
+  controller of its own (`IndexCtlr`). A net-segment allocation fills exactly
+  one segment, and its segment metadata carry the index controller's type,
+  so the log scan skips index segments. uDepot keeps its tables mmap'd on
+  index segments for the store's whole life; uDepot-ng's tables live in
+  memory (SPDK has no mmap) and are written with explicit writes at
+  `close()`, while GC still runs to free the segments they need. If they
+  cannot be written, the next open scans the log.
+- **Layout**, one table (or one part of a table larger than a segment) per
+  index segment, as uDepot lays out a directory segment:
+  `[IndexHdr 512 B | slots, 8 B each | ... | IndexFtr 512 B]`, the footer at
+  the end of the net segment. Slots are `HashEntry`'s raw 64 bits, which use
+  uDepot's bitfield layout.
+- **Ordering.** Every table is written before any footer, and a footer
+  carries a checksum bound to the device seed and the flush's timestamp,
+  which is newer than any index seen on the device. An index is complete
+  when, for its timestamp, every (table, part) has a valid footer; only the
+  newest index is considered.
+- **Restore.** Load the tables; rebuild salsa's per-segment valid counts from
+  the entries, as uDepot's `restore()` does: a live entry holds `kv_size`
+  grains, a deleted one its tombstone's, read from the tombstone's header.
+  Index segments are not restored, so salsa sees them as free.
+- **Invalidation.** Every valid footer found at open is cleared before
+  anything is written, restored or not, as uDepot's `invalidate_ftr()`:
+  otherwise a crash later in the session could restore an index older than
+  the log.
+- Not yet: the paper also flushes periodically, to shorten recovery after a
+  crash.
 
 ## Implementation Order
 

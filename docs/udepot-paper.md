@@ -126,7 +126,9 @@ Quotes below are from the paper; section numbers are the paper's.
 - Legacy implements this with tables mmap'd onto index segments, footers written
   and `msync`ed at shutdown, `restore()` first, `crash_recovery()` as fallback,
   and footers invalidated right after a successful restore. uDepot-ng flushes
-  with explicit writes instead of mmap (SPDK has no mmap), in legacy's layout.
+  with explicit writes at `close()` instead of mmap (SPDK has no mmap), in
+  legacy's layout. Status: implemented (`docs/architecture.md`, "Index
+  segments"), except the periodic flush.
 
 ## KV operations (§4.5)
 

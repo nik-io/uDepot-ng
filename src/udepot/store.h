@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <coroutine>
 #include <cstddef>
@@ -233,14 +234,21 @@ public:
     // relocated copy and before repointing the key's directory entry, with
     // the key's stripes held. Tests use it to widen the window a racing put
     // or del would fall into.
-    inline static void (*gc_relocation_test_hook)(
-        std::span<const uint8_t> key) = nullptr;
+    // The hooks are atomic: tests set and clear them while the store's
+    // threads may be reading them.
+    using KeyHook = void (*)(std::span<const uint8_t> key);
+    inline static std::atomic<KeyHook> gc_relocation_test_hook{nullptr};
 
     // Test seam, never set in production: a get calls it after looking up
     // a record and before reading it, inside its read-side section. Tests
     // use it to let writers recycle the record's segment meanwhile.
-    inline static void (*get_read_test_hook)(
-        std::span<const uint8_t> key) = nullptr;
+    inline static std::atomic<KeyHook> get_read_test_hook{nullptr};
+
+    // Test seam, never set in production: close() calls it before writing
+    // each index footer; returning false stops the flush there, as a crash
+    // would.
+    using FooterHook = bool (*)();
+    inline static std::atomic<FooterHook> index_footer_test_hook{nullptr};
 
     Directory& directory() { return *directory_; }
     const Directory& directory() const { return *directory_; }
@@ -320,9 +328,53 @@ private:
     int persist_dev_md();
     bool validate_dev_md(salsa::salsa_dev_md* md_out);
 
-    // Segment metadata: written at the tail of each segment.
-    int persist_seg_md(uint64_t grain_start, uint64_t timestamp);
+    // Segment metadata: written at the tail of each segment. ctlr_type is
+    // the owning controller's id: KV segments are ours, index segments
+    // index_ctlr_'s.
+    int persist_seg_md(uint64_t grain_start, uint64_t timestamp,
+                       uint8_t ctlr_type);
     bool validate_seg_md(const salsa::salsa_seg_md& md) const;
+    // Reads and validates the metadata of the segment starting at seg_base.
+    bool read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md);
+
+    // ── Index segments (paper §4.4) ─────────────────────────────────────
+    // close() flushes the hash tables to index segments, and an open after
+    // a clean shutdown restores them instead of scanning the log; the log
+    // stays the source of truth after a crash. As uDepot's
+    // uDepotDirectoryMap, the index has a salsa controller of its own: a
+    // net-segment allocation fills exactly one segment, and its segments'
+    // metadata carry its type, so the log scan skips them.
+    class IndexCtlr final : public salsa::SalsaCtlr {
+    public:
+        explicit IndexCtlr(UDepot* store) : store_(store) {}
+
+    private:
+        // Never holds anything GC could move (uDepot: "this should not
+        // happen").
+        int gc_callback(u64, u64) override { return ENOSYS; }
+        void seg_md_callback(u64 grain_start, u64) override {
+            store_->index_seg_md_callback(grain_start);
+        }
+        UDepot* store_;
+    };
+    std::unique_ptr<IndexCtlr> index_ctlr_;
+    // Newest index timestamp seen on the device; the next flush is newer.
+    uint64_t index_ts_ = 0;
+    void index_seg_md_callback(uint64_t md_grain);
+    // Write every table to index segments, footers last. Returns 0 or
+    // -errno; on failure no complete index is left, and the next open
+    // scans the log.
+    int flush_index();
+    int allocate_index_segment(uint64_t net_grains, u64* grain);
+    // Restore the newest complete index, if there is one (*restored), and
+    // invalidate every valid index footer on the device either way, so a
+    // later crash cannot bring back an index older than the log. Returns
+    // -errno only if that invalidation failed.
+    int restore_index(bool* restored);
+    CoroTask<int> tombstone_grains(uint64_t pba, uint64_t seg_ts,
+                                   uint64_t* grains);
+    template <typename T>
+    uint32_t index_md_csum(const T& md) const;
 
     // Read `grains` grains from `grain` into buf (reallocated if too
     // small). Returns 0 or -errno.

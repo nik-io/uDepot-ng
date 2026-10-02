@@ -101,6 +101,12 @@ public:
         return HashEntry::load(slots_[idx], std::memory_order_relaxed);
     }
 
+    // Set a slot's raw entry, when restoring a persisted table. Nothing
+    // may read or write the table meanwhile.
+    void restore_slot(uint64_t idx, uint64_t raw) noexcept {
+        slots_[idx].store(raw, std::memory_order_relaxed);
+    }
+
     uint64_t total_slots() const noexcept {
         return num_buckets_ + HashEntry::kHopRange;
     }

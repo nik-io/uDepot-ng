@@ -131,6 +131,12 @@ public:
     uint32_t num_tables() const noexcept;
     uint32_t index_bits() const noexcept;
 
+    // The current snapshot, for callers no grow or write can race:
+    // persisting the index at close() and restoring it at open().
+    DirSnapshot& snapshot() noexcept {
+        return *current_.load(std::memory_order_acquire);
+    }
+
 private:
     Rcu& rcu_;
     uint32_t index_bits_;
