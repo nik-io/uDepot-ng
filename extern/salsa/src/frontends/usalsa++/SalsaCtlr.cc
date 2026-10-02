@@ -111,6 +111,10 @@ SalsaCtlr::init(Scm *const scm, const u64 reserved_per_seg,
 		goto fail0;
 	}
 	cb_scm_ = scm;
+	/* A controller may be init'ed again after shutdown() (uDepot-ng reopens
+	 * the same store object): start the allocation count afresh, as a new
+	 * controller would, so recovery's restore_seg_alloc_nr() sets it. */
+	seg_alloc_nr_ = 0;
 
 	cb_prop_set_ = pset;
 	stream_nr_ = std::max(std::min(stream_nr, USALSAPP_MAX_STREAMS), 1U);

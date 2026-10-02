@@ -302,9 +302,11 @@ int UDepot<IO>::crash_recovery() {
         if (ts > max_timestamp)
             max_timestamp = ts;
 
-        // Mark the entire segment as in use; grains that hold no valid
+        // Mark the segment's data grains in use, as uDepot's crash_recovery
+        // does (the net size: the metadata grains at the tail hold no
+        // records and must not count as valid); grains that hold no valid
         // record are invalidated as the walk passes them.
-        scm_->restore_grain_range(seg_base, seg_size, get_ctlr_id());
+        scm_->restore_grain_range(seg_base, data_grains, get_ctlr_id());
 
         // As uDepot (which maps the segment): one read of the net segment,
         // then walk it in memory.
