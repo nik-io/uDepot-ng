@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "udepot/store.h"
+#include "udepot/io/aio.h"
 #include "udepot/io/posix.h"
+#ifdef UDEPOT_BUILD_URING
+#include "udepot/io/uring.h"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -15,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+using udepot::AioIO;
 using udepot::PosixIO;
 using udepot::StoreConfig;
 using udepot::UDepot;
@@ -29,6 +34,12 @@ struct BenchConfig {
     size_t store_size = 1077936129;
     const char* file = "/dev/shm/udepot-ng-bench.store";
     int threads = 1;
+    std::string backend = "posix";
+    // Values through the zero-copy interface (alloc_put_buffer + put, get
+    // into a GetBuffer) instead of the copying one. The workload is
+    // otherwise identical: the only difference is the value copies the
+    // zero-copy path avoids.
+    bool zero_copy = false;
 };
 
 static double now_secs() {
@@ -44,7 +55,8 @@ struct ThreadResult {
     int errors = 0;
 };
 
-static ThreadResult run_thread(UDepot<PosixIO>& store,
+template <typename IO>
+static ThreadResult run_thread(UDepot<IO>& store,
                                const BenchConfig& cfg,
                                int thread_id) {
     ThreadResult result;
@@ -61,11 +73,20 @@ static ThreadResult run_thread(UDepot<PosixIO>& store,
         uint64_t key_size = 8 + (key % 24);
 
         std::memcpy(keyb, &key, sizeof(key));
-        std::memcpy(val.data(), &valu, sizeof(valu));
 
-        int rc = store.put(
-            std::span<const uint8_t>(keyb, key_size),
-            std::span<const uint8_t>(val.data(), cfg.val_size)).run_sync();
+        int rc;
+        if (cfg.zero_copy) {
+            // The value is produced straight into the record buffer.
+            auto pb = store.alloc_put_buffer(key_size, cfg.val_size);
+            std::memcpy(pb.value().data(), &valu, sizeof(valu));
+            rc = store.put(std::span<const uint8_t>(keyb, key_size), pb)
+                     .run_sync();
+        } else {
+            std::memcpy(val.data(), &valu, sizeof(valu));
+            rc = store.put(
+                std::span<const uint8_t>(keyb, key_size),
+                std::span<const uint8_t>(val.data(), cfg.val_size)).run_sync();
+        }
         if (rc != 0) {
             fprintf(stderr, "put failed: thread=%d i=%lu rc=%d\n",
                     thread_id, static_cast<unsigned long>(i), rc);
@@ -77,6 +98,7 @@ static ThreadResult run_thread(UDepot<PosixIO>& store,
 
     // GET
     std::vector<uint8_t> val_out(cfg.val_size);
+    udepot::GetBuffer gb;
     t0 = now_secs();
     for (uint64_t i = 0; i < cfg.ops; ++i) {
         uint64_t key = (thread_seed + i) * kPrime;
@@ -86,9 +108,17 @@ static ThreadResult run_thread(UDepot<PosixIO>& store,
         std::memcpy(keyb, &key, sizeof(key));
 
         size_t val_size_read = 0;
-        int rc = store.get(
-            std::span<const uint8_t>(keyb, key_size),
-            val_out.data(), val_out.size(), &val_size_read).run_sync();
+        const uint8_t* got = val_out.data();
+        int rc;
+        if (cfg.zero_copy) {
+            rc = store.get(std::span<const uint8_t>(keyb, key_size), &gb)
+                     .run_sync();
+            got = gb.value().data();
+        } else {
+            rc = store.get(
+                std::span<const uint8_t>(keyb, key_size),
+                val_out.data(), val_out.size(), &val_size_read).run_sync();
+        }
         if (rc != 0) {
             fprintf(stderr, "get failed: thread=%d i=%lu rc=%d\n",
                     thread_id, static_cast<unsigned long>(i), rc);
@@ -98,7 +128,7 @@ static ThreadResult run_thread(UDepot<PosixIO>& store,
 
         if (cfg.val_size >= sizeof(uint64_t)) {
             uint64_t val_ret;
-            std::memcpy(&val_ret, val_out.data(), sizeof(val_ret));
+            std::memcpy(&val_ret, got, sizeof(val_ret));
             if (val_ret != valu) {
                 fprintf(stderr, "value mismatch: thread=%d i=%lu\n",
                         thread_id, static_cast<unsigned long>(i));
@@ -151,6 +181,7 @@ static ThreadResult run_thread(UDepot<PosixIO>& store,
     return result;
 }
 
+template <typename IO>
 static int run_bench(const BenchConfig& cfg) {
     StoreConfig sc;
     sc.path = cfg.file;
@@ -159,7 +190,7 @@ static int run_bench(const BenchConfig& cfg) {
     sc.initial_tables = 4;
     sc.index_bits = 14;
 
-    UDepot<PosixIO> store;
+    UDepot<IO> store;
     int rc = store.open(sc);
     if (rc != 0) {
         fprintf(stderr, "open failed: %d\n", rc);
@@ -226,7 +257,9 @@ static void usage() {
         "  --grain-size <bytes> Grain size (default: 512)\n"
         "  --val-size <bytes>   Value size (default: 1024)\n"
         "  --seed <n>     RNG seed (default: 42)\n"
-        "  --threads <n>  Number of concurrent threads (default: 1)\n");
+        "  --threads <n>  Number of concurrent threads (default: 1)\n"
+        "  --backend <b>  posix, aio or uring (default: posix)\n"
+        "  --zero-copy    Use the zero-copy put/get interface\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -248,6 +281,10 @@ int main(int argc, char* argv[]) {
             cfg.seed = std::stoull(argv[++i]);
         } else if (arg == "--threads" && i + 1 < argc) {
             cfg.threads = std::stoi(argv[++i]);
+        } else if (arg == "--backend" && i + 1 < argc) {
+            cfg.backend = argv[++i];
+        } else if (arg == "--zero-copy") {
+            cfg.zero_copy = true;
         } else if (arg == "-h" || arg == "--help") {
             usage();
             return 0;
@@ -259,7 +296,19 @@ int main(int argc, char* argv[]) {
     }
 
     std::filesystem::remove(cfg.file);
-    int rc = run_bench(cfg);
+    int rc;
+    if (cfg.backend == "posix") {
+        rc = run_bench<PosixIO>(cfg);
+    } else if (cfg.backend == "aio") {
+        rc = run_bench<AioIO>(cfg);
+#ifdef UDEPOT_BUILD_URING
+    } else if (cfg.backend == "uring") {
+        rc = run_bench<udepot::UringIO>(cfg);
+#endif
+    } else {
+        fprintf(stderr, "Unknown backend: %s\n", cfg.backend.c_str());
+        return 1;
+    }
     std::filesystem::remove(cfg.file);
     return rc;
 }

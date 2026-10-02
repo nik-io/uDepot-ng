@@ -112,6 +112,36 @@ ctest --test-dir build
 - SPDK tests require `UDEPOT_BUILD_SPDK=ON` and a configured SPDK environment
 - Non-SPDK tests must always pass
 
+### CI
+
+`.github/workflows/ci.yml` runs on every push to main and every PR:
+
+- **unit tests**, Debug and Release. Debug keeps asserts, salsa's included;
+  the first Debug run found two recovery bugs that every Release run had
+  compiled out. JNI and Python included. The job fails if a backend or
+  binding test was not built: a missing liburing silently disables io_uring
+  in CMake, which would otherwise pass with less coverage.
+- **ThreadSanitizer**, the same tests minus the bindings, failing on any
+  report.
+- **zero-copy perf invariant**, below.
+
+### Zero-copy perf invariant
+
+As in uDepot: `scripts/perf-zerocopy.sh <posix|aio|uring>` (or
+`cmake --build build --target run_perf_test` for all of them) runs
+`udepot_ng_bench` with the copying and the zero-copy put/get, interleaved,
+on a `/dev/shm` store. It fails if zero copy's median is more than 5%
+slower than copy's on PUT or GET. The two runs differ only in the value
+copies zero copy avoids. It compares one operation done two ways, inside
+one run, so there is no stored baseline to drift.
+
+Values are 32 KiB: at 1 KiB a copy is ~2% of a put, and a zero-copy path
+that copied twice still passed. Even at 32 KiB, one stray extra copy is
+about 5% of a put, at the edge of the tolerance: in a mutation test it
+failed the gate on io_uring and passed it on posix and AIO. The gate
+catches a zero-copy path that does clearly more work than the copying one,
+not every lost copy.
+
 ### Performance regression gate
 
 **uDepot-ng must be strictly equal to or faster than uDepot on every

@@ -278,6 +278,22 @@ if(UDEPOT_BUILD_TESTS)
     add_executable(udepot_ng_bench test/perf/udepot_ng_bench.cc)
     target_link_libraries(udepot_ng_bench PRIVATE udepot)
 
+    # Zero-copy invariant (scripts/perf-zerocopy.sh), as uDepot's
+    # `make run_perf_test`: on every backend, zero-copy put/get must not be
+    # slower than the copying interface. Meaningful in Release only.
+    set(_perf_backends posix aio)
+    if(UDEPOT_BUILD_URING)
+        list(APPEND _perf_backends uring)
+    endif()
+    set(_perf_cmds)
+    foreach(_b IN LISTS _perf_backends)
+        list(APPEND _perf_cmds COMMAND
+             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/perf-zerocopy.sh
+             ${_b} ${CMAKE_CURRENT_BINARY_DIR})
+    endforeach()
+    add_custom_target(run_perf_test ${_perf_cmds}
+        DEPENDS udepot_ng_bench USES_TERMINAL)
+
     # Legacy uDepot benchmark for the perf regression gate.
     # Requires UDEPOT_ROOT pointing to a built uDepot tree with libudepot.a.
     if(NOT DEFINED UDEPOT_ROOT)
