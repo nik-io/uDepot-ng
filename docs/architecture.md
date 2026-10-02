@@ -358,9 +358,18 @@ stream.
   read-side section.
 - **GC** reads the victim segment in one pass (uDepot maps it), relocates every
   record the directory still points at, and waits a grace period before the
-  segment is reused. A tombstone is dropped only when no live segment older
-  than the victim remains — otherwise an older copy of its key could
-  resurface on recovery — and is relocated like any record until then.
+  segment is reused.
+  - **A relocated record goes to a segment newer than its victim.** Recovery
+    orders a key's records by segment timestamp, and every older copy of the
+    key is older than the victim's. The relocation segment stays open while
+    the data stream moves on, so it can be older than the victim; GC then
+    closes it and takes a fresh, newest one. uDepot does not check this.
+  - **A tombstone is dropped only when no segment older than the victim may
+    still hold records on disk** — otherwise an older copy of its key could
+    resurface on recovery — and is relocated like any record until then. A
+    segment GC has reclaimed still counts until it is reused: its metadata
+    and old records stay on disk, and recovery replays them. uDepot drops
+    tombstones unconditionally.
 - **Recovery** reads each segment with valid metadata in one pass and replays
   its records; for each key the newest in recovery order (segment timestamp,
   then grain) wins, tombstones included. Grains holding no valid record are

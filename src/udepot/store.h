@@ -244,6 +244,21 @@ public:
     // use it to let writers recycle the record's segment meanwhile.
     inline static std::atomic<KeyHook> get_read_test_hook{nullptr};
 
+    // Test seam, never set in production: GC calls it for every record it
+    // relocates, with the timestamps of the victim segment and of the
+    // segment the copy went to.
+    using RelocationHook = void (*)(std::span<const uint8_t> key,
+                                    uint64_t victim_ts, uint64_t dst_ts);
+    inline static std::atomic<RelocationHook> gc_relocation_order_test_hook{
+        nullptr};
+
+    // Test seam, never set in production: GC calls it when it drops a
+    // deleted key's tombstone, with the timestamp of the victim segment.
+    using TombstoneDropHook = void (*)(std::span<const uint8_t> key,
+                                       uint64_t victim_ts);
+    inline static std::atomic<TombstoneDropHook> gc_tombstone_drop_test_hook{
+        nullptr};
+
     // Test seam, never set in production: close() calls it before writing
     // each index footer; returning false stops the flush there, as a crash
     // would.
@@ -274,8 +289,10 @@ private:
     // Whether the segment's metadata reached the device (written at
     // allocation, in seg_md_callback).
     std::unique_ptr<std::atomic<bool>[]> seg_md_ok_;
-    // Segments holding data: allocated (or restored) and not yet reclaimed
-    // by GC. GC uses it to tell whether a tombstone can still matter.
+    // Segments whose records crash recovery could replay: allocated (or
+    // restored) and not yet reused. A segment GC has reclaimed keeps its
+    // metadata and old records on disk until it is reused. GC uses it to
+    // tell whether a tombstone can still matter.
     std::unique_ptr<std::atomic<bool>[]> seg_live_;
 
     // Waiting for free space or for a directory grow. When salsa has no

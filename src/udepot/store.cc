@@ -1199,6 +1199,9 @@ int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
             // As uDepot purged deleted entries at GC; only when no older
             // segment remains, since an older copy of the key would
             // otherwise come back after a crash.
+            if (auto hook = gc_tombstone_drop_test_hook.load(
+                    std::memory_order_relaxed))
+                hook(key, hdr.timestamp);
             table.remove_locked(hash, grain);
             invalidate_grains(grain, entry_grains, true);
             return 0;
@@ -1206,13 +1209,31 @@ int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
 
         // Relocate: copy to the relocation stream with the new segment's
         // timestamp, then repoint the entry.
+        //
+        // Recovery orders a key's records by segment timestamp, so the copy
+        // has to land in a segment newer than the victim: every older copy
+        // of the key still on disk is older than the victim's. The
+        // relocation segment stays open while the data stream moves on, so
+        // it can be older (PR #3 review, finding 6). Then close it and
+        // take a fresh one, which is newer than every segment there is.
         u64 dst = 0;
-        int rc = salsa::SalsaCtlr::allocate_grains(entry_grains, &dst, 0, true);
-        if (rc != 0) return rc;
         auto drop_dst = [&] {
             invalidate_grains(dst, entry_grains, true);
             release_grains(dst, entry_grains, true);
         };
+        for (int attempt = 0;; ++attempt) {
+            int rc = salsa::SalsaCtlr::allocate_grains(entry_grains, &dst, 0,
+                                                       true);
+            if (rc != 0) return rc;
+            if (seg_timestamps_[scm_->grain_to_seg_idx(dst)].load(
+                    std::memory_order_acquire) > hdr.timestamp)
+                break;
+            drop_dst();
+            // A freshly staged segment is the newest; failing twice means
+            // the timestamps are broken, not that the stream was stale.
+            if (attempt == 1) return EIO;
+            salsa::SalsaCtlr::drain_remaining_grains(0, true);
+        }
         // As for user writes (try_allocate_grains): crash recovery would
         // not find a segment whose metadata write failed.
         if (!seg_md_ok_[scm_->grain_to_seg_idx(dst)].load(
@@ -1245,6 +1266,9 @@ int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
 
         if (auto hook = gc_relocation_test_hook.load(std::memory_order_relaxed))
             hook(key);
+        if (auto hook =
+                gc_relocation_order_test_hook.load(std::memory_order_relaxed))
+            hook(key, hdr.timestamp, moved_hdr.timestamp);
         bool moved = table.update_locked(hash, grain, entry.kv_size(), dst);
         assert(moved);  // the stripes have been held since entry_at
         (void)moved;
@@ -1311,8 +1335,12 @@ int UDepot<IO>::gc_callback(u64 grain_start, u64 grain_nr) {
 
     // Readers that looked up an entry before it moved may still be reading
     // this segment; it is reused only after they are done.
+    //
+    // seg_live_ stays set: until the segment is reused, its metadata and
+    // the old records in it are still on disk, and crash recovery would
+    // replay them. A tombstone guards against exactly those (PR #3 review,
+    // finding 8). Reuse rewrites the metadata, with a new timestamp.
     rcu_.synchronize();
-    seg_live_[victim].store(false, std::memory_order_release);
     return 0;
 }
 

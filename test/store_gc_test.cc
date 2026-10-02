@@ -16,6 +16,8 @@
 #include <cerrno>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <random>
 #include <map>
 #include <string>
 #include <thread>
@@ -623,4 +625,128 @@ TEST_F(StoreGcTest, GetSurvivesItsSegmentBeingRecycled) {
     UDepot<PosixIO>::get_read_test_hook = nullptr;
     EXPECT_EQ(put_errors.load(), 0);
     EXPECT_EQ(bad, 0) << "of " << kReads << " reads held across a recycle";
+}
+
+// Recovery orders a key's records by segment timestamp, so a relocated copy
+// must land in a segment newer than the one it came from: all older copies
+// of the key are older than that. The relocation segment stays open while
+// the data stream moves on, and in this workload (cold data interleaved
+// with hot overwrites) GC moved records into an older one (PR #3 review,
+// finding 6). Any key with an older copy on disk in a
+// segment between the two would then come back stale after a crash.
+TEST_F(StoreGcTest, RelocationNeverMovesIntoAnOlderSegment) {
+    static std::atomic<int> relocations{0};
+    static std::atomic<int> into_older{0};
+    relocations = 0;
+    into_older = 0;
+    UDepot<PosixIO>::gc_relocation_order_test_hook =
+        [](std::span<const uint8_t>, uint64_t victim_ts, uint64_t dst_ts) {
+            relocations.fetch_add(1);
+            if (dst_ts <= victim_ts) into_older.fetch_add(1);
+        };
+    struct ResetHook {
+        ~ResetHook() {
+            UDepot<PosixIO>::gc_relocation_order_test_hook = nullptr;
+        }
+    } reset_hook;
+
+    ASSERT_EQ(store_.open(config_), 0);
+    const std::string val(3000, 'v');
+    constexpr int kCold = 5000;
+    constexpr int kHot = 200;
+    for (int i = 0; i < kCold; ++i) {
+        ASSERT_EQ(store_.put("c" + std::to_string(i), val).run_sync(), 0);
+        for (int h = 0; h < 3; ++h)
+            ASSERT_EQ(store_.put("h" + std::to_string((i * 3 + h) % kHot), val)
+                          .run_sync(), 0);
+    }
+    // Long enough that, without the fix, every run saw at least one (6 of
+    // 6; a sixth of this caught a third of runs).
+    for (int i = 0; i < 120000; ++i)
+        ASSERT_EQ(store_.put("h" + std::to_string(i % kHot), val).run_sync(),
+                  0);
+    store_.close();
+    UDepot<PosixIO>::gc_relocation_order_test_hook = nullptr;
+
+    EXPECT_GT(relocations.load(), 0);
+    EXPECT_EQ(into_older.load(), 0) << "of " << relocations.load()
+                                    << " relocations";
+}
+
+// Whether the store file holds, in a segment older than ts, a record of key
+// that crash recovery would replay: the segment's metadata still carries
+// that timestamp, and so does the record. Reads the file directly, so it
+// does not trust the store's own bookkeeping.
+static bool older_copy_on_disk(const std::filesystem::path& path,
+                               std::span<const uint8_t> key, uint64_t ts) {
+    constexpr size_t kGrain = 512;
+    constexpr size_t kSegGrains = 2048;  // gc_config's segment_size
+    constexpr size_t kSegBytes = kGrain * kSegGrains;
+    std::ifstream in(path, std::ios::binary);
+    std::vector<char> seg(kSegBytes);
+    while (in.read(seg.data(), kSegBytes)) {
+        const char* md = seg.data() + kSegBytes - kGrain;  // salsa_seg_md
+        uint64_t seg_size, grain_size, seg_ts;
+        std::memcpy(&seg_size, md, 8);
+        std::memcpy(&grain_size, md + 8, 8);
+        std::memcpy(&seg_ts, md + 16, 8);
+        if (seg_size != kSegGrains || grain_size != kGrain || seg_ts == 0 ||
+            seg_ts >= ts)
+            continue;
+        for (size_t g = 0; g + 1 < kSegGrains; ++g) {
+            const char* rec = seg.data() + g * kGrain;
+            udepot::KvHeader hdr;
+            std::memcpy(&hdr, rec, sizeof(hdr));
+            if (hdr.timestamp == seg_ts && hdr.key_size == key.size() &&
+                !udepot::is_tombstone(hdr) &&
+                std::memcmp(rec + sizeof(hdr), key.data(), key.size()) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+// Regression (PR #3 review, finding 8): GC let a tombstone go once every
+// older segment had been reclaimed, but a reclaimed segment keeps its
+// metadata and old records on disk until it is reused, and crash recovery
+// replays them: a deleted key could come back. In this workload (random
+// puts and deletes under GC pressure) about a fifth of the tombstones GC
+// dropped had an older copy of their key still on disk.
+TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
+    static std::filesystem::path path;
+    static std::atomic<int> drops{0};
+    static std::atomic<int> unsafe{0};
+    path = path_;
+    drops = 0;
+    unsafe = 0;
+    UDepot<PosixIO>::gc_tombstone_drop_test_hook =
+        [](std::span<const uint8_t> key, uint64_t victim_ts) {
+            drops.fetch_add(1);
+            if (older_copy_on_disk(path, key, victim_ts)) unsafe.fetch_add(1);
+        };
+    struct ResetHook {
+        ~ResetHook() {
+            UDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
+        }
+    } reset_hook;
+
+    ASSERT_EQ(store_.open(config_), 0);
+    std::mt19937 rng(1);
+    const std::string val(2500, 'v');
+    constexpr int kKeys = 6000;
+    for (int i = 0; i < 60000; ++i) {
+        std::string key = "k" + std::to_string(rng() % kKeys);
+        if (rng() % 100 < 30) {
+            int rc = store_.del(key).run_sync();
+            ASSERT_TRUE(rc == 0 || rc == -ENOENT) << rc;
+        } else {
+            ASSERT_EQ(store_.put(key, val).run_sync(), 0);
+        }
+    }
+    store_.close();
+    UDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
+
+    // Tombstones must still be reclaimed, or they would take space forever.
+    EXPECT_GT(drops.load(), 0);
+    EXPECT_EQ(unsafe.load(), 0) << "of " << drops.load() << " dropped";
 }
