@@ -186,7 +186,7 @@ The overhead sources in legacy, per strace:
 
 - **PUT**: Mbuff allocation + copy per operation, pwritev (scatter-gather) vs
   pwrite64 (flat buffer), TRT coroutine scheduling overhead, virtual dispatch
-  through `uDepotIO_`. I/O counts are identical (one pread for lookup-before-write
+  through `uDepotIO_`. I/O counts are identical (one key-verify pread
   + one pwrite for data, on both sides).
 - **GET/EXISTS**: Same I/O count (one pread each). Legacy takes a per-bucket
   mutex on every read — the architectural change RCU eliminates. Plus

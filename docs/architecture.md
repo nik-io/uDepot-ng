@@ -141,10 +141,14 @@ cleared from the lower one, so a reader scanning upward sees each entry in at
 least one position. The worst case for a concurrent reader is an extra disk
 read for a tag match.
 
-A put is lookup-before-write, as in uDepot: the key-verify reads run
-unlocked, then the stripe lock is taken, the decision is re-checked against
-the entries verified, and the directory is updated in the same critical
-section. As in uDepot's `is_pba_order_equal_to_total_order`, a write only
+A put writes its record first and then checks, as the paper (§4.5) and
+uDepot do: the record goes to the log, the key-verify reads run unlocked,
+then the stripe lock is taken, the decision is re-checked against the
+entries verified, and the directory is updated in the same critical section.
+A put that is rejected there (a conditional put, or a lost race) invalidates
+its grains, but its record stays in the log: after a crash the log scan can
+bring it back, which the paper accepts; after a clean shutdown the persisted
+index decides, and it stays dead. As in uDepot's `is_pba_order_equal_to_total_order`, a write only
 replaces an entry (live or deleted) that is older in recovery order — segment
 timestamp, then grain — otherwise it is rewritten, so recovery always
 reproduces the order writes were acknowledged in.
