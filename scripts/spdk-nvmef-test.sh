@@ -11,7 +11,9 @@
 # (traddr:trsvcid:subnqn), so the test binary needs no command-line change.
 #
 # Requirements: a build with -DUDEPOT_BUILD_SPDK=ON, a built SPDK tree under
-# extern/spdk, and root (for the target). Hugepages are used when they can be
+# extern/spdk (configured with --target-arch=x86-64-v2, not the default
+# -march=native, so it runs on whatever host the container lands on), and
+# root (for the target). Hugepages are used when they can be
 # reserved; otherwise both the target and the initiator run with --no-huge
 # (UDEPOT_SPDK_NO_HUGE=1), e.g. in containers without hugetlbfs. CI runs it
 # under sudo.
@@ -98,7 +100,11 @@ TGT_PID=$!
 # Wait until the RPC server actually answers.
 ready="no"
 for i in $(seq 1 40); do
-    kill -0 "$TGT_PID" 2>/dev/null || fail "nvmf_tgt exited during startup"
+    if ! kill -0 "$TGT_PID" 2>/dev/null; then
+        grep -q "unsupported cpu type" "$TGT_LOG" &&
+            fail "SPDK was built for another CPU (-march=native): rebuild it with ./configure --target-arch=x86-64-v2"
+        fail "nvmf_tgt exited during startup"
+    fi
     if test -S /var/tmp/spdk.sock && "$RPC" spdk_get_version >/dev/null 2>&1; then
         ready="yes"; break
     fi

@@ -91,7 +91,10 @@ Claude**. Claude is a co-author, not the author.
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# With SPDK
+# With SPDK. Build SPDK for a portable CPU target: its default,
+# -march=native, produces binaries that refuse to start ("unsupported cpu
+# type") when the container lands on a host without the same CPU features.
+(cd extern/spdk && ./configure --target-arch=x86-64-v2 ... && make)
 cmake -B build -DUDEPOT_BUILD_SPDK=ON
 cmake --build build
 
@@ -130,7 +133,10 @@ must be built at `BUILD_TYPE=PERFORMANCE` (`-O3 -DNDEBUG`) to match uDepot-ng's
 cmake Release build; `perf-regression.sh` does this automatically.
 
 The speed gap is genuine, not a benchmark artifact. With both at -O3, uDepot-ng
-is 2.5-4.5x faster (PUT +157%, GET +174%, EXISTS +345%, DEL +303% at 5000 ops).
+is 2-5x faster at 5000 ops, varying by host: PUT +127-182%, GET +174-227%,
+EXISTS +345-408%, DEL +125-303% on the two cloud hosts measured. Each phase
+lasts only a few milliseconds, so single runs swing by ~15%; compare medians
+across runs, never two builds' runs on different hosts.
 The overhead sources in legacy, per strace:
 
 - **PUT**: Mbuff allocation + copy per operation, pwritev (scatter-gather) vs
