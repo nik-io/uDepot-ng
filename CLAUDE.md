@@ -133,7 +133,11 @@ ctest --test-dir build
   binding test was not built: a missing liburing silently disables io_uring
   in CMake, which would otherwise pass with less coverage.
 - **ThreadSanitizer**, the same tests minus the bindings, failing on any
-  report.
+  report. Debug with `-O1`, so asserts stay on. It has the same "every test
+  built" check (`scripts/ci-check-tests-built.sh`).
+- **SPDK backend**, `scripts/spdk-nvmef-test.sh` against a loopback NVMe-oF
+  software target, as uDepot's CI does. SPDK is built with
+  `--target-arch=x86-64-v2` and its tree cached per submodule revision.
 - **zero-copy perf invariant**, below.
 
 ### Zero-copy perf invariant
