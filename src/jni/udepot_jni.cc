@@ -13,9 +13,8 @@
 
 using Store = udepot::UDepot<udepot::AioIO>;
 
-// Never freed: Java threads call get/put/del without taking g_mtx, so
-// shutdown() closes the store (calls then fail with -ESHUTDOWN) but must
-// not destroy it under them.
+// As in uDepot's JNI binding, get/put/del do not take g_mtx: the caller
+// must ensure none is in progress during shutdown(), or follows it.
 static Store g_store;
 static bool g_open = false;  // guarded by g_mtx
 static std::mutex g_mtx;

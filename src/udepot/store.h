@@ -90,10 +90,9 @@ public:
     UDepot(const UDepot&) = delete;
     UDepot& operator=(const UDepot&) = delete;
 
-    // open() and close() must not run concurrently with each other.
-    // Operations may race close(): it waits for the ones in progress, and
-    // any that start after it fail with -ESHUTDOWN, as do operations on a
-    // store that was never opened. The object must outlive every caller.
+    // As in uDepot, the caller orders open() and close() against
+    // operations: none may start before open() returns, run concurrently
+    // with close(), or follow it.
     int open(const StoreConfig& config);
     void close();
 
@@ -156,9 +155,6 @@ public:
 private:
     Rcu rcu_;
     IO io_;
-    // Checked by every operation inside its RCU read section; close()
-    // clears it and then waits a grace period. Own line: read on every op.
-    alignas(64) std::atomic<bool> open_{false};
     Directory* directory_ = nullptr;
     uint32_t grain_size_ = 512;
     uint64_t total_grains_ = 0;

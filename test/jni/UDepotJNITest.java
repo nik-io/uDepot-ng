@@ -146,45 +146,6 @@ class UDepotJNITest {
         }
     }
 
-    // Regression: shutdown() deleted the store while other threads were in
-    // get/put/del, which read the global pointer without the lock. Calls
-    // racing or following shutdown() must now fail cleanly (-ESHUTDOWN).
-    void testShutdownWhileThreadsRun() throws InterruptedException {
-        final uDepotJNI kv = KV;
-        final int eshutdown = 108;
-        int threadCount = 4;
-        java.util.concurrent.atomic.AtomicInteger ops =
-            new java.util.concurrent.atomic.AtomicInteger(0);
-        java.util.concurrent.atomic.AtomicInteger unexpected =
-            new java.util.concurrent.atomic.AtomicInteger(0);
-
-        Thread[] threads = new Thread[threadCount];
-        for (int t = 0; t < threadCount; t++) {
-            final int tid = t;
-            threads[t] = new Thread(() -> {
-                byte[] buf = new byte[64];
-                for (int i = 0; ; i++) {
-                    byte[] k = ("sd" + tid + "_k" + (i % 32)).getBytes();
-                    int rc = (i % 2 == 0)
-                        ? kv.put(k, k.length, k, k.length)
-                        : kv.get(k, k.length, buf, buf.length);
-                    ops.incrementAndGet();
-                    if (rc == -eshutdown) break;
-                    if (rc < 0 && rc != -2 /* ENOENT */)
-                        unexpected.incrementAndGet();
-                }
-                byte[] k = ("sd" + tid + "_k0").getBytes();
-                if (kv.del(k, k.length) != -eshutdown)
-                    unexpected.incrementAndGet();
-            });
-        }
-        for (Thread th : threads) th.start();
-        while (ops.get() < 2000) Thread.yield();
-        kv.shutdown();
-        for (Thread th : threads) th.join();
-        check(unexpected.get() == 0, "calls racing shutdown fail cleanly");
-    }
-
     public static void main(String[] argv) throws Exception {
         String fname;
         if (argv.length > 0) {
@@ -207,7 +168,6 @@ class UDepotJNITest {
             test.testLargeValue();
             test.testGetRawDeviceCapacity();
             test.testConcurrentPutGet();
-            test.testShutdownWhileThreadsRun();  // last: shuts the store
         } finally {
             test.shutdown();
             Files.deleteIfExists(Path.of(fname));

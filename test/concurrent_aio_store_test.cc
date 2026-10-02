@@ -374,38 +374,3 @@ TEST_F(ConcurrentAioStoreTest, ConcurrentPutsOfOneKeyLeaveOneEntry) {
     EXPECT_EQ(survivors, 0)
         << "keys still readable after del(): duplicate directory entries";
 }
-
-// Regression: close() tore the store down while operations were in flight,
-// and operations after close() dereferenced the deleted directory. close()
-// now waits for running operations; later ones fail with -ESHUTDOWN.
-TEST_F(ConcurrentAioStoreTest, CloseWhileOperationsInFlight) {
-    constexpr int kThreads = 4;
-    std::atomic<bool> go{false};
-    std::atomic<int> ops{0};
-    std::atomic<int> unexpected{0};
-
-    std::vector<std::thread> threads;
-    for (int t = 0; t < kThreads; ++t) {
-        threads.emplace_back([&, t] {
-            while (!go.load()) std::this_thread::yield();
-            for (int i = 0;; ++i) {
-                std::string key = make_key(t, i % 64);
-                size_t n = 0;
-                int rc = (i % 2)
-                    ? store_.put(key, make_val(t, i)).run_sync()
-                    : store_.get(key, nullptr, 0, &n).run_sync();
-                ops.fetch_add(1);
-                if (rc == -ESHUTDOWN) break;
-                if (rc != 0 && rc != -ENOENT) unexpected.fetch_add(1);
-            }
-            if (store_.del(make_key(t, 0)).run_sync() != -ESHUTDOWN)
-                unexpected.fetch_add(1);
-        });
-    }
-    go.store(true);
-    while (ops.load() < 2000) std::this_thread::yield();
-    store_.close();
-    for (auto& th : threads) th.join();
-
-    EXPECT_EQ(unexpected.load(), 0);
-}

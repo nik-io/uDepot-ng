@@ -4,6 +4,7 @@
 #include "udepot/store.h"
 
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <cerrno>
 #include <cstdio>
@@ -500,19 +501,13 @@ int UDepot<IO>::open(const StoreConfig& config) {
         space_stop_ = false;
     }
     space_waker_ = std::thread(&UDepot::space_waker_loop, this);
-
-    open_.store(true, std::memory_order_release);
     return 0;
 }
 
 template <typename IO>
 void UDepot<IO>::close() {
-    // Operations check open_ inside their RCU read section, so once the
-    // grace period ends none is still running and none can start.
-    open_.store(false, std::memory_order_release);
-    rcu_.synchronize();
-    // Operations waiting for space hold no read-side section; resume them
-    // so they see the store closed before it is torn down.
+    // As uDepot's shutdown(): no operation may be in progress or start
+    // (store.h), so none is waiting for space or a grow either.
     stop_space_waker();
 
     if (scm_) {
@@ -567,14 +562,13 @@ CoroTask<int> UDepot<IO>::allocate_or_wait(
         if (probe) probe->n = 0;
         co_await SpaceWait{this};
         guard.emplace(rcu_);
-        if (!open_.load(std::memory_order_acquire)) co_return -ESHUTDOWN;
     }
 }
 
 template <typename IO>
 bool UDepot<IO>::SpaceWait::await_suspend(std::coroutine_handle<> h) {
     std::lock_guard<std::mutex> lock(store->space_mu_);
-    if (store->space_stop_) return false;  // closing: retry, see it closed
+    assert(!store->space_stop_);  // no operation may race close()
     if (grow != Directory::kAnyGeneration)
         store->grow_request_ =
             std::max(store->grow_request_.value_or(0), grow);
@@ -592,7 +586,6 @@ CoroTask<int> UDepot<IO>::wait_for_grow(uint64_t gen, bool grow,
     if (probe) probe->n = 0;
     co_await SpaceWait{this, grow ? gen : Directory::kAnyGeneration};
     guard.emplace(rcu_);
-    if (!open_.load(std::memory_order_acquire)) co_return -ESHUTDOWN;
     co_return 0;
 }
 
@@ -636,8 +629,9 @@ void UDepot<IO>::space_waker_loop() {
         lock.lock();
         resume_waiters(lock);
     }
+    // No operation may race close(), so none is left waiting.
+    assert(space_waiters_.empty());
     grow_request_.reset();
-    resume_waiters(lock);  // they find the store closed
 }
 
 template <typename IO>
@@ -920,7 +914,6 @@ CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
         co_return -EINVAL;
 
     std::optional<Rcu::ReadGuard> guard(std::in_place, rcu_);
-    if (!open_.load(std::memory_order_acquire)) co_return -ESHUTDOWN;
 
     // Build the on-disk entry.  Must happen before any co_await so that
     // key/val data is copied while the caller's buffers are still alive.
@@ -1051,7 +1044,6 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
 
     uint64_t hash = hash_key(key);
     Rcu::ReadGuard guard(rcu_);
-    if (!open_.load(std::memory_order_acquire)) co_return -ESHUTDOWN;
 
     // Iterate through all tag-matching entries to handle collisions.
     for (uint32_t start = 0; ; ) {
@@ -1189,7 +1181,6 @@ CoroTask<int> UDepot<IO>::del(std::span<const uint8_t> key,
 
     uint64_t hash = hash_key(key);
     std::optional<Rcu::ReadGuard> guard(std::in_place, rcu_);
-    if (!open_.load(std::memory_order_acquire)) co_return -ESHUTDOWN;
 
     const uint64_t tomb_grains = kv_total_grains(key.size(), 0);
     uint64_t tomb = UINT64_MAX;
@@ -1240,7 +1231,6 @@ CoroTask<int> UDepot<IO>::exists(std::span<const uint8_t> key,
 
     uint64_t hash = hash_key(key);
     Rcu::ReadGuard guard(rcu_);
-    if (!open_.load(std::memory_order_acquire)) co_return -ESHUTDOWN;
 
     for (uint32_t start = 0; ; ) {
         HashEntry entry = directory_->lookup(hash, start);

@@ -105,8 +105,9 @@ correct: the grace period is bounded by the slowest in-flight I/O (milliseconds
 on NVMe). This means **no separate table refcounting** — RCU alone guarantees
 that no reader references a freed table, and that GC does not reuse a segment
 a reader may still be reading (GC waits a grace period before handing a
-segment back). `close()` uses the same grace period to wait for operations in
-flight. The exceptions are waiting for free space (see *Space management*)
+segment back). As in uDepot, the caller orders `close()` after every
+operation: none may race or follow it, so the store keeps no open flag on the
+operation path. The exceptions are waiting for free space (see *Space management*)
 and waiting for a directory grow: an operation leaves its section while it
 waits, so it can never hold up the grace period that GC or the grow needs to
 let it continue.
