@@ -40,6 +40,16 @@
    it unless there is an explicit, agreed-upon reason to diverge. When unsure
    whether a choice is covered by the rewrite plan or is a new divergence,
    **ask before implementing.**
+10. **The uDepot paper is the design reference — read `docs/udepot-paper.md`
+    before any design-level change** (index, resize, persistence/recovery, GC,
+    put/del ordering, zero copy, Memcache). It summarises and quotes the FAST '19
+    paper. Where the paper and legacy uDepot's code disagree, **follow the
+    paper, or ask**; where both are silent, legacy is the reference. Notable
+    consequences already decided: empty values are valid (tombstones need their
+    own encoding); the index is flushed to index segments and restored on a
+    clean start, with the log scan only after a crash; resize is incremental
+    per lock region with a shadow directory; PUT writes before it checks, and
+    Memcache paths may carry weaker durability than the store.
 
 ## Project Overview
 
@@ -48,7 +58,8 @@ ground-up rewrite of [uDepot](https://www.usenix.org/system/files/fast19-kourtis
 with a modernized concurrency model (userspace RCU, lock-free reads, C++23
 coroutines) and a simplified runtime (no separate TRT scheduler).
 
-See `docs/architecture.md` for the full design.
+See `docs/architecture.md` for the full design, and `docs/udepot-paper.md`
+for the paper it implements.
 
 ## Design Principles
 

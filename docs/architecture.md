@@ -470,10 +470,16 @@ future) is planned as a follow-up once the async backends are working.
 
 ## On-Disk Format
 
-The on-disk format (segment layout, directory table layout, salsa metadata)
-is **unchanged** from uDepot. A uDepot-ng store can read a uDepot store and
-vice versa — the rewrite changes the in-memory concurrency model and runtime,
-not the persistent format.
+The intent is uDepot's format (segment layout, directory table layout, salsa
+metadata; see `docs/udepot-paper.md`, §4.4), so a uDepot-ng store and a uDepot
+store can read each other. **Two known divergences remain:**
+
+- The KV record header carries an 8-byte timestamp (`KvHeader`). uDepot's
+  header is 6 bytes (key size, value size); it orders a record by its
+  segment's timestamp, which the record's checksum is bound to.
+- Index segments: uDepot flushes the directory's tables at shutdown and
+  restores them on a clean start. uDepot-ng is adding this; until then every
+  open rebuilds the index from the log.
 
 ## Implementation Order
 
