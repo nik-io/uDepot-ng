@@ -225,3 +225,32 @@ TEST_F(SpdkStoreTest, ConcurrentOverwritesBeyondDeviceSize) {
            (long long)std::chrono::duration_cast<ms>(t2 - t1).count(),
            (long long)std::chrono::duration_cast<ms>(t3 - t2).count());
 }
+
+// Zero copy holds on SPDK: the store's buffers are DMA memory covering whole
+// grains, so neither a zero-copy nor a copying put/get bounces in the
+// backend (PR #3 review, finding 7).
+TEST_F(SpdkStoreTest, PutAndGetDoNotBounce) {
+    const std::string key = "zc-key";
+    std::string val(10000, 'z');
+    ASSERT_EQ(store_.put(key, val).run_sync(), 0);  // opens the queue pair
+    const uint64_t before = SpdkIO::thread_bounce_count();
+
+    auto key_span = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(key.data()), key.size());
+    udepot::PutBuffer pb = store_.alloc_put_buffer(key.size(), val.size());
+    ASSERT_TRUE(pb.valid());
+    std::memcpy(pb.value().data(), val.data(), val.size());
+    ASSERT_EQ(store_.put(key_span, pb).run_sync(), 0);
+
+    udepot::GetBuffer gb;
+    ASSERT_EQ(store_.get(key_span, &gb).run_sync(), 0);
+    ASSERT_EQ(gb.value().size(), val.size());
+    EXPECT_EQ(std::memcmp(gb.value().data(), val.data(), val.size()), 0);
+
+    std::string out(val.size(), '\0');
+    size_t n = 0;
+    ASSERT_EQ(store_.get(key, reinterpret_cast<uint8_t*>(out.data()),
+                         out.size(), &n).run_sync(), 0);
+    EXPECT_EQ(out, val);
+    EXPECT_EQ(SpdkIO::thread_bounce_count(), before);
+}

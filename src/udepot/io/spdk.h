@@ -99,6 +99,9 @@ struct SpdkQpair {
     // it, which is not re-entrant).
     std::vector<std::coroutine_handle<>> ready;
     SpdkGlobalState* gs = nullptr;  // registry this queue pair is in
+    // I/Os copied through a bounce buffer: their buffer could not be handed
+    // to the device as it was (see direct_io_ok in spdk.cc).
+    uint64_t bounced = 0;
 
     SpdkQpair() = default;
     SpdkQpair(SpdkNamespace* namespace_ptr, SpdkGlobalState* owner);
@@ -128,7 +131,10 @@ struct SpdkQpair {
 // SPDK NVMe I/O backend for uDepot-ng.
 //
 // Matches the IoBackend concept. Uses SPDK's userspace NVMe driver for
-// direct device access, with DMA buffer bounce for pread/pwrite.
+// direct device access. pread/pwrite hand the caller's buffer to the device
+// when it is DMA memory (alloc_buffer's) covering whole sectors, as uDepot's
+// read_raw_sync/write_raw_sync did; any other buffer bounces through a DMA
+// buffer, as its read_sync/write_sync did.
 //
 // As in uDepot, each thread has its own queue pair and only that thread
 // touches it: an I/O is submitted there, its coroutine suspends, and the
@@ -168,6 +174,9 @@ public:
 
     size_t get_size() const noexcept { return size_; }
     IoBuffer alloc_buffer(size_t size);
+
+    // I/Os on the calling thread's queue pair that bounced. For tests.
+    static uint64_t thread_bounce_count();
 
 private:
     size_t size_ = 0;

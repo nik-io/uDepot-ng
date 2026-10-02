@@ -559,6 +559,28 @@ bool SpdkIO::poll_thread_qpair() {
     return qp->npending > 0;
 }
 
+// Whether the device can transfer straight to or from buf: memory SPDK can
+// translate (alloc_buffer's DMA memory), dword-aligned as NVMe requires, and
+// covering whole sectors. SPDK registers memory in 2 MiB units, so checking
+// each 2 MiB step and the last byte covers the whole range.
+static bool direct_io_ok(const void* buf, size_t count, off_t offset,
+                         uint32_t bsize) {
+    if (count == 0 || count % bsize != 0 ||
+        static_cast<uint64_t>(offset) % bsize != 0 ||
+        reinterpret_cast<uintptr_t>(buf) % 4 != 0)
+        return false;
+    constexpr size_t kStep = 2 * 1024 * 1024;
+    const char* p = static_cast<const char*>(buf);
+    for (size_t off = 0; off < count; off += kStep)
+        if (spdk_vtophys(p + off, nullptr) == SPDK_VTOPHYS_ERROR) return false;
+    return spdk_vtophys(p + count - 1, nullptr) != SPDK_VTOPHYS_ERROR;
+}
+
+uint64_t SpdkIO::thread_bounce_count() {
+    SpdkQpair* qp = thread_qpair_.get();
+    return qp ? qp->bounced : 0;
+}
+
 ssize_t SpdkIO::pwrite_sync(const void* buf, size_t count, off_t offset) {
     SpdkQpair* qp = get_thread_qpair();
     if (!qp) return -EIO;
@@ -568,10 +590,16 @@ ssize_t SpdkIO::pwrite_sync(const void* buf, size_t count, off_t offset) {
     uint64_t lba_end = (static_cast<uint64_t>(offset) + count + bsize - 1) / bsize;
     uint64_t nlbas = lba_end - lba_start;
 
-    void* dma_buf = qp->alloc_dma_buffer(nlbas * bsize);
-    if (!dma_buf) return -ENOMEM;
-    size_t copy_off = static_cast<size_t>(offset) - lba_start * bsize;
-    std::memcpy(static_cast<char*>(dma_buf) + copy_off, buf, count);
+    void* dma_buf = nullptr;
+    if (direct_io_ok(buf, count, offset, bsize)) {
+        dma_buf = const_cast<void*>(buf);
+    } else {
+        dma_buf = qp->alloc_dma_buffer(nlbas * bsize);
+        if (!dma_buf) return -ENOMEM;
+        ++qp->bounced;
+        size_t copy_off = static_cast<size_t>(offset) - lba_start * bsize;
+        std::memcpy(static_cast<char*>(dma_buf) + copy_off, buf, count);
+    }
 
     bool done = false;
     SpdkRequest req{qp, 0, {}, &done};
@@ -582,7 +610,7 @@ ssize_t SpdkIO::pwrite_sync(const void* buf, size_t count, off_t offset) {
         // meanwhile are queued for its next poll, not resumed here.
         while (!done) qp->execute_completions(0);
     }
-    qp->free_dma_buffer(dma_buf);
+    if (dma_buf != buf) qp->free_dma_buffer(dma_buf);
     if (rc != 0 || req.result < 0) return -EIO;
     return static_cast<ssize_t>(count);
 }
@@ -596,8 +624,19 @@ CoroTask<ssize_t> SpdkIO::pread(void* buf, size_t count, off_t offset) {
     uint64_t lba_end = (static_cast<uint64_t>(offset) + count + bsize - 1) / bsize;
     uint64_t nlbas = lba_end - lba_start;
 
+    if (direct_io_ok(buf, count, offset, bsize)) {
+        SpdkRequest req{};
+        ssize_t result = co_await SpdkSubmitAwaitable{
+            &req, qp, buf, lba_start, static_cast<uint32_t>(nlbas),
+            SpdkSubmitAwaitable::Op::kRead
+        };
+        if (result < 0) co_return result;
+        co_return static_cast<ssize_t>(count);
+    }
+
     void* dma_buf = qp->alloc_dma_buffer(nlbas * bsize);
     if (!dma_buf) co_return -ENOMEM;
+    ++qp->bounced;
 
     SpdkRequest req{};
     ssize_t result = co_await SpdkSubmitAwaitable{
@@ -625,11 +664,16 @@ CoroTask<ssize_t> SpdkIO::pwrite(const void* buf, size_t count, off_t offset) {
     uint64_t lba_end = (static_cast<uint64_t>(offset) + count + bsize - 1) / bsize;
     uint64_t nlbas = lba_end - lba_start;
 
-    void* dma_buf = qp->alloc_dma_buffer(nlbas * bsize);
-    if (!dma_buf) co_return -ENOMEM;
-
-    size_t copy_off = static_cast<size_t>(offset) - lba_start * bsize;
-    std::memcpy(static_cast<char*>(dma_buf) + copy_off, buf, count);
+    void* dma_buf = nullptr;
+    if (direct_io_ok(buf, count, offset, bsize)) {
+        dma_buf = const_cast<void*>(buf);
+    } else {
+        dma_buf = qp->alloc_dma_buffer(nlbas * bsize);
+        if (!dma_buf) co_return -ENOMEM;
+        ++qp->bounced;
+        size_t copy_off = static_cast<size_t>(offset) - lba_start * bsize;
+        std::memcpy(static_cast<char*>(dma_buf) + copy_off, buf, count);
+    }
 
     SpdkRequest req{};
     ssize_t result = co_await SpdkSubmitAwaitable{
@@ -637,7 +681,7 @@ CoroTask<ssize_t> SpdkIO::pwrite(const void* buf, size_t count, off_t offset) {
         SpdkSubmitAwaitable::Op::kWrite
     };
 
-    qp->free_dma_buffer(dma_buf);
+    if (dma_buf != buf) qp->free_dma_buffer(dma_buf);
     if (result < 0) co_return result;
     co_return static_cast<ssize_t>(count);
 }
