@@ -82,43 +82,37 @@ if(UDEPOT_BUILD_SPDK)
     target_sources(udepot PRIVATE src/udepot/io/spdk.cc)
     target_compile_definitions(udepot PUBLIC UDEPOT_BUILD_SPDK=1)
 
-    target_include_directories(udepot PUBLIC
+    # SYSTEM: DPDK's headers do not build warning-free as C++23.
+    target_include_directories(udepot SYSTEM PUBLIC
         "${SPDK_DIR}/include"
         "${SPDK_DIR}/dpdk/build/include"
     )
 
-    # SPDK and DPDK static libraries.  The order matters for static linking.
-    set(SPDK_LIBS
-        "${SPDK_DIR}/build/lib/libspdk_nvme.a"
-        "${SPDK_DIR}/build/lib/libspdk_env_dpdk.a"
-        "${SPDK_DIR}/build/lib/libspdk_env_dpdk_rpc.a"
-        "${SPDK_DIR}/build/lib/libspdk_util.a"
-        "${SPDK_DIR}/build/lib/libspdk_log.a"
-        "${SPDK_DIR}/build/lib/libspdk_sock.a"
-        "${SPDK_DIR}/build/lib/libspdk_sock_posix.a"
-        "${SPDK_DIR}/build/lib/libspdk_json.a"
-        "${SPDK_DIR}/build/lib/libspdk_jsonrpc.a"
-        "${SPDK_DIR}/build/lib/libspdk_rpc.a"
-        "${SPDK_DIR}/build/lib/libspdk_trace.a"
-        "${SPDK_DIR}/build/lib/libspdk_vfio_user.a"
-    )
-
-    set(DPDK_LIBS
-        "${SPDK_DIR}/dpdk/build/lib/librte_eal.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_mempool.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_mempool_ring.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_ring.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_pci.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_bus_pci.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_kvargs.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_telemetry.a"
-        "${SPDK_DIR}/dpdk/build/lib/librte_log.a"
-    )
-
+    # Link exactly what SPDK's pkg-config says this SPDK build needs; a
+    # hand-kept list drifts from the SPDK version (v24.09 added keyring and
+    # OpenSSL). --whole-archive as in SPDK's own build: modules such as the
+    # posix socket transport register themselves from static constructors,
+    # which the linker would otherwise drop, leaving NVMe-oF/TCP without a
+    # socket implementation at run time.
+    set(_spdk_pc "${SPDK_DIR}/build/lib/pkgconfig")
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env "PKG_CONFIG_PATH=${_spdk_pc}"
+                pkg-config --libs --static spdk_nvme spdk_env_dpdk
+                spdk_sock_posix
+        OUTPUT_VARIABLE SPDK_PC_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _spdk_pc_rc)
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env "PKG_CONFIG_PATH=${_spdk_pc}"
+                pkg-config --libs --static spdk_syslibs
+        OUTPUT_VARIABLE SPDK_SYS_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT _spdk_pc_rc EQUAL 0)
+        message(FATAL_ERROR "pkg-config could not resolve SPDK in ${_spdk_pc}")
+    endif()
+    separate_arguments(SPDK_PC_LIBS UNIX_COMMAND "${SPDK_PC_LIBS}")
+    separate_arguments(SPDK_SYS_LIBS UNIX_COMMAND "${SPDK_SYS_LIBS}")
     target_link_libraries(udepot PUBLIC
-        ${SPDK_LIBS}
-        ${DPDK_LIBS}
-        pthread dl rt numa uuid
+        -Wl,--whole-archive ${SPDK_PC_LIBS} -Wl,--no-whole-archive
+        ${SPDK_SYS_LIBS}
     )
 endif()
 
@@ -181,6 +175,10 @@ if(UDEPOT_BUILD_TESTS)
 
     udepot_add_test(coro_test       test/coro_test.cc)
     udepot_add_test(rcu_test        test/rcu_test.cc)
+    # The reader-fence path, which macOS and kernels without membarrier use.
+    add_test(NAME rcu_test_reader_fence COMMAND rcu_test)
+    set_tests_properties(rcu_test_reader_fence PROPERTIES TIMEOUT 60
+                         ENVIRONMENT UDEPOT_RCU_READER_FENCE=1)
     udepot_add_test(buffer_test     test/buffer_test.cc)
     udepot_add_test(posix_test      test/io/posix_test.cc)
     udepot_add_test(hash_table_test test/hash_table_test.cc)
@@ -190,10 +188,15 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(aio_store_test  test/aio_store_test.cc)
     udepot_add_test(concurrent_store_test test/concurrent_store_test.cc)
     udepot_add_test(store_recovery_test test/store_recovery_test.cc)
+    udepot_add_test(store_gc_test   test/store_gc_test.cc)
+    set_tests_properties(store_gc_test PROPERTIES TIMEOUT 300)
     udepot_add_test(concurrent_aio_store_test test/concurrent_aio_store_test.cc)
     set_tests_properties(concurrent_aio_store_test PROPERTIES TIMEOUT 180)
     udepot_add_test(aio_queue_depth_test test/aio_queue_depth_test.cc)
-    set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 180)
+    # Asserts that deeper queues beat serial, measured within the run; CPU
+    # contention from tests running alongside it makes that a coin flip.
+    set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 180
+                         RUN_SERIAL TRUE)
     udepot_add_test(net_test test/io/net_test.cc)
 
     if(UDEPOT_BUILD_NET)
@@ -274,6 +277,22 @@ if(UDEPOT_BUILD_TESTS)
     # Perf benchmark binary (not a gtest — standalone executable).
     add_executable(udepot_ng_bench test/perf/udepot_ng_bench.cc)
     target_link_libraries(udepot_ng_bench PRIVATE udepot)
+
+    # Zero-copy invariant (scripts/perf-zerocopy.sh), as uDepot's
+    # `make run_perf_test`: on every backend, zero-copy put/get must not be
+    # slower than the copying interface. Meaningful in Release only.
+    set(_perf_backends posix aio)
+    if(UDEPOT_BUILD_URING)
+        list(APPEND _perf_backends uring)
+    endif()
+    set(_perf_cmds)
+    foreach(_b IN LISTS _perf_backends)
+        list(APPEND _perf_cmds COMMAND
+             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/perf-zerocopy.sh
+             ${_b} ${CMAKE_CURRENT_BINARY_DIR})
+    endforeach()
+    add_custom_target(run_perf_test ${_perf_cmds}
+        DEPENDS udepot_ng_bench USES_TERMINAL)
 
     # Legacy uDepot benchmark for the perf regression gate.
     # Requires UDEPOT_ROOT pointing to a built uDepot tree with libudepot.a.

@@ -105,3 +105,23 @@ class TestBinaryKeys:
         out = np.zeros(4, dtype=np.uint8)
         assert store.get(key, out)
         np.testing.assert_array_equal(out, val)
+
+
+class TestClose:
+    """After close the handle is gone: calls raise instead of passing a
+    freed pointer to C. As in uDepot, no call may race the close."""
+
+    def test_calls_after_close_raise(self, tmp_path):
+        kv = pyudepot.uDepot(file_name=str(tmp_path / "closed"),
+                             size=STORE_SIZE, force_destroy=True)
+        assert kv.put(_key("k"), _val("v"))
+        kv._cleanup()
+        with pytest.raises(ValueError):
+            kv.put(_key("k"), _val("v"))
+        with pytest.raises(ValueError):
+            kv.get(_key("k"), np.zeros(8, dtype=np.uint8))
+        with pytest.raises(ValueError):
+            kv.delete(_key("k"))
+        with pytest.raises(ValueError):
+            kv.exists(_key("k"))
+        kv._cleanup()  # closing twice is harmless

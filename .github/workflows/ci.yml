@@ -1,0 +1,223 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: unit tests (${{ matrix.build_type }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Debug keeps asserts, salsa's included: the first assert-enabled run
+        # found two recovery bugs every Release run had compiled out.
+        # Release is what ships and what the perf gate measures.
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only cityhash: extern/spdk is large and needed only for SPDK builds.
+      - name: Submodules
+        run: git submodule update --init --depth 1 extern/cityhash
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build ccache \
+            libaio-dev liburing-dev \
+            python3-numpy python3-pytest default-jdk
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ matrix.build_type }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.build_type }}-
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DUDEPOT_BUILD_JNI=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # A missing dependency silently drops a backend or binding (CMake
+      # disables io_uring when liburing is absent), and the run would pass
+      # while covering less. Fail instead.
+      - name: Every test is built
+        run: scripts/ci-check-tests-built.sh build pyudepot_test jni_test
+
+      - name: Unit tests
+        run: ctest --test-dir build -j"$(nproc)" --output-on-failure
+
+  tsan:
+    name: unit tests (ThreadSanitizer)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Submodules
+        run: git submodule update --init --depth 1 extern/cityhash
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build ccache libaio-dev liburing-dev
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-tsan-${{ github.sha }}
+          restore-keys: ccache-tsan-
+
+      # The runner's default ASLR entropy leaves TSAN's runtime no room for
+      # its shadow memory ("unexpected memory mapping").
+      - name: Allow TSAN's memory layout
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      # The Python and JNI bindings are left out: an instrumented library
+      # cannot be loaded into an uninstrumented interpreter or JVM. Debug
+      # keeps asserts (RelWithDebInfo would add -O2 -DNDEBUG); the -O1 below
+      # is what makes TSAN's run time bearable.
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            "-DCMAKE_C_FLAGS=-fsanitize=thread -O1 -g" \
+            "-DCMAKE_CXX_FLAGS=-fsanitize=thread -O1 -g -Wno-tsan" \
+            -DUDEPOT_BUILD_PYTHON=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Every test is built
+        run: scripts/ci-check-tests-built.sh build
+
+      # Any report fails the test that produced it.
+      - name: Unit tests
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build -j"$(nproc)" --output-on-failure
+
+  spdk:
+    name: SPDK backend (NVMe-oF software target)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Submodules
+        run: git submodule update --init --depth 1 extern/cityhash
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build ccache pkg-config \
+            libaio-dev liburing-dev \
+            nasm meson python3-pyelftools libnuma-dev uuid-dev libssl-dev \
+            libncurses-dev
+
+      # SPDK takes most of the job to build and changes only with the
+      # submodule, so its build tree is cached per revision.
+      - name: SPDK revision
+        id: spdk
+        run: echo "rev=$(git rev-parse HEAD:extern/spdk)" >> "$GITHUB_OUTPUT"
+
+      - name: SPDK build cache
+        id: spdk-cache
+        uses: actions/cache@v4
+        with:
+          path: extern/spdk
+          key: spdk-${{ steps.spdk.outputs.rev }}-x86-64-v2-v1
+
+      # As CLAUDE.md: a portable target, never SPDK's default -march=native,
+      # whose binaries refuse to start on a host without the same CPU.
+      - name: Build SPDK
+        if: steps.spdk-cache.outputs.cache-hit != 'true'
+        run: |
+          git submodule update --init --recursive --depth 1 extern/spdk
+          cd extern/spdk
+          ./configure --target-arch=x86-64-v2 --disable-tests \
+            --disable-unit-tests --disable-examples --without-nvme-cuse \
+            --without-vhost --without-virtio --without-crypto
+          make -j"$(nproc)"
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-spdk-${{ github.sha }}
+          restore-keys: ccache-spdk-
+
+      # Debug: the backend's asserts stay on.
+      - name: Build
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DUDEPOT_BUILD_SPDK=ON -DUDEPOT_BUILD_PYTHON=OFF
+          cmake --build build -j"$(nproc)" --target spdk_test spdk_store_test
+
+      # As uDepot's CI: the SPDK backend as an NVMe-oF initiator against a
+      # loopback nvmf_tgt exporting a RAM-backed bdev. No NVMe hardware.
+      - name: SPDK NVMe-oF backend test
+        timeout-minutes: 15
+        run: sudo -E scripts/spdk-nvmef-test.sh build
+
+  perf:
+    name: zero-copy perf invariant
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Submodules
+        run: git submodule update --init --depth 1 extern/cityhash
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build ccache libaio-dev liburing-dev
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-perf-${{ github.sha }}
+          restore-keys: ccache-perf-
+
+      - name: Build (Release)
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DUDEPOT_BUILD_PYTHON=OFF
+          cmake --build build -j"$(nproc)" --target udepot_ng_bench
+
+      # As uDepot's CI: zero-copy put/get must not be slower than the copying
+      # interface, per backend, on a /dev/shm store, comparing medians of
+      # interleaved runs within one job. No stored baselines: an invariant
+      # measured in one run survives a shared runner's drift; a recorded
+      # number does not. An invariant that holds on one backend only is not
+      # one, so every backend runs.
+      - name: Zero-copy invariant (posix)
+        timeout-minutes: 10
+        run: scripts/perf-zerocopy.sh posix build
+      - name: Zero-copy invariant (aio)
+        timeout-minutes: 15
+        run: scripts/perf-zerocopy.sh aio build
+      - name: Zero-copy invariant (io_uring)
+        timeout-minutes: 20
+        run: scripts/perf-zerocopy.sh uring build

@@ -16,6 +16,7 @@ extern "C" {
 	#include "gc/gc.h"
 	#include "sto-ctlr/private/sto-capacity-mgr-common.h"
 	#include "sto-ctlr/sto-capacity-mgr.h"
+	#include "sto-ctlr/scm-seg-alloc.h"
 	#include "util/parse-storage-args.h"
 	#include "util/scm_usr_helpers.h"
 }
@@ -202,6 +203,20 @@ u64
 Scm::seg_to_grain(gc_io_work_parent *const work) const
 {
 	return scm_seg_to_grain(scm_, work->seg);
+}
+
+void
+Scm::set_defer_free_seg(void (*const fn)(void *arg, struct segment *seg),
+			void *const arg)
+{
+	scm_->defer_free_arg = arg;
+	scm_->defer_free_seg = fn;
+}
+
+void
+Scm::put_free_seg(struct segment *const seg)
+{
+	scm_put_free_seg(scm_, seg, 0);
 }
 
 u64

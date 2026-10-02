@@ -489,7 +489,14 @@ static void gc_recycle_seg_on_zero_valid_pages(
 	struct segment *const seg,
 	const u32             bin)
 {
-	scm_put_free_seg(gc->base.scm, seg, 0);
+	struct sto_capacity_mgr *const scm = gc->base.scm;
+	/* Unlike a segment GC cleaned (whose relocation upcall ends only once
+	 * the frontend is done with it), nothing has told the frontend this
+	 * one is going away: let it delay reuse if it needs to. */
+	if (NULL != scm->defer_free_seg)
+		scm->defer_free_seg(scm->defer_free_arg, seg);
+	else
+		scm_put_free_seg(scm, seg, 0);
 	gc_seg_released(&gc->base, &gc->fifo[bin], 0);
 	os_atomic32_inc(&gc->zero_valid_nr);
 }

@@ -157,3 +157,70 @@ TEST_F(SpdkIOTest, MultiThreadedIO) {
         << "multi-threaded I/O failed — completions likely not polled "
            "on the submitting thread's qpair";
 }
+
+// Regression (PR #3 review, finding 7): every I/O bounced through a fresh
+// DMA buffer, so the zero-copy API still copied on SPDK. DMA memory that
+// covers whole sectors now goes to the device as is.
+TEST_F(SpdkIOTest, DmaBufferIoDoesNotBounce) {
+    const size_t len = 8192;
+    auto w = io_.alloc_buffer(len);
+    auto r = io_.alloc_buffer(len);
+    ASSERT_NE(w.data, nullptr);
+    ASSERT_NE(r.data, nullptr);
+    for (size_t i = 0; i < len; ++i)
+        static_cast<uint8_t*>(w.data)[i] = static_cast<uint8_t>(i * 7);
+    std::memset(r.data, 0, len);
+
+    // Opens this thread's queue pair, so the count below starts from it.
+    ASSERT_EQ(io_.pwrite(w.data, len, 8192).run_sync(),
+              static_cast<ssize_t>(len));
+    const uint64_t before = SpdkIO::thread_bounce_count();
+    ASSERT_EQ(io_.pwrite(w.data, len, 16384).run_sync(),
+              static_cast<ssize_t>(len));
+    ASSERT_EQ(io_.pread(r.data, len, 16384).run_sync(),
+              static_cast<ssize_t>(len));
+    ASSERT_EQ(io_.pwrite_sync(w.data, len, 24576), static_cast<ssize_t>(len));
+    EXPECT_EQ(SpdkIO::thread_bounce_count(), before);
+    EXPECT_EQ(std::memcmp(w.data, r.data, len), 0);
+}
+
+// Memory SPDK cannot translate (an ordinary heap buffer) bounces, and the
+// data still round-trips.
+TEST_F(SpdkIOTest, HeapBufferBounces) {
+    const size_t len = 4096;
+    std::vector<uint8_t> w(len), r(len, 0);
+    for (size_t i = 0; i < len; ++i) w[i] = static_cast<uint8_t>(i * 13 + 1);
+
+    ASSERT_EQ(io_.pwrite(w.data(), len, 32768).run_sync(),
+              static_cast<ssize_t>(len));
+    const uint64_t before = SpdkIO::thread_bounce_count();
+    ASSERT_EQ(io_.pwrite(w.data(), len, 32768).run_sync(),
+              static_cast<ssize_t>(len));
+    ASSERT_EQ(io_.pread(r.data(), len, 32768).run_sync(),
+              static_cast<ssize_t>(len));
+    EXPECT_EQ(SpdkIO::thread_bounce_count(), before + 2);
+    EXPECT_EQ(w, r);
+}
+
+// A DMA buffer that does not cover whole sectors bounces too: the device
+// would otherwise transfer past the bytes asked for.
+TEST_F(SpdkIOTest, PartialSectorIoBounces) {
+    const size_t sector = 512;
+    auto w = io_.alloc_buffer(2 * sector);
+    ASSERT_NE(w.data, nullptr);
+    std::memset(w.data, 0x5A, 2 * sector);
+    ASSERT_EQ(io_.pwrite(w.data, 2 * sector, 40960).run_sync(),
+              static_cast<ssize_t>(2 * sector));
+
+    auto r = io_.alloc_buffer(2 * sector);
+    ASSERT_NE(r.data, nullptr);
+    std::memset(r.data, 0, 2 * sector);
+    const uint64_t before = SpdkIO::thread_bounce_count();
+    // 100 bytes at a non-sector offset: only those may be written to r.
+    ASSERT_EQ(io_.pread(r.data, 100, 40960 + 7).run_sync(), 100);
+    EXPECT_EQ(SpdkIO::thread_bounce_count(), before + 1);
+    for (size_t i = 0; i < 100; ++i)
+        ASSERT_EQ(static_cast<uint8_t*>(r.data)[i], 0x5A) << i;
+    for (size_t i = 100; i < 2 * sector; ++i)
+        ASSERT_EQ(static_cast<uint8_t*>(r.data)[i], 0) << i;
+}

@@ -32,7 +32,10 @@ public:
 	SalsaCtlr();
 	virtual ~SalsaCtlr();
 	virtual int gc_callback(u64 grain_start, u64 grain_nr);
-	virtual void seg_md_callback(u64 grain_start, u64 grain_nr);
+	// alloc_nr is the allocation count this segment was given: unique per
+	// controller, unlike a later get_seg_alloc_nr(), which a concurrent
+	// allocation may already have moved on.
+	virtual void seg_md_callback(u64 grain_start, u64 grain_nr, u64 alloc_nr);
 	int init(Scm *scm, u64 reserved_per_seg, u32 stream_nr = 1, u32 rel_stream_nr = 0, scm_prop_set pset = SCM_PROP_SET_ALL);
 	int shutdown();
 
@@ -51,7 +54,7 @@ public:
 	u8 get_ctlr_id(void) const { return cb_ri_.ri_ctlr_id; }
 	u64 get_seg_alloc_nr() const {return seg_alloc_nr_.load(); }
 	void restore_seg_alloc_nr(u64 nr) { assert(seg_alloc_nr_ < nr); seg_alloc_nr_ = nr; }
-	void inc_seg_alloc_nr() { seg_alloc_nr_.fetch_add(1); }
+	u64 inc_seg_alloc_nr() { return seg_alloc_nr_.fetch_add(1) + 1; }
 private:
 	Scm                  *cb_scm_;
 	scm_prop_set          cb_prop_set_;

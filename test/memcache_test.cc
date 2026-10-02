@@ -170,8 +170,8 @@ protected:
                 ("udepot_memcache_test_" + std::to_string(getpid()));
         StoreConfig config;
         config.path = path_.c_str();
-        config.size = kStoreSize;
-        config.grain_size = 512;
+        config.size = store_size();
+        config.grain_size = grain_size();
         config.initial_tables = 2;
         config.index_bits = 10;
         config.force_destroy = true;
@@ -193,6 +193,9 @@ protected:
         store_.close();
         std::filesystem::remove(path_);
     }
+
+    virtual size_t store_size() const { return kStoreSize; }
+    virtual uint32_t grain_size() const { return 512; }
 
     std::filesystem::path path_;
     UDepot<PosixIO> store_;
@@ -551,4 +554,165 @@ TEST_F(MemcacheTest, MultiGet) {
     EXPECT_TRUE(all.find("VALUE mg1") != std::string::npos);
     EXPECT_TRUE(all.find("VALUE mg2") != std::string::npos);
     EXPECT_TRUE(all.find("VALUE mg3") != std::string::npos);
+}
+
+// Regression: ADD, INCR and APPEND checked or read the key and then wrote
+// it in a separate store call, so concurrent clients could both pass the
+// check (two ADDs both STORED) or overwrite each other (lost increments).
+// The condition is now enforced by the store with the write.
+TEST_F(MemcacheTest, ConcurrentAddStoresOnce) {
+    constexpr int kClients = 8;
+    constexpr int kKeys = 50;
+    std::atomic<int> stored[kKeys] = {};
+    std::vector<std::thread> threads;
+    for (int c = 0; c < kClients; ++c) {
+        threads.emplace_back([&] {
+            McClient client;
+            if (!client.connect(port_)) return;
+            for (int k = 0; k < kKeys; ++k) {
+                std::string cmd = "add once" + std::to_string(k) +
+                                  " 0 0 1\r\nx\r\n";
+                if (!client.send_cmd(cmd)) return;
+                if (client.recv_line() == "STORED") stored[k].fetch_add(1);
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+    int wrong = 0;
+    for (auto& s : stored)
+        if (s.load() != 1) ++wrong;
+    EXPECT_EQ(wrong, 0) << "keys stored by more or fewer than one ADD";
+}
+
+TEST_F(MemcacheTest, ConcurrentIncrLosesNoUpdates) {
+    constexpr int kClients = 8;
+    constexpr int kIncrs = 100;
+    {
+        McClient client;
+        ASSERT_TRUE(client.connect(port_));
+        ASSERT_TRUE(client.send_cmd("set ctr 0 0 1\r\n0\r\n"));
+        ASSERT_EQ(client.recv_line(), "STORED");
+    }
+    std::vector<std::thread> threads;
+    for (int c = 0; c < kClients; ++c) {
+        threads.emplace_back([&] {
+            McClient client;
+            if (!client.connect(port_)) return;
+            for (int i = 0; i < kIncrs; ++i) {
+                if (!client.send_cmd("incr ctr 1\r\n")) return;
+                client.recv_line();
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    McClient client;
+    ASSERT_TRUE(client.connect(port_));
+    ASSERT_TRUE(client.send_cmd("get ctr\r\n"));
+    auto result = client.recv_get_response();
+    ASSERT_TRUE(result.found);
+    EXPECT_EQ(result.data, std::to_string(kClients * kIncrs));
+}
+
+TEST_F(MemcacheTest, ConcurrentAppendLosesNoUpdates) {
+    constexpr int kClients = 8;
+    constexpr int kAppends = 25;
+    {
+        McClient client;
+        ASSERT_TRUE(client.connect(port_));
+        ASSERT_TRUE(client.send_cmd("set log 0 0 0\r\n\r\n"));
+        ASSERT_EQ(client.recv_line(), "STORED");
+    }
+    std::vector<std::thread> threads;
+    for (int c = 0; c < kClients; ++c) {
+        threads.emplace_back([&] {
+            McClient client;
+            if (!client.connect(port_)) return;
+            for (int i = 0; i < kAppends; ++i) {
+                if (!client.send_cmd("append log 0 0 1\r\na\r\n")) return;
+                client.recv_line();
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    McClient client;
+    ASSERT_TRUE(client.connect(port_));
+    ASSERT_TRUE(client.send_cmd("get log\r\n"));
+    auto result = client.recv_get_response();
+    ASSERT_TRUE(result.found);
+    EXPECT_EQ(result.data.size(), size_t{kClients * kAppends});
+}
+
+
+// Regression (PR #3 review, finding 12): reads copied into a fixed buffer
+// but decoded the metadata at the end of the full stored size, past the
+// buffer. INCR used 140 bytes, so a long value's flags came from the heap.
+TEST_F(MemcacheTest, IncrKeepsFlagsOfLongValue) {
+    McClient client;
+    ASSERT_TRUE(client.connect(port_));
+
+    std::string val = "5" + std::string(199, ' ');
+    ASSERT_TRUE(client.send_cmd("set lc 7 0 " + std::to_string(val.size()) +
+                                "\r\n" + val + "\r\n"));
+    EXPECT_EQ(client.recv_line(), "STORED");
+
+    ASSERT_TRUE(client.send_cmd("incr lc 3\r\n"));
+    EXPECT_EQ(client.recv_line(), "8");
+
+    ASSERT_TRUE(client.send_cmd("get lc\r\n"));
+    auto result = client.recv_get_response();
+    EXPECT_TRUE(result.found);
+    EXPECT_EQ(result.data, "8");
+    EXPECT_EQ(result.flags, 7u);
+}
+
+// 4 KiB grains: records up to ~8 MiB, past memcache's 1 MiB limit.
+class MemcacheLargeGrainTest : public MemcacheTest {
+protected:
+    size_t store_size() const override { return 128 * 1024 * 1024 + 4096; }
+    uint32_t grain_size() const override { return 4096; }
+};
+
+// GET used a 1 MiB buffer: a longer stored value was decoded and sent from
+// past its end.
+TEST_F(MemcacheLargeGrainTest, GetReturnsWholeValueLongerThanOneMiB) {
+    std::string data(1536 * 1024, 'L');
+    for (size_t i = 0; i < data.size(); i += 4096) data[i] = 'a' + i % 26;
+    // Stored as the server lays it out: data, expiry (never), flags.
+    std::string stored = data;
+    int64_t expiry = 0;
+    uint32_t flags = 9;
+    stored.append(reinterpret_cast<const char*>(&expiry), sizeof(expiry));
+    stored.append(reinterpret_cast<const char*>(&flags), sizeof(flags));
+    ASSERT_EQ(store_.put("huge", stored).run_sync(), 0);
+
+    McClient client;
+    ASSERT_TRUE(client.connect(port_));
+    ASSERT_TRUE(client.send_cmd("get huge\r\n"));
+    auto result = client.recv_get_response();
+    EXPECT_TRUE(result.found);
+    EXPECT_EQ(result.flags, 9u);
+    EXPECT_TRUE(result.data == data) << "got " << result.data.size()
+                                     << " bytes";
+}
+
+// APPEND has the same limit as SET, so values stay readable.
+TEST_F(MemcacheLargeGrainTest, AppendBeyondMaxValueIsRefused) {
+    McClient client;
+    ASSERT_TRUE(client.connect(port_));
+
+    const size_t max = MemcacheServer<UDepot<PosixIO>>::kMaxValueLen;
+    std::string val(max, 'M');
+    ASSERT_TRUE(client.send_cmd("set full 0 0 " + std::to_string(max) +
+                                "\r\n" + val + "\r\n"));
+    EXPECT_EQ(client.recv_line(), "STORED");
+
+    ASSERT_TRUE(client.send_cmd("append full 0 0 1\r\nx\r\n"));
+    EXPECT_EQ(client.recv_line(), "SERVER_ERROR object too large for cache");
+
+    ASSERT_TRUE(client.send_cmd("get full\r\n"));
+    auto result = client.recv_get_response();
+    EXPECT_TRUE(result.found);
+    EXPECT_TRUE(result.data == val);
 }

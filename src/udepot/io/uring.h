@@ -13,6 +13,7 @@
 
 #include "udepot/buffer.h"
 #include "udepot/coro.h"
+#include "udepot/io/fd_io.h"
 
 namespace udepot {
 
@@ -25,10 +26,16 @@ public:
     UringIO& operator=(const UringIO&) = delete;
 
     int open(const char* path, size_t size);
+    // Completes all I/O already submitted, then tears down. No new I/O may
+    // be submitted once close() has begun (UDepot::close guarantees this).
     void close();
 
     CoroTask<ssize_t> pread(void* buf, size_t count, off_t offset);
     CoroTask<ssize_t> pwrite(const void* buf, size_t count, off_t offset);
+
+    ssize_t pwrite_sync(const void* buf, size_t count, off_t offset) {
+        return pwrite_full_fd(fd_, buf, count, offset);
+    }
 
     size_t get_size() const noexcept { return size_; }
     IoBuffer alloc_buffer(size_t size);

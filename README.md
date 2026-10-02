@@ -128,10 +128,11 @@ uDepot-ng sizes the store from `StoreConfig::size`. On a **regular file** the
 store creates or truncates the file to that size. A **block device cannot be
 truncated**, so set `size` to the device capacity.
 
-**Device size must not be an exact multiple of the segment size.** uDepot puts
-its device metadata in the tail left over after `align_down(device_size,
-segment_size * grain_size)`. A device whose size divides exactly leaves no
-tail, and init fails.
+**The device metadata needs a tail past the last whole segment.** As uDepot,
+uDepot-ng puts it after `align_down(device_size, segment_size * grain_size)`.
+When a new store's size divides exactly, open picks a slightly smaller
+segment size that leaves a tail; reopening an existing store without one
+fails with `EINVAL`.
 
 Note the grain size: with an O_DIRECT backend every write must be a multiple
 of the device sector size, and uDepot-ng sizes its segment metadata writes in
@@ -141,14 +142,14 @@ against buffered IO backend.
 
 ## Notes
 
-- Crash recovery is not yet implemented.
+- A clean `close()` persists the index, and the next open restores it; after
+  a crash, open rebuilds the index from the log.
 
 - Best performance is expected when using the AIO backend with batched
   coroutines for queue-depth scaling.
 
 ## Roadmap
 
-- **Crash recovery** — persist and restore from the uDepot data log
 - **io_uring backend** — kernel-side I/O submission ring
 - **Network backends** — memcache protocol server (TCP/RDMA), NVMe over Fabrics
 - **Python API** — ctypes bindings to `libpyudepot.so`

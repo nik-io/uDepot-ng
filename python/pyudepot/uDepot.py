@@ -51,26 +51,34 @@ class uDepot:
         atexit.register(self._cleanup)
 
     def _cleanup(self):
+        # As uDepot's close: shut down and free the store. The caller must
+        # ensure no call on this object is in progress or follows.
         if self._kv:
             pyclose(self._kv)
             self._kv = None
 
+    def _handle(self):
+        # Calls after close would pass a freed pointer to C.
+        if not self._kv:
+            raise ValueError('uDepot store is closed')
+        return self._kv
+
     def get(self, key, val_out):
-        rc = pyget(self._kv, key, key.size, val_out, val_out.size)
+        rc = pyget(self._handle(), key, key.size, val_out, val_out.size)
         if rc != 0:
             logging.info('pyget returned=%d', rc)
             return False
         return True
 
     def put(self, key, val):
-        rc = pyput(self._kv, key, key.size, val, val.size)
+        rc = pyput(self._handle(), key, key.size, val, val.size)
         if rc != 0:
             logging.info('pyput returned=%d', rc)
             return False
         return True
 
     def delete(self, key):
-        rc = pydel(self._kv, key, key.size)
+        rc = pydel(self._handle(), key, key.size)
         if rc != 0:
             logging.info('pydel returned=%d', rc)
             return False
@@ -78,7 +86,7 @@ class uDepot:
 
     def exists(self, key):
         val_size = c_ulonglong(0)
-        rc = pyexists(self._kv, key, key.size, byref(val_size))
+        rc = pyexists(self._handle(), key, key.size, byref(val_size))
         if rc != 0:
             return None
         return val_size.value

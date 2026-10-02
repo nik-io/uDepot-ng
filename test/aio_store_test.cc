@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -149,4 +150,45 @@ TEST_F(AioStoreTest, ManyKeysRoundTrip) {
                   expected)
             << "i=" << i;
     }
+}
+
+// ── Zero-copy interface ─────────────────────────────────────────────────────
+
+namespace {
+std::span<const uint8_t> zc_bytes(std::string_view s) {
+    return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
+}
+std::string_view zc_text(std::span<const uint8_t> s) {
+    return {reinterpret_cast<const char*>(s.data()), s.size()};
+}
+}  // namespace
+
+TEST_F(AioStoreTest, ZeroCopyRoundTrip) {
+    const std::string val(5000, 'q');
+    auto pb = store_.alloc_put_buffer(4, val.size());
+    ASSERT_TRUE(pb.valid());
+    std::memcpy(pb.value().data(), val.data(), val.size());
+    ASSERT_EQ(store_.put(zc_bytes("zkey"), pb).run_sync(), 0);
+    udepot::GetBuffer gb;
+    ASSERT_EQ(store_.get(zc_bytes("zkey"), &gb).run_sync(), 0);
+    EXPECT_EQ(zc_text(gb.value()), val);
+}
+
+// The key is copied into the record before the put first suspends (here,
+// on the AIO data write), so the caller's key buffer may go away while the
+// put is still in flight.
+TEST_F(AioStoreTest, ZeroCopyPutDoesNotNeedTheKeyAfterStarting) {
+    // An existing key: the put has to read and match it, after suspending.
+    ASSERT_EQ(store_.put("keyabc", "old").run_sync(), 0);
+    auto pb = store_.alloc_put_buffer(6, 3);
+    ASSERT_TRUE(pb.valid());
+    std::memcpy(pb.value().data(), "val", 3);
+    auto key = std::make_unique<std::string>("keyabc");
+    auto op = store_.put(zc_bytes(*key), pb);
+    std::memset(key->data(), 'X', key->size());  // clobbered mid-flight
+    key.reset();
+    ASSERT_EQ(op.run_sync(), 0);
+    udepot::GetBuffer gb;
+    ASSERT_EQ(store_.get(zc_bytes("keyabc"), &gb).run_sync(), 0);
+    EXPECT_EQ(zc_text(gb.value()), "val");
 }

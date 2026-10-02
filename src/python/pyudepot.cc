@@ -37,6 +37,8 @@ void* uDepotOpen(const char* fname, uint64_t size, int force_destroy) {
     return static_cast<void*>(store);
 }
 
+// As uDepot's uDepotClose: shut the store down and free it. The caller
+// must ensure no call on this handle is in progress or follows.
 void uDepotClose(void* kv) {
     if (!kv) return;
     auto* store = static_cast<Store*>(kv);

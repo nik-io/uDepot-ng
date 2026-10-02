@@ -76,6 +76,14 @@ struct sto_capacity_mgr {
 
 	struct scm_dev_properties    scm_dev_props;
 
+	/* Optional (NULL: free at once). Called instead of scm_put_free_seg()
+	 * for a segment GC recycles because its last valid grain was
+	 * invalidated, so the frontend can hold the segment back until no
+	 * reader can still be reading its old contents; it must later call
+	 * scm_put_free_seg(scm, seg, 0). Set before init_threads(). */
+	void (*defer_free_seg)(void *arg, struct segment *seg);
+	void                        *defer_free_arg;
+
 	#define SCM_NSTATS 8
 	os_atomic64_t prop_stats[SCM_DEV_RANGES_MAX][SCM_NSTATS];
 

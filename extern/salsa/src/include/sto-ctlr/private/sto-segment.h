@@ -88,9 +88,12 @@ static inline void segment_reset(
 {
 	seg->is_reloc = 0;
 	seg->stream   = 0;
-	seg->priv  = SALSA_INVALID_PRIVATE_ID;
+	/* priv and state are read without the segment's lock (see their
+	 * accessors below): every access to them is atomic. */
+	__atomic_store_n(&seg->priv, (u8) SALSA_INVALID_PRIVATE_ID,
+			__ATOMIC_RELEASE);
 	seg->ctlr_id  = SALSA_INVALID_CTLR_ID;
-	seg->state    = SEG_INVALID;
+	__atomic_store_n(&seg->state, (u8) SEG_INVALID, __ATOMIC_RELEASE);
 	os_atomic32_set(&seg->valid_nr, page_nr);
 	CDS_INIT_LIST_HEAD(&seg->list);
 	hash_list_init(&seg->hlist);
@@ -117,7 +120,7 @@ static inline void segment_init(
 	seg->queue_id = queue_id;
 	seg->rmap     = NULL;
 	assert(0 == ((uintptr_t) (&seg->valid_nr) & 3));
-	assert(SEG_INVALID == seg->state);
+	assert(SEG_INVALID == __atomic_load_n(&seg->state, __ATOMIC_ACQUIRE));
 }
 
 static inline void segment_set_ctlr(
@@ -212,7 +215,8 @@ __attribute__((pure))
 static inline u32 segment_get_private(
         const struct segment *const seg)
 {
-	return seg->priv;
+	/* A lock-free hint, set by the destage path under a gc queue lock. */
+	return __atomic_load_n(&seg->priv, __ATOMIC_ACQUIRE);
 }
 
 static inline void segment_set_private(
@@ -220,14 +224,15 @@ static inline void segment_set_private(
         const u32        priv)
 {
 	assert(priv <= SALSA_MAX_PRIVATE_ID);
-	seg->priv = priv;
+	__atomic_store_n(&seg->priv, (u8) priv, __ATOMIC_RELEASE);
 }
 
 __attribute__((pure))
 static inline u32 segment_get_state(
 	const struct segment *const seg)
 {
-	return seg->state;
+	/* As priv: read under the segment lock, written under a queue lock. */
+	return __atomic_load_n(&seg->state, __ATOMIC_ACQUIRE);
 }
 
 static inline void segment_set_state(
@@ -235,6 +240,6 @@ static inline void segment_set_state(
 	const enum segment_state state)
 {
 	assert(state < SEG_STATE_LAST);
-	seg->state = state;
+	__atomic_store_n(&seg->state, (u8) state, __ATOMIC_RELEASE);
 }
 #endif	/* _SALSA_STO_SEGMENT_H_ */

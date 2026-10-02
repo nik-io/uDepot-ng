@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "udepot/io/aio.h"
+#include "udepot/tsan.h"
 
 #include <cerrno>
 #include <coroutine>
@@ -88,15 +89,21 @@ struct AioRequest {
 struct AioSubmitAwaitable {
     AioRequest* req;
     aio_context_t ctx;
+    std::atomic<size_t>* pending;
 
     bool await_ready() noexcept { return false; }
 
     bool await_suspend(std::coroutine_handle<> h) noexcept {
         req->handle = h;
         struct iocb* cbs[1] = {&req->cb};
+        // Counted before submitting: the completion can arrive, and be
+        // counted down, before io_submit returns.
+        pending->fetch_add(1, std::memory_order_release);
+        tsan_release_to_kernel(req);
         int rc = sys_io_submit(ctx, 1, cbs);
         if (rc != 1) {
             req->result = (rc < 0) ? -errno : -EIO;
+            pending->fetch_sub(1, std::memory_order_relaxed);
             return false;
         }
         return true;
@@ -176,7 +183,7 @@ CoroTask<ssize_t> AioIO::pread(void* buf, size_t count, off_t offset) {
     req.cb.aio_offset = offset;
     req.cb.aio_data = reinterpret_cast<uint64_t>(&req);
 
-    ssize_t result = co_await AioSubmitAwaitable{&req, ctx_};
+    ssize_t result = co_await AioSubmitAwaitable{&req, ctx_, &pending_};
     co_return result;
 }
 
@@ -191,7 +198,7 @@ CoroTask<ssize_t> AioIO::pwrite(const void* buf, size_t count, off_t offset) {
     req.cb.aio_offset = offset;
     req.cb.aio_data = reinterpret_cast<uint64_t>(&req);
 
-    ssize_t result = co_await AioSubmitAwaitable{&req, ctx_};
+    ssize_t result = co_await AioSubmitAwaitable{&req, ctx_, &pending_};
     co_return result;
 }
 
@@ -204,7 +211,11 @@ void AioIO::poller_loop() {
     static constexpr int kMaxEvents = 8;
     struct io_event events[kMaxEvents];
 
-    while (running_.load(std::memory_order_acquire)) {
+    // After close() clears running_, keep going until every submitted I/O
+    // has completed; returning earlier would leave those coroutines
+    // suspended forever.
+    while (running_.load(std::memory_order_acquire) ||
+           pending_.load(std::memory_order_acquire) > 0) {
         int n = 0;
         if (aio_ring_valid(ctx_))
             n = aio_ring_getevents(ctx_, kMaxEvents, events);
@@ -219,27 +230,13 @@ void AioIO::poller_loop() {
 
         for (int i = 0; i < n; ++i) {
             auto* req = reinterpret_cast<AioRequest*>(events[i].data);
+            tsan_acquire_from_kernel(req);
             if (events[i].res2 != 0) {
                 req->result = -EIO;
             } else {
                 req->result = static_cast<ssize_t>(events[i].res);
             }
-            req->handle.resume();
-        }
-    }
-
-    // Drain remaining events on shutdown.
-    for (;;) {
-        struct timespec timeout = {0, 0};
-        int n = sys_io_getevents(ctx_, 0, kMaxEvents, events, &timeout);
-        if (n <= 0) break;
-        for (int i = 0; i < n; ++i) {
-            auto* req = reinterpret_cast<AioRequest*>(events[i].data);
-            if (events[i].res2 != 0) {
-                req->result = -EIO;
-            } else {
-                req->result = static_cast<ssize_t>(events[i].res);
-            }
+            pending_.fetch_sub(1, std::memory_order_relaxed);
             req->handle.resume();
         }
     }

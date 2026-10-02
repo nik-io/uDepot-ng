@@ -4,9 +4,11 @@
 #pragma once
 
 #include <atomic>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <sys/types.h>
 #include <thread>
@@ -70,7 +72,14 @@ public:
 
     void process_all_admin_completions();
 
+    // Every thread's queue pair, so shutdown() can free them before
+    // detaching their controllers (they otherwise outlive it in TLS).
+    void register_qpair(struct SpdkQpair* qp);
+    void unregister_qpair(struct SpdkQpair* qp);
+
 private:
+    std::mutex qpairs_mu_;
+    std::vector<struct SpdkQpair*> qpairs_;
     std::vector<SpdkController> controllers_;
     std::vector<SpdkNamespace> namespaces_;
     std::vector<NvmefTarget> nvmef_targets_;
@@ -85,9 +94,17 @@ struct SpdkQpair {
     SpdkNamespace* ns = nullptr;
     struct spdk_nvme_qpair* qpair = nullptr;
     size_t npending = 0;
+    // Coroutines whose I/O completed, resumed by the owning thread's poll
+    // after spdk_nvme_qpair_process_completions returns (not from inside
+    // it, which is not re-entrant).
+    std::vector<std::coroutine_handle<>> ready;
+    SpdkGlobalState* gs = nullptr;  // registry this queue pair is in
+    // I/Os copied through a bounce buffer: their buffer could not be handed
+    // to the device as it was (see direct_io_ok in spdk.cc).
+    uint64_t bounced = 0;
 
     SpdkQpair() = default;
-    SpdkQpair(SpdkNamespace* namespace_ptr);
+    SpdkQpair(SpdkNamespace* namespace_ptr, SpdkGlobalState* owner);
     ~SpdkQpair();
 
     SpdkQpair(const SpdkQpair&) = delete;
@@ -114,8 +131,17 @@ struct SpdkQpair {
 // SPDK NVMe I/O backend for uDepot-ng.
 //
 // Matches the IoBackend concept. Uses SPDK's userspace NVMe driver for
-// direct device access. Per-thread queue pairs, DMA buffer bounce for
-// pread/pwrite, and a poller thread for completion processing.
+// direct device access. pread/pwrite hand the caller's buffer to the device
+// when it is DMA memory (alloc_buffer's) covering whole sectors, as uDepot's
+// read_raw_sync/write_raw_sync did; any other buffer bounces through a DMA
+// buffer, as its read_sync/write_sync did.
+//
+// As in uDepot, each thread has its own queue pair and only that thread
+// touches it: an I/O is submitted there, its coroutine suspends, and the
+// thread harvests the completion when it polls (the TRT poller task's job;
+// here run_sync() drives it through set_thread_poll). A coroutine therefore
+// stays on the thread that submitted its I/O. A background thread polls
+// the admin queues for NVMe-oF keep-alives.
 class SpdkIO {
 public:
     SpdkIO() noexcept = default;
@@ -143,8 +169,14 @@ public:
     CoroTask<ssize_t> pread(void* buf, size_t count, off_t offset);
     CoroTask<ssize_t> pwrite(const void* buf, size_t count, off_t offset);
 
+    // Blocking: submits on the calling thread's queue pair and polls it.
+    ssize_t pwrite_sync(const void* buf, size_t count, off_t offset);
+
     size_t get_size() const noexcept { return size_; }
     IoBuffer alloc_buffer(size_t size);
+
+    // I/Os on the calling thread's queue pair that bounced. For tests.
+    static uint64_t thread_bounce_count();
 
 private:
     size_t size_ = 0;
@@ -154,7 +186,8 @@ private:
     static SpdkGlobalState global_state_;
     static std::string namespace_name_;
 
-    SpdkQpair* get_thread_qpair();
+    static SpdkQpair* get_thread_qpair();
+    static bool poll_thread_qpair();
 
     void poller_loop();
 };

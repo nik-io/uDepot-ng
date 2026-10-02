@@ -4,10 +4,12 @@
 #include "udepot/store.h"
 #include "udepot/io/posix.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -245,11 +247,9 @@ TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
     // first put does not necessarily land at grain 0).
     uint64_t hash = store_.hash_key(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>("crc_key"), 7));
-    auto tok = store_.rcu().register_thread();
-    store_.rcu().read_lock(tok);
+    uint32_t rcu_idx = store_.rcu().read_lock();
     udepot::HashEntry entry = store_.directory().lookup(hash);
-    store_.rcu().read_unlock(tok);
-    store_.rcu().unregister_thread(tok);
+    store_.rcu().read_unlock(rcu_idx);
     ASSERT_FALSE(entry.empty());
 
     off_t offset = static_cast<off_t>(entry.pba()) * store_.grain_size();
@@ -368,14 +368,15 @@ TEST_F(StoreTest, ExistsWithTagCollisionFindsCorrectKey) {
 
 // --- CRC table-based vs bit-by-bit equivalence ---
 
-static uint16_t crc16_bitwise(const uint8_t* data, size_t len) {
-    uint16_t crc = 0xFFFF;
+// zlib's crc32(crc, buf, len), bit by bit, independent of the store's table.
+static uint32_t crc32_bitwise(uint32_t crc, const uint8_t* data, size_t len) {
+    crc = ~crc;
     for (size_t i = 0; i < len; ++i) {
-        crc ^= static_cast<uint16_t>(data[i]) << 8;
+        crc ^= data[i];
         for (int j = 0; j < 8; ++j)
-            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
     }
-    return crc;
+    return ~crc;
 }
 
 // --- Upsert (overwrite) ---
@@ -400,8 +401,7 @@ TEST_F(StoreTest, PutOverwriteDoesNotLeaveOldValue) {
     uint64_t hash = store_.hash_key(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>("dup"), 3));
 
-    auto tok = store_.rcu().register_thread();
-    store_.rcu().read_lock(tok);
+    uint32_t rcu_idx = store_.rcu().read_lock();
 
     int count = 0;
     for (uint32_t start = 0; ; ) {
@@ -411,8 +411,7 @@ TEST_F(StoreTest, PutOverwriteDoesNotLeaveOldValue) {
         ++count;
     }
 
-    store_.rcu().read_unlock(tok);
-    store_.rcu().unregister_thread(tok);
+    store_.rcu().read_unlock(rcu_idx);
 
     EXPECT_EQ(count, 1) << "overwrite must not create duplicate entries";
 }
@@ -485,7 +484,9 @@ TEST_F(StoreTest, PutOverwriteExistsReportsNewSize) {
 TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
     // Put a key/value pair; read it back via raw I/O and verify the
     // on-disk CRC matches the reference bitwise implementation.
-    // The CRC covers only the 14-byte header (matching uDepot).
+    // As uDepot's checksum16(timestamp, md): a CRC32 seeded with the
+    // segment timestamp, over the header, then over the device seed,
+    // truncated to 16 bits.
     std::string key = "crc_check_key";
     std::vector<uint8_t> val(256);
     for (size_t i = 0; i < val.size(); ++i)
@@ -499,11 +500,9 @@ TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
 
     // Look up the PBA from the directory.
     uint64_t hash = store_.hash_key(key_span);
-    auto tok = store_.rcu().register_thread();
-    store_.rcu().read_lock(tok);
+    uint32_t rcu_idx = store_.rcu().read_lock();
     udepot::HashEntry entry = store_.directory().lookup(hash);
-    store_.rcu().read_unlock(tok);
-    store_.rcu().unregister_thread(tok);
+    store_.rcu().read_unlock(rcu_idx);
     ASSERT_FALSE(entry.empty());
 
     off_t offset = static_cast<off_t>(entry.pba()) * store_.grain_size();
@@ -519,8 +518,14 @@ TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
                         .run_sync();
     ASSERT_EQ(nread, static_cast<ssize_t>(read_size));
 
-    // Reference CRC over the header only (14 bytes).
-    uint16_t ref_crc = crc16_bitwise(buf.data(), sizeof(udepot::KvHeader));
+    udepot::KvHeader hdr;
+    std::memcpy(&hdr, buf.data(), sizeof(hdr));
+    const uint64_t seed = store_.seed();
+    uint32_t crc = crc32_bitwise(static_cast<uint32_t>(hdr.timestamp),
+                                 buf.data(), sizeof(udepot::KvHeader));
+    crc = crc32_bitwise(crc, reinterpret_cast<const uint8_t*>(&seed),
+                        sizeof(seed));
+    uint16_t ref_crc = static_cast<uint16_t>(crc);
 
     // Read the stored CRC from the suffix.
     size_t suffix_offset = sizeof(udepot::KvHeader) + key.size() + val.size();
@@ -528,5 +533,174 @@ TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
     std::memcpy(&suffix, buf.data() + suffix_offset, sizeof(suffix));
 
     EXPECT_EQ(suffix.crc16, ref_crc)
-        << "On-disk CRC covers only the 14-byte header (matching uDepot)";
+        << "On-disk CRC is uDepot's checksum16 over the header and seed";
+}
+
+TEST_F(StoreTest, PutCreateFailsIfKeyExists) {
+    EXPECT_EQ(store_.put("k", "v1", udepot::PutMode::kCreate).run_sync(), 0);
+    EXPECT_EQ(store_.put("k", "v2", udepot::PutMode::kCreate).run_sync(),
+              -EEXIST);
+    char val[8];
+    size_t n = 0;
+    ASSERT_EQ(store_.get("k", reinterpret_cast<uint8_t*>(val), sizeof(val),
+                         &n).run_sync(), 0);
+    EXPECT_EQ(std::string_view(val, n), "v1");
+}
+
+TEST_F(StoreTest, PutReplaceFailsIfKeyMissing) {
+    EXPECT_EQ(store_.put("k", "v", udepot::PutMode::kReplace).run_sync(),
+              -ENOENT);
+    size_t n = 0;
+    EXPECT_EQ(store_.get("k", nullptr, 0, &n).run_sync(), -ENOENT);
+    ASSERT_EQ(store_.put("k", "v1").run_sync(), 0);
+    EXPECT_EQ(store_.put("k", "v2", udepot::PutMode::kReplace).run_sync(), 0);
+}
+
+TEST_F(StoreTest, VersionChangesOnEveryPut) {
+    uint64_t v1 = udepot::kAnyVersion, v2 = udepot::kAnyVersion;
+    size_t n = 0;
+    ASSERT_EQ(store_.put("k", "a").run_sync(), 0);
+    ASSERT_EQ(store_.get("k", nullptr, 0, &n, &v1).run_sync(), 0);
+    ASSERT_EQ(store_.put("k", "a").run_sync(), 0);
+    ASSERT_EQ(store_.get("k", nullptr, 0, &n, &v2).run_sync(), 0);
+    EXPECT_NE(v1, udepot::kAnyVersion);
+    EXPECT_NE(v1, v2);
+}
+
+TEST_F(StoreTest, PutIfVersionRejectsStaleVersion) {
+    uint64_t v1 = 0, v2 = 0;
+    size_t n = 0;
+    ASSERT_EQ(store_.put("k", "a").run_sync(), 0);
+    ASSERT_EQ(store_.get("k", nullptr, 0, &n, &v1).run_sync(), 0);
+    ASSERT_EQ(store_.put("k", "b", udepot::PutMode::kUpsert, v1).run_sync(), 0);
+    // v1 is gone now; a second writer holding it must lose.
+    EXPECT_EQ(store_.put("k", "c", udepot::PutMode::kUpsert, v1).run_sync(),
+              -ESTALE);
+    char val[8];
+    ASSERT_EQ(store_.get("k", reinterpret_cast<uint8_t*>(val), sizeof(val),
+                         &n, &v2).run_sync(), 0);
+    EXPECT_EQ(std::string_view(val, n), "b");
+    // A version check implies the key must exist.
+    EXPECT_EQ(store_.put("missing", "x", udepot::PutMode::kUpsert, v2)
+                  .run_sync(), -ENOENT);
+}
+
+TEST_F(StoreTest, DelIfVersion) {
+    uint64_t v1 = 0, v2 = 0;
+    size_t n = 0;
+    ASSERT_EQ(store_.put("k", "a").run_sync(), 0);
+    ASSERT_EQ(store_.get("k", nullptr, 0, &n, &v1).run_sync(), 0);
+    ASSERT_EQ(store_.put("k", "b").run_sync(), 0);
+    EXPECT_EQ(store_.del("k", v1).run_sync(), -ESTALE);
+    ASSERT_EQ(store_.get("k", nullptr, 0, &n, &v2).run_sync(), 0);
+    EXPECT_EQ(store_.del("k", v2).run_sync(), 0);
+    EXPECT_EQ(store_.get("k", nullptr, 0, &n).run_sync(), -ENOENT);
+}
+
+// ── Zero-copy interface ─────────────────────────────────────────────────────
+
+namespace {
+std::span<const uint8_t> bytes(std::string_view s) {
+    return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
+}
+std::string_view text(std::span<const uint8_t> s) {
+    return {reinterpret_cast<const char*>(s.data()), s.size()};
+}
+}  // namespace
+
+TEST_F(StoreTest, ZeroCopyPutThenZeroCopyGet) {
+    const std::string val(3000, 'z');
+    auto pb = store_.alloc_put_buffer(5, val.size());
+    ASSERT_TRUE(pb.valid());
+    ASSERT_EQ(pb.value().size(), val.size());
+    std::memcpy(pb.value().data(), val.data(), val.size());
+    ASSERT_EQ(store_.put(bytes("zckey"), pb).run_sync(), 0);
+
+    udepot::GetBuffer gb;
+    uint64_t version = 0;
+    ASSERT_EQ(store_.get(bytes("zckey"), &gb, &version).run_sync(), 0);
+    ASSERT_TRUE(gb.valid());
+    EXPECT_EQ(text(gb.value()), val);
+    EXPECT_NE(version, 0u);
+
+    // The copying interface reads the same record.
+    std::string out(val.size(), '\0');
+    size_t n = 0;
+    ASSERT_EQ(store_.get("zckey", reinterpret_cast<uint8_t*>(out.data()),
+                         out.size(), &n).run_sync(), 0);
+    EXPECT_EQ(out, val);
+}
+
+TEST_F(StoreTest, ZeroCopyGetSeesCopyingPut) {
+    ASSERT_EQ(store_.put("plain", "value").run_sync(), 0);
+    udepot::GetBuffer gb;
+    ASSERT_EQ(store_.get(bytes("plain"), &gb).run_sync(), 0);
+    EXPECT_EQ(text(gb.value()), "value");
+}
+
+// A PutBuffer stays the caller's: it can be refilled and put again, under
+// the same key (overwrite) or another of the same size.
+TEST_F(StoreTest, ZeroCopyPutBufferIsReusable) {
+    auto pb = store_.alloc_put_buffer(4, 8);
+    ASSERT_TRUE(pb.valid());
+    std::memcpy(pb.value().data(), "aaaaaaaa", 8);
+    ASSERT_EQ(store_.put(bytes("key1"), pb).run_sync(), 0);
+    std::memcpy(pb.value().data(), "bbbbbbbb", 8);
+    ASSERT_EQ(store_.put(bytes("key2"), pb).run_sync(), 0);
+    std::memcpy(pb.value().data(), "cccccccc", 8);
+    ASSERT_EQ(store_.put(bytes("key1"), pb).run_sync(), 0);
+
+    udepot::GetBuffer gb;
+    ASSERT_EQ(store_.get(bytes("key1"), &gb).run_sync(), 0);
+    EXPECT_EQ(text(gb.value()), "cccccccc");
+    ASSERT_EQ(store_.get(bytes("key2"), &gb).run_sync(), 0);
+    EXPECT_EQ(text(gb.value()), "bbbbbbbb");
+}
+
+TEST_F(StoreTest, ZeroCopyPutHonoursModes) {
+    auto pb = store_.alloc_put_buffer(3, 1);
+    ASSERT_TRUE(pb.valid());
+    pb.value()[0] = 'x';
+    EXPECT_EQ(store_.put(bytes("abc"), pb, udepot::PutMode::kReplace)
+                  .run_sync(), -ENOENT);
+    EXPECT_EQ(store_.put(bytes("abc"), pb, udepot::PutMode::kCreate)
+                  .run_sync(), 0);
+    EXPECT_EQ(store_.put(bytes("abc"), pb, udepot::PutMode::kCreate)
+                  .run_sync(), -EEXIST);
+}
+
+TEST_F(StoreTest, ZeroCopyErrors) {
+    // Sizes the store cannot hold give no buffer.
+    EXPECT_FALSE(store_.alloc_put_buffer(0, 10).valid());
+    EXPECT_FALSE(store_.alloc_put_buffer(UINT16_MAX + 1, 10).valid());
+    EXPECT_FALSE(store_.alloc_put_buffer(10, 2u << 20).valid());
+
+    // A key of another size than the buffer was made for, or no buffer.
+    auto pb = store_.alloc_put_buffer(4, 4);
+    ASSERT_TRUE(pb.valid());
+    EXPECT_EQ(store_.put(bytes("toolong"), pb).run_sync(), -EINVAL);
+    udepot::PutBuffer empty;
+    EXPECT_EQ(store_.put(bytes("k"), empty).run_sync(), -EINVAL);
+
+    // A missing key leaves the GetBuffer empty, even if it held a value.
+    ASSERT_EQ(store_.put("have", "it").run_sync(), 0);
+    udepot::GetBuffer gb;
+    ASSERT_EQ(store_.get(bytes("have"), &gb).run_sync(), 0);
+    EXPECT_EQ(store_.get(bytes("missing"), &gb).run_sync(), -ENOENT);
+    EXPECT_FALSE(gb.valid());
+    EXPECT_EQ(store_.get(std::span<const uint8_t>{}, &gb).run_sync(), -EINVAL);
+}
+
+// Recovery reads zero-copy records like any other.
+TEST_F(StoreTest, ZeroCopyPutSurvivesReopen) {
+    auto pb = store_.alloc_put_buffer(7, 100);
+    ASSERT_TRUE(pb.valid());
+    std::memset(pb.value().data(), 'r', 100);
+    ASSERT_EQ(store_.put(bytes("durable"), pb).run_sync(), 0);
+    store_.close();
+    config_.force_destroy = false;
+    ASSERT_EQ(store_.open(config_), 0);
+    udepot::GetBuffer gb;
+    ASSERT_EQ(store_.get(bytes("durable"), &gb).run_sync(), 0);
+    EXPECT_EQ(text(gb.value()), std::string(100, 'r'));
 }

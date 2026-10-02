@@ -92,9 +92,9 @@ static void
 seg_md_callback(void *const arg, const u64 grain, const u64 len)
 {
 	SalsaCtlr *const sc = static_cast<SalsaCtlr *>(arg);
-	sc->inc_seg_alloc_nr();
-	DBG("alloc-nr=%lu", sc->get_seg_alloc_nr());
-	return sc->seg_md_callback(grain, len);
+	const u64 alloc_nr = sc->inc_seg_alloc_nr();
+	DBG("alloc-nr=%lu", alloc_nr);
+	return sc->seg_md_callback(grain, len, alloc_nr);
 }
 
 __attribute__((warn_unused_result))
@@ -111,6 +111,10 @@ SalsaCtlr::init(Scm *const scm, const u64 reserved_per_seg,
 		goto fail0;
 	}
 	cb_scm_ = scm;
+	/* A controller may be init'ed again after shutdown() (uDepot-ng reopens
+	 * the same store object): start the allocation count afresh, as a new
+	 * controller would, so recovery's restore_seg_alloc_nr() sets it. */
+	seg_alloc_nr_ = 0;
 
 	cb_prop_set_ = pset;
 	stream_nr_ = std::max(std::min(stream_nr, USALSAPP_MAX_STREAMS), 1U);
@@ -182,7 +186,7 @@ SalsaCtlr::gc_callback(u64 grain_start, u64 grain_nr)
 }
 
 void
-SalsaCtlr::seg_md_callback(u64 grain_start, u64 grain_nr)
+SalsaCtlr::seg_md_callback(u64 grain_start, u64 grain_nr, u64 alloc_nr)
 {
 	assert(0);
 }

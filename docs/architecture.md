@@ -33,83 +33,148 @@ Inherited from uDepot — non-negotiable.
 ### 1. RCU-Protected Hash Directory
 
 The hash directory (mapping from hash prefix to hash table) is protected by a
-hand-rolled, epoch-based userspace RCU with per-thread thread-local state.
+hand-rolled userspace RCU with per-thread counters (the sleepable-RCU
+algorithm).
 
 **Why**: The original uDepot drains all readers before a grow operation can
 proceed (a write lock on a `BRLock` with 128 per-thread RWLocks), stalling the
 entire store. RCU eliminates this: readers never block, and the writer defers
 reclamation of the old directory until a grace period elapses.
 
-**Per-thread RCU state** (one cache line per registered thread):
+**Per-thread slot** (one cache line, written only by the thread that owns it):
 
 ```cpp
-struct alignas(64) RcuThreadState {
-    std::atomic<uint64_t> epoch;  // odd = active, even/0 = quiescent
-    uint32_t nesting;             // concurrent coroutines on same thread
+struct alignas(64) Slot {
+    std::atomic<uint64_t> lock[2];    // sections entered, per index
+    std::atomic<uint64_t> unlock[2];  // sections left, per index
 };
 ```
 
-**Reader path** (zero shared-line atomic RMW):
+**Reader path** (zero shared-line atomic RMW, no shared-line writes):
 
 ```cpp
-void rcu_read_lock() {
-    if (tls_rcu->nesting++ == 0)
-        tls_rcu->epoch.store(global_epoch_.load(std::memory_order_relaxed) | 1,
-                             std::memory_order_release);
+uint32_t read_lock() {
+    Slot& s = this_thread_slot();
+    uint32_t idx = gp_idx_.load(relaxed) & 1;
+    s.lock[idx].store(s.lock[idx].load(relaxed) + 1, relaxed);
+    compiler_barrier();   // full fence where membarrier is unavailable
+    return idx;
 }
 
-void rcu_read_unlock() {
-    if (--tls_rcu->nesting == 0)
-        tls_rcu->epoch.store(0, std::memory_order_release);
+void read_unlock(uint32_t idx) {   // may run on a different thread
+    Slot& s = this_thread_slot();
+    s.unlock[idx].store(s.unlock[idx].load(relaxed) + 1, release);
 }
 ```
 
-Cost: two thread-local stores, one global load (read-shared, rarely written).
+A section is counted in on the thread that enters it and counted out on the
+thread that leaves it. They differ routinely: a coroutine starts on its
+caller's thread and finishes on an I/O backend's poller. Because only the
+sums matter, that is correct by construction, and each bump is a plain load
+and store on the bumping thread's own slot.
 
-**Writer path** (grow):
+**Writer path** (grow, close):
 
 ```cpp
-void synchronize_rcu() {
-    uint64_t target = global_epoch_.fetch_add(2, std::memory_order_acq_rel);
-    for (auto& ts : all_thread_states_) {
-        while (true) {
-            uint64_t e = ts.epoch.load(std::memory_order_acquire);
-            if (e == 0 || e > target) break;  // quiescent or past target
-            // spin/yield
-        }
-    }
+void synchronize() {
+    heavy_barrier();
+    wait_until_drained(other index);   // stragglers from the previous flip
+    flip gp_idx_;
+    heavy_barrier();
+    wait_until_drained(old index);     // sum(unlock) == sum(lock), all slots
+    heavy_barrier();
 }
 ```
+
+**Ordering.** A reader's lock bump must be visible before its protected loads
+(a StoreLoad ordering, which x86 and arm64 both relax). On Linux (x86-64 and
+arm64) `heavy_barrier()` is `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)`,
+which executes a full barrier on every running thread, so readers need only a
+compiler barrier, the trade the Linux kernel's `srcu_read_lock_lite` makes with
+`synchronize_rcu()`. On macOS, and on kernels without membarrier, readers issue
+a full fence instead (`dmb ish` on arm64). `UDEPOT_RCU_READER_FENCE=1` forces
+that path; CTest runs `rcu_test` both ways.
+
+Slots are claimed per thread on first use and released when the thread exits.
+Counts only grow, so a reused slot keeps counting. Beyond 256 concurrent
+threads, the rest share one slot updated with atomic RMW: slower, still
+correct.
 
 **RCU critical section spans the entire KV operation**, including I/O. This is
 correct: the grace period is bounded by the slowest in-flight I/O (milliseconds
-on NVMe), and grows are rare. This means **no separate table refcounting** —
-RCU alone guarantees that no reader references a freed table.
+on NVMe). This means **no separate table refcounting** — RCU alone guarantees
+that no reader references a freed table, and that GC does not reuse a segment
+a reader may still be reading (GC waits a grace period before handing a
+segment back). As in uDepot, the caller orders `close()` after every
+operation: none may race or follow it, so the store keeps no open flag on the
+operation path. The exceptions are waiting for free space (see *Space management*)
+and waiting for a directory grow: an operation leaves its section while it
+waits, so it can never hold up the grace period that GC or the grow needs to
+let it continue.
 
-Nesting handles multiple coroutines on the same thread: the thread goes
-quiescent only when all coroutines have exited their critical sections.
+`Rcu::call(fn)` (call_rcu) runs `fn` after a grace period on a reclaimer
+thread, batching callbacks behind one `synchronize()`; `Rcu::barrier()` waits
+for those queued. The directory frees replaced snapshots this way.
 
 ### 2. Lock-Free Reads, Stripe-Locked Writes
 
-Hash tables use hopscotch hashing with 8-byte `HashEntry` values (fits in one
-atomic load on x86-64).
+Hash tables use hopscotch hashing with 8-byte `HashEntry` values (one atomic
+load): a 5-bit neighborhood offset, an 8-bit tag, an 11-bit size in grains and
+a 40-bit pba. As in uDepot, a slot is **unused** when its pba is all ones, and
+an entry with size 0 is **deleted**: it keeps pointing at the key's tombstone,
+so a later write is still ordered against the delete, and recovery and GC can
+find the tombstone.
 
-**Lock-free get path**: scan the neighborhood bitmap, load candidate entries
-atomically, check tags, go to disk for key confirmation. No locks acquired.
+**Lock-free get path**: scan the bucket's 32-slot neighborhood, load entries
+atomically, check tags, go to disk to confirm the key. No locks acquired.
 
-**Stripe-locked put/del path**: 1024 stripe locks per table. The hopscotch
-displacement chain modifies multiple entries under the stripe lock, with stores
-ordered so that concurrent readers always see a valid state:
+**Stripe-locked put/del path** (uDepot's `uDepotMap`): at most 1024 stripe
+locks per table. A write for a bucket searches for a free slot up to
+`kMaxDisplace = 64` neighborhoods past it and moves entries forward to bring
+that slot into the neighborhood, so it touches at most
+`[bucket - 32, bucket + 32 * 65)`. Stripes are at least that long (the stripe
+count is halved until they are), so a write takes one or two adjacent stripe
+locks, in ascending order — no global lock, no deadlock.
 
-- **Insert**: write entry at target slot (`store(entry, release)`), then set
-  bitmap bit (`store(bitmap, release)`).
-- **Delete**: clear bitmap bit first, then clear entry.
-- **Displace**: copy entry to new slot, set new bitmap bit, clear old bitmap
-  bit. Entry visible in at least one position at all times.
+Entries only ever move to a higher slot, written there before they are
+cleared from the lower one, so a reader scanning upward sees each entry in at
+least one position. The worst case for a concurrent reader is an extra disk
+read for a tag match.
 
-Worst case for a concurrent reader: an unnecessary disk read (false positive
-from stale bitmap) or missing an entry mid-displacement (but it is still
-visible at the old position). Both are safe.
+A put writes its record first and then checks, as the paper (§4.5) and
+uDepot do: the record goes to the log, the key-verify reads run unlocked,
+then the stripe lock is taken, the decision is re-checked against the
+entries verified, and the directory is updated in the same critical section.
+A put that is rejected there (a conditional put, or a lost race) invalidates
+its grains, but its record stays in the log: after a crash the log scan can
+bring it back, which the paper accepts; after a clean shutdown the persisted
+index decides, and it stays dead. As in uDepot's `is_pba_order_equal_to_total_order`, a write only
+replaces an entry (live or deleted) that is older in recovery order — segment
+timestamp, then grain — otherwise it is rewritten, so recovery always
+reproduces the order writes were acknowledged in.
+
+**Directory.** As in uDepot's `hash_to_map`, a key's table is chosen by the
+top bits of its tag and its bucket by the low bits of its hash. `grow()`
+doubles the number of tables. Legacy excluded every operation for the grow
+(`rwpflock.write_enter()` + `write_wait_readers()`); uDepot-ng keeps that for
+writers only, using RCU:
+
+1. Set the snapshot's `frozen` flag. A writer checks it under its stripe
+   lock, inside its read section, and backs off if set.
+2. `synchronize()`: every writer that missed the flag has finished, so its
+   write is in the old tables, and none can start.
+3. Copy live and deleted entries into the new tables, holding no lock.
+4. Publish the new snapshot and wake the writers that backed off; they
+   retry on it.
+5. Free the old snapshot with `Rcu::call()` (call_rcu): once a grace period
+   has passed, on the RCU reclaimer thread, off the grow path.
+
+Readers never block: they keep reading the frozen tables during the copy.
+Grow is rare, so ordinary writes pay only a flag load under their stripe lock.
+Because `grow()` waits for a grace period it never runs inside a read section
+or on an I/O poller thread (which in-flight reads may be waiting on): a
+writer that finds its table full leaves its section and suspends, and the
+store's waker thread runs the grow.
 
 ### 3. Eager-Start C++23 Coroutines
 
@@ -152,10 +217,27 @@ backend pollers. C++23 coroutines replace everything except the pollers.
 
 What remains lives in `io/`:
 
-- **Poller loop** per async backend (aio, uring, spdk): runs on a dedicated
-  thread, harvests completions, resumes the coroutine handles that completed.
+- **Completion polling** per async backend. AIO and io_uring run a poller
+  thread that harvests completions and resumes the coroutines that completed.
+  SPDK follows uDepot's TRT model instead: each thread has its own queue pair
+  (`SpdkQpair`, no shared state), submits and suspends, and its own poll —
+  driven by `run_sync()` through a thread-local hook, the way a TRT scheduler
+  polled between tasks — harvests completions and resumes the coroutines.
+  One thread per `SpdkIO` polls the controllers' admin queues (~10x/s), which
+  keeps NVMe-oF keep-alives flowing.
 - **Awaitable** that bridges I/O completion to coroutine resume.
 - **Buffer allocation** utilities (tagged by backend).
+
+`spdk_env_init` gets the process's cpu affinity as its core mask, as uDepot's
+`spdk_init` did, so the EAL never claims a core outside it (by default it
+takes core 0, which a co-located `nvmf_tgt` reactor may be spinning on — a
+10 ms stall per I/O). The calling thread's affinity is restored afterwards:
+uDepot's TRT pinned the threads it owned, but uDepot-ng runs on its caller's.
+
+Where uDepot's tasks yielded to the TRT scheduler — waiting for salsa to stage
+a segment — uDepot-ng suspends the coroutine on a waiter list and a waker
+thread resumes it to retry (see *Space management*), so a poller thread is
+never blocked.
 
 No scheduler, no task types, no run queues, no futures/waitsets, no
 page-fault rollback, no cross-core task migration.
@@ -228,14 +310,22 @@ struct IoBuffer {
 };
 ```
 
-Zero-copy works the same way:
-- **put**: caller passes their buffer → backend writes from it directly.
-- **get**: caller passes a pre-allocated buffer → backend reads into it.
-- **SPDK path**: `store.alloc_buffer()` returns a DMA-safe buffer.
+Zero copy is uDepot's Mbuff interface, with the record laid out in one
+contiguous buffer instead of a chain of nodes:
 
-For the memcache server, SET receives the value into an `IoBuffer` from the
-storage backend's allocator and writes it directly; GET reads into an
-`IoBuffer` and sends it over the network. No linked list needed.
+- **put**: `alloc_put_buffer(key_size, val_size)` returns a `PutBuffer`
+  shaped like the on-disk record. The caller writes the value into
+  `value()`, and `put(key, PutBuffer&)` fills in the header, key and checksum
+  around it and writes the buffer as is. On SPDK the buffer is DMA memory.
+- **get**: `get(key, GetBuffer*)` hands over the buffer the record was read
+  into; `value()` views the value inside it.
+- The span-based `put`/`get` copy the value into, or out of, such a record
+  buffer. Both interfaces run the same coroutine (`put_record` and
+  `get_record`), so they differ only in that copy. `scripts/perf-zerocopy.sh`
+  gates on it: zero copy must not be slower, on any backend.
+
+The memcache server and the Python and JNI bindings still use the copying
+interface.
 
 ### 8. Network Backend and Memcache Server
 
@@ -249,6 +339,41 @@ Remote access for flywheel is planned — the memcache protocol provides a
 ready-made wire format, and the zero-copy path through the protocol handler
 (recv into storage-compatible buffer, send from storage buffer) preserves the
 no-copy property end to end.
+
+### 9. Space Management (unchanged from uDepot)
+
+Grains come from salsa, configured as uDepot's non-memcache store: relocating
+GC (`init_local(14, 2, 4)`), 20% overprovisioning, one user and one relocation
+stream.
+
+- **Release.** Every allocation is released once its write is committed or
+  invalidated; salsa seals a segment, making it a GC candidate, only when all
+  its grains are released.
+- **Segment metadata** is written in salsa's allocation callback, before any
+  grain of the segment is handed out (uDepot's `persist_seg_md`). The
+  callback can run on any thread, including an I/O poller, so it uses the
+  backend's blocking `pwrite_sync`.
+- **Waiting for space.** Allocation never blocks: when no segment is staged
+  it returns `EAGAIN`, and the operation waits as described in §4, outside its
+  read-side section.
+- **GC** reads the victim segment in one pass (uDepot maps it), relocates every
+  record the directory still points at, and waits a grace period before the
+  segment is reused.
+  - **A relocated record goes to a segment newer than its victim.** Recovery
+    orders a key's records by segment timestamp, and every older copy of the
+    key is older than the victim's. The relocation segment stays open while
+    the data stream moves on, so it can be older than the victim; GC then
+    closes it and takes a fresh, newest one. uDepot does not check this.
+  - **A tombstone is dropped only when no segment older than the victim may
+    still hold records on disk** — otherwise an older copy of its key could
+    resurface on recovery — and is relocated like any record until then. A
+    segment GC has reclaimed still counts until it is reused: its metadata
+    and old records stay on disk, and recovery replays them. uDepot drops
+    tombstones unconditionally.
+- **Recovery** reads each segment with valid metadata in one pass and replays
+  its records; for each key the newest in recovery order (segment timestamp,
+  then grain) wins, tombstones included. Grains holding no valid record are
+  invalidated.
 
 ## Directory Layout
 
@@ -264,7 +389,7 @@ uDepot-ng/
 │   ├── hash_table.h             # hopscotch table (lock-free reads)
 │   ├── hash_table.cc
 │   ├── hash_entry.h             # 8-byte packed hash entry
-│   ├── rcu.h                    # per-thread epoch-based userspace RCU
+│   ├── rcu.h                    # per-thread-counter userspace RCU
 │   ├── rcu.cc
 │   ├── buffer.h                 # IoBuffer, allocator tags
 │   ├── coro.h                   # CoroTask (eager start, symmetric transfer)
@@ -358,15 +483,86 @@ future) is planned as a follow-up once the async backends are working.
 
 ## On-Disk Format
 
-The on-disk format (segment layout, directory table layout, salsa metadata)
-is **unchanged** from uDepot. A uDepot-ng store can read a uDepot store and
-vice versa — the rewrite changes the in-memory concurrency model and runtime,
-not the persistent format.
+The intent is uDepot's format (segment layout, directory table layout, salsa
+metadata; see `docs/udepot-paper.md`, §4.4), so a uDepot-ng store and a uDepot
+store can read each other. **Known divergences:**
+
+- The KV record header carries an 8-byte timestamp (`KvHeader`). uDepot's
+  header is 6 bytes (key size, value size); it orders a record by its
+  segment's timestamp, which the record's checksum is bound to.
+- Index segment headers and footers extend uDepot's `dirmap_hdr` /
+  `dirmap_ftr` (below) with the table's size and its part number. uDepot
+  sized every table to fill its segment, so it needed neither.
+
+### Record identity
+
+As uDepot's `checksum16(timestamp, md)`, a record's 2-byte checksum is a
+CRC32 seeded with its segment's timestamp, over the header, then over the
+device seed, truncated to 16 bits. Recovery and GC accept a record only if
+its header carries its segment's timestamp and the checksum matches. A store
+created over an earlier one (`force_destroy`) restarts its timestamps from
+the same values on the same segments; without the seed in the checksum, a
+crash brought back the earlier store's records left past what the new one
+had written. Each new store therefore needs its own seed: uDepot took the
+monotonic clock's seconds, which repeat for two stores created within a
+second or across reboots, so uDepot-ng draws it from `std::random_device`
+mixed with the real-time clock.
+
+Each segment's timestamp is the allocation count salsa gave that segment,
+passed to the metadata callback, so two streams staging segments at once
+get different ones (reading the counter in the callback after both had
+bumped it gave them the same, and recovery could not order their records).
+
+### Device geometry
+
+As uDepot: the device is divided into segments of `segment_size` grains; the
+last grain(s) of every segment hold salsa's per-segment metadata, and the
+device metadata lives in the tail past the last whole segment. There must be
+such a tail (uDepot's `check_dev_size`): a fresh store whose size is an exact
+multiple of the segment size gets the smaller segment size that leaves one
+and wastes least, and a restored store without one fails to open. Without
+the check, the device metadata sat inside the last segment, so filling the
+device overwrote it and the next open started an empty store.
+
+### Index segments (paper §4.4)
+
+`close()` flushes the directory to index segments, and an open after a clean
+shutdown restores it instead of scanning the log. After a crash the log scan
+decides, as the paper says: *"the persistent source of truth is the log"*.
+
+- **Allocation.** As uDepot's `uDepotDirectoryMap`, the index has a salsa
+  controller of its own (`IndexCtlr`). A net-segment allocation fills exactly
+  one segment, and its segment metadata carry the index controller's type,
+  so the log scan skips index segments. uDepot keeps its tables mmap'd on
+  index segments for the store's whole life; uDepot-ng's tables live in
+  memory (SPDK has no mmap) and are written with explicit writes at
+  `close()`, while GC still runs to free the segments they need. If they
+  cannot be written, the next open scans the log.
+- **Layout**, one table (or one part of a table larger than a segment) per
+  index segment, as uDepot lays out a directory segment:
+  `[IndexHdr 512 B | slots, 8 B each | ... | IndexFtr 512 B]`, the footer at
+  the end of the net segment. Slots are `HashEntry`'s raw 64 bits, which use
+  uDepot's bitfield layout.
+- **Ordering.** Every table is written before any footer, and a footer
+  carries a checksum bound to the device seed and the flush's timestamp,
+  which is newer than any index seen on the device. An index is complete
+  when, for its timestamp, every (table, part) has a valid footer; only the
+  newest index is considered.
+- **Restore.** Load the tables; rebuild salsa's per-segment valid counts from
+  the entries, as uDepot's `restore()` does: a live entry holds `kv_size`
+  grains, a deleted one its tombstone's, read from the tombstone's header.
+  Index segments are not restored, so salsa sees them as free.
+- **Invalidation.** Every valid footer found at open is cleared before
+  anything is written, restored or not, as uDepot's `invalidate_ftr()`:
+  otherwise a crash later in the session could restore an index older than
+  the log.
+- Not yet: the paper also flushes periodically, to shorten recovery after a
+  crash.
 
 ## Implementation Order
 
 1. **`coro.h`** — CoroTask with eager start, `run_sync()`.
-2. **`rcu.h`** — per-thread epoch-based RCU.
+2. **`rcu.h`** — per-thread-counter RCU.
 3. **`buffer.h`** — IoBuffer with allocator tags.
 4. **`io/posix.h`** — synchronous pread/pwrite backend.
 5. **`hash_entry.h`, `hash_table.h`** — hopscotch table with lock-free

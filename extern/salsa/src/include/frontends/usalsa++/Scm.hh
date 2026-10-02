@@ -81,6 +81,11 @@ public:
 	int exit_threads();
 
 	sto_capacity_mgr * scm_get (void) const { return scm_;}
+	// See sto_capacity_mgr::defer_free_seg. Set before init_threads();
+	// a deferred segment is handed back with put_free_seg().
+	void set_defer_free_seg(void (*fn)(void *arg, struct segment *seg),
+	                        void *arg);
+	void put_free_seg(struct segment *seg);
 	u64 get_size(void) const;
 	u64 get_seg_size(void) const;
 	u64 get_grain_size(void) const;

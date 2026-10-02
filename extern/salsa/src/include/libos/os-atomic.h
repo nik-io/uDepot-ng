@@ -22,17 +22,28 @@ typedef volatile s64			os_atomic64_t;
 
 #define os_atomic32_add(_IADDRP, _COUNT)	__sync_add_and_fetch(_IADDRP, _COUNT)
 #define os_atomic32_sub(_IADDRP, _COUNT) 	__sync_sub_and_fetch(_IADDRP, _COUNT)
-#define os_atomic32_set(_IADDRP, _COUNT)	(*((volatile s32 *) (_IADDRP)) = _COUNT)
+/*
+ * Plain volatile accesses are not atomic in the C/C++ memory model: x86's
+ * TSO hides that, but on ARM they are unordered, so a flag set after some
+ * writes (or read before some reads) carries no ordering at all. Acquire
+ * loads and release stores give every flag here the ordering x86 provides
+ * for free -- and compile to the same plain moves there.
+ */
+#define os_atomic32_set(_IADDRP, _COUNT)	\
+	__atomic_store_n((volatile s32 *) (_IADDRP), (s32) (_COUNT), __ATOMIC_RELEASE)
 #define os_atomic32_zero(_IADDRP)		os_atomic32_set(_IADDRP, 0U)
-#define os_atomic32_read(_IADDRP)		(*((volatile s32 *) (_IADDRP)))
+#define os_atomic32_read(_IADDRP)		\
+	__atomic_load_n((volatile s32 *) (_IADDRP), __ATOMIC_ACQUIRE)
 #define os_atomic32_inc(_IADDRP)		__sync_add_and_fetch(_IADDRP, 1U)
 #define os_atomic32_dec(_IADDRP)		__sync_sub_and_fetch(_IADDRP, 1U)
 
 #define os_atomic64_add(_IADDRP, _COUNT)	__sync_add_and_fetch(_IADDRP, _COUNT)
 #define os_atomic64_sub(_IADDRP, _COUNT) 	__sync_sub_and_fetch(_IADDRP, _COUNT)
-#define os_atomic64_set(_IADDRP, _COUNT)	(*((volatile s64 *) (_IADDRP)) = _COUNT)
+#define os_atomic64_set(_IADDRP, _COUNT)	\
+	__atomic_store_n((volatile s64 *) (_IADDRP), (s64) (_COUNT), __ATOMIC_RELEASE)
 #define os_atomic64_zero(_IADDRP)		os_atomic64_set(_IADDRP, 0U)
-#define os_atomic64_read(_IADDRP)		(*((volatile s64 *) (_IADDRP)))
+#define os_atomic64_read(_IADDRP)		\
+	__atomic_load_n((volatile s64 *) (_IADDRP), __ATOMIC_ACQUIRE)
 #define os_atomic64_inc(_IADDRP)		__sync_add_and_fetch(_IADDRP, 1U)
 #define os_atomic64_dec(_IADDRP)		__sync_sub_and_fetch(_IADDRP, 1U)
 

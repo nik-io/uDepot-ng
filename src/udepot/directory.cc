@@ -3,87 +3,134 @@
 
 #include "udepot/directory.h"
 
-#include <cassert>
+#include <bit>
+#include <cerrno>
+#include <thread>
 
 namespace udepot {
 
-Directory::Directory(Rcu& rcu, uint32_t initial_tables,
-                     uint32_t index_bits)
+namespace {
+
+uint32_t table_bits_for(uint32_t tables) {
+    uint32_t bits = 0;
+    while ((1u << bits) < tables && bits < DirSnapshot::kMaxTableBits) ++bits;
+    return bits;
+}
+
+}  // namespace
+
+Directory::Directory(Rcu& rcu, uint32_t initial_tables, uint32_t index_bits)
     : rcu_(rcu),
       index_bits_(index_bits),
-      current_(new DirSnapshot(initial_tables, index_bits)) {}
+      current_(new DirSnapshot(table_bits_for(initial_tables), index_bits,
+                               0)) {}
 
-Directory::~Directory() { delete current_.load(std::memory_order_relaxed); }
+Directory::~Directory() {
+    // Snapshots retired by grow() are freed by RCU callbacks.
+    rcu_.barrier();
+    delete current_.load(std::memory_order_relaxed);
+}
 
-HashEntry Directory::lookup(uint64_t hash, uint32_t start_offset) const noexcept {
+HashEntry Directory::lookup(uint64_t hash, uint32_t start_offset,
+                            bool include_deleted) const noexcept {
     DirSnapshot* snap = current_.load(std::memory_order_acquire);
-    return snap->table_for_hash(hash).lookup(hash, start_offset);
+    return snap->table_for_hash(hash).lookup(hash, start_offset,
+                                             include_deleted);
+}
+
+Directory::Locked Directory::lock_for(uint64_t hash) {
+    DirSnapshot* snap = current_.load(std::memory_order_acquire);
+    HashTable& table = snap->table_for_hash(hash);
+    auto lock = table.lock_for(hash);
+    // Checked inside the caller's read section: a writer that sees false
+    // here is one grow()'s synchronize() waits for, so its write is in the
+    // tables before they are copied.
+    if (snap->frozen.load(std::memory_order_acquire))
+        return Locked{nullptr, snap, {}};
+    return Locked{&table, snap, std::move(lock)};
+}
+
+void Directory::wait_for_grow(uint64_t generation) {
+    std::unique_lock<std::mutex> lock(grown_mu_);
+    grown_cv_.wait(lock, [&] {
+        // A snapshot is freed once replaced; read it inside a section.
+        Rcu::ReadGuard guard(rcu_);
+        return current_.load(std::memory_order_acquire)->generation !=
+               generation;
+    });
 }
 
 int Directory::insert(uint64_t hash, uint16_t kv_size, uint64_t pba) {
-    DirSnapshot* snap = current_.load(std::memory_order_acquire);
-    return snap->table_for_hash(hash).insert(hash, kv_size, pba);
+    auto locked = lock_for(hash);
+    assert(!locked.frozen());
+    return locked.table->insert_locked(hash, kv_size, pba) == 0 ? 0 : -ENOSPC;
 }
 
 bool Directory::update(uint64_t hash, uint64_t old_pba,
                        uint16_t new_kv_size, uint64_t new_pba) {
-    DirSnapshot* snap = current_.load(std::memory_order_acquire);
-    return snap->table_for_hash(hash).update(hash, old_pba,
-                                              new_kv_size, new_pba);
+    auto locked = lock_for(hash);
+    assert(!locked.frozen());
+    return locked.table->update_locked(hash, old_pba, new_kv_size, new_pba);
 }
 
 bool Directory::remove(uint64_t hash, uint64_t pba) {
-    DirSnapshot* snap = current_.load(std::memory_order_acquire);
-    return snap->table_for_hash(hash).remove(hash, pba);
+    auto locked = lock_for(hash);
+    assert(!locked.frozen());
+    return locked.table->remove_locked(hash, pba);
 }
 
-int Directory::grow() {
+int Directory::grow(uint64_t seen) {
     std::lock_guard<std::mutex> lock(grow_mutex_);
 
+    // Only grow() replaces current_, and it holds grow_mutex_: the snapshot
+    // cannot be freed under us.
     DirSnapshot* old_snap = current_.load(std::memory_order_acquire);
-    uint32_t old_count = old_snap->size();
-    uint32_t new_count = old_count * 2;
+    if (seen != kAnyGeneration && seen != old_snap->generation)
+        return 0;  // someone else grew it
+    if (old_snap->table_bits >= DirSnapshot::kMaxTableBits) return -ENOSPC;
 
-    auto* new_snap = new DirSnapshot(new_count, index_bits_);
+    // Allocated before freezing: writers stall only for the copy.
+    auto* new_snap = new DirSnapshot(old_snap->table_bits + 1, index_bits_,
+                                     old_snap->generation + 1);
 
-    // Rehash: for each entry in each old table, insert into the
-    // appropriate new table. We walk the raw slots.
-    for (uint32_t t = 0; t < old_count; ++t) {
-        HashTable& old_table = *old_snap->tables[t];
+    // As uDepot's rwpflock write_enter + write_wait_readers, for writers
+    // only: new writers see the flag and back off, and the grace period
+    // waits out every one that did not. Readers carry on.
+    old_snap->frozen.store(true, std::memory_order_seq_cst);
+    rcu_.synchronize();
 
-        for (uint64_t s = 0; s < old_table.total_slots(); ++s) {
-            HashEntry entry = old_table.load_slot(s);
+    // Nothing writes the old tables now; the new ones are unpublished.
+    for (auto& old_table : old_snap->tables) {
+        for (uint64_t s = 0; s < old_table->total_slots(); ++s) {
+            HashEntry entry = old_table->load_slot(s);
             if (entry.empty()) continue;
-
-            // Reconstruct the hash from the entry's position and tag.
+            // An entry holds its tag and home bucket: enough for both the
+            // new table index (tag bits) and the bucket.
             uint64_t home_bucket = s - entry.bucket_offset();
             uint64_t hash = (static_cast<uint64_t>(entry.key_tag()) << 56) |
                             home_bucket;
-
-            // The old table index was: hash % old_count == t
-            // The new table index is: hash % new_count
-            // This is either t or t + old_count.
-            int rc = new_snap->table_for_hash(hash).insert(
+            // Splitting a table halves its load, so the copy always fits.
+            int rc = new_snap->table_for_hash(hash).insert_locked(
                 hash, entry.kv_size(), entry.pba());
-            if (rc != 0) {
-                delete new_snap;
-                return -1;
-            }
+            assert(rc == 0);
+            (void)rc;
         }
     }
 
-    // Publish the new directory. Readers in progress still see old_snap
-    // via their loaded pointer — RCU guarantees it remains valid.
     current_.store(new_snap, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> g(grown_mu_);
+    }
+    grown_cv_.notify_all();
 
-    // Wait for all pre-existing readers to finish, then reclaim.
-    rcu_.synchronize();
-    delete old_snap;
-
+    // Readers may still be in the old snapshot: free it after a grace
+    // period, off this path (call_rcu).
+    rcu_.call([old_snap] { delete old_snap; });
     return 0;
 }
 
 uint32_t Directory::num_tables() const noexcept {
+    Rcu::ReadGuard guard(rcu_);
     return current_.load(std::memory_order_acquire)->size();
 }
 

@@ -40,6 +40,16 @@
    it unless there is an explicit, agreed-upon reason to diverge. When unsure
    whether a choice is covered by the rewrite plan or is a new divergence,
    **ask before implementing.**
+10. **The uDepot paper is the design reference — read `docs/udepot-paper.md`
+    before any design-level change** (index, resize, persistence/recovery, GC,
+    put/del ordering, zero copy, Memcache). It summarises and quotes the FAST '19
+    paper. Where the paper and legacy uDepot's code disagree, **follow the
+    paper, or ask**; where both are silent, legacy is the reference. Notable
+    consequences already decided: empty values are valid (tombstones need their
+    own encoding); the index is flushed to index segments and restored on a
+    clean start, with the log scan only after a crash; resize is incremental
+    per lock region with a shadow directory; PUT writes before it checks, and
+    Memcache paths may carry weaker durability than the store.
 
 ## Project Overview
 
@@ -48,7 +58,8 @@ ground-up rewrite of [uDepot](https://www.usenix.org/system/files/fast19-kourtis
 with a modernized concurrency model (userspace RCU, lock-free reads, C++23
 coroutines) and a simplified runtime (no separate TRT scheduler).
 
-See `docs/architecture.md` for the full design.
+See `docs/architecture.md` for the full design, and `docs/udepot-paper.md`
+for the paper it implements.
 
 ## Design Principles
 
@@ -58,7 +69,7 @@ These are foundational constraints. Every change must preserve them.
    DMA buffers (`rte_malloc`) only at the SPDK boundary where hardware
    requires them.
 2. **No global locking**: The directory uses userspace RCU (per-thread
-   epoch, zero shared-line atomic RMW on the read path). Hash tables use
+   counters, zero shared-line atomic RMW on the read path). Hash tables use
    lock-free reads and 1024 stripe locks for writes.
 3. **Minimal amplification**: No indirection layers, journaling, or metadata
    overhead beyond what the log-structured allocator needs.
@@ -91,7 +102,10 @@ Claude**. Claude is a co-author, not the author.
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# With SPDK
+# With SPDK. Build SPDK for a portable CPU target: its default,
+# -march=native, produces binaries that refuse to start ("unsupported cpu
+# type") when the container lands on a host without the same CPU features.
+(cd extern/spdk && ./configure --target-arch=x86-64-v2 ... && make)
 cmake -B build -DUDEPOT_BUILD_SPDK=ON
 cmake --build build
 
@@ -108,6 +122,40 @@ ctest --test-dir build
 - A failing test must fail the build — never silently exit 0
 - SPDK tests require `UDEPOT_BUILD_SPDK=ON` and a configured SPDK environment
 - Non-SPDK tests must always pass
+
+### CI
+
+`.github/workflows/ci.yml` runs on every push to main and every PR:
+
+- **unit tests**, Debug and Release. Debug keeps asserts, salsa's included;
+  the first Debug run found two recovery bugs that every Release run had
+  compiled out. JNI and Python included. The job fails if a backend or
+  binding test was not built: a missing liburing silently disables io_uring
+  in CMake, which would otherwise pass with less coverage.
+- **ThreadSanitizer**, the same tests minus the bindings, failing on any
+  report. Debug with `-O1`, so asserts stay on. It has the same "every test
+  built" check (`scripts/ci-check-tests-built.sh`).
+- **SPDK backend**, `scripts/spdk-nvmef-test.sh` against a loopback NVMe-oF
+  software target, as uDepot's CI does. SPDK is built with
+  `--target-arch=x86-64-v2` and its tree cached per submodule revision.
+- **zero-copy perf invariant**, below.
+
+### Zero-copy perf invariant
+
+As in uDepot: `scripts/perf-zerocopy.sh <posix|aio|uring>` (or
+`cmake --build build --target run_perf_test` for all of them) runs
+`udepot_ng_bench` with the copying and the zero-copy put/get, interleaved,
+on a `/dev/shm` store. It fails if zero copy's median is more than 5%
+slower than copy's on PUT or GET. The two runs differ only in the value
+copies zero copy avoids. It compares one operation done two ways, inside
+one run, so there is no stored baseline to drift.
+
+Values are 32 KiB: at 1 KiB a copy is ~2% of a put, and a zero-copy path
+that copied twice still passed. Even at 32 KiB, one stray extra copy is
+about 5% of a put, at the edge of the tolerance: in a mutation test it
+failed the gate on io_uring and passed it on posix and AIO. The gate
+catches a zero-copy path that does clearly more work than the copying one,
+not every lost copy.
 
 ### Performance regression gate
 
@@ -130,19 +178,19 @@ must be built at `BUILD_TYPE=PERFORMANCE` (`-O3 -DNDEBUG`) to match uDepot-ng's
 cmake Release build; `perf-regression.sh` does this automatically.
 
 The speed gap is genuine, not a benchmark artifact. With both at -O3, uDepot-ng
-is 2-7x faster. The overhead sources in legacy, per strace:
+is 2-5x faster at 5000 ops, varying by host: PUT +127-182%, GET +174-227%,
+EXISTS +345-408%, DEL +125-303% on the two cloud hosts measured. Each phase
+lasts only a few milliseconds, so single runs swing by ~15%; compare medians
+across runs, never two builds' runs on different hosts.
+The overhead sources in legacy, per strace:
 
 - **PUT**: Mbuff allocation + copy per operation, pwritev (scatter-gather) vs
   pwrite64 (flat buffer), TRT coroutine scheduling overhead, virtual dispatch
-  through `uDepotIO_`. I/O counts are identical (one pread for lookup-before-write
+  through `uDepotIO_`. I/O counts are identical (one key-verify pread
   + one pwrite for data, on both sides).
 - **GET/EXISTS**: Same I/O count (one pread each). Legacy takes a per-bucket
   mutex on every read — the architectural change RCU eliminates. Plus
   Mbuff/TRT/vtable overhead.
-- **DEL**: All of the above, plus legacy writes a tombstone to disk for every
-  delete (500 extra pwritev per 500 DEL ops). uDepot-ng removes the directory
-  entry and invalidates grains without a disk write. Tombstones serve crash
-  recovery (so `restore()` knows a key was deleted); uDepot-ng has no restore
-  path yet, so omitting them is consistent with the "enterprise-grade crash
-  recovery only" principle. When restore is added, DEL will need tombstones and
-  the DEL speedup will narrow.
+- **DEL**: Same I/O on both sides: a key-verify pread and a tombstone write
+  per delete (crash recovery needs the tombstone to know the key was
+  deleted). The gap is the same per-operation overhead as PUT.

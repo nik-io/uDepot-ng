@@ -212,73 +212,78 @@ static CoroTask<int> handle_store(
 
     int rc = -1;
 
+    // The condition each command puts on the key is checked by the store in
+    // the same critical section as the write, so concurrent clients cannot
+    // both pass it.
     if (req == ReqType::kSet) {
         rc = co_await store.put(key_span, val_span);
     } else if (req == ReqType::kAdd) {
-        // ADD: store only if key does NOT exist.
-        size_t existing_size = 0;
-        int exists_rc = co_await store.exists(key_span, &existing_size);
-        if (exists_rc == 0) {
-            if (!noreply) co_await conn.send_full(
-                kNotStored.data(), kNotStored.size(), kSendFlags);
-            co_return 0;
-        }
-        rc = co_await store.put(key_span, val_span);
+        rc = co_await store.put(key_span, val_span, PutMode::kCreate);
     } else if (req == ReqType::kReplace) {
-        // REPLACE: store only if key DOES exist.
-        size_t existing_size = 0;
-        int exists_rc = co_await store.exists(key_span, &existing_size);
-        if (exists_rc != 0) {
-            if (!noreply) co_await conn.send_full(
-                kNotStored.data(), kNotStored.size(), kSendFlags);
-            co_return 0;
-        }
-        rc = co_await store.put(key_span, val_span);
+        rc = co_await store.put(key_span, val_span, PutMode::kReplace);
     } else if (req == ReqType::kAppend || req == ReqType::kPrepend) {
-        // APPEND/PREPEND: get existing value, merge, put back.
-        std::vector<uint8_t> existing(kMetaSize + 1024 * 1024);
-        size_t existing_size = 0;
-        int get_rc = co_await store.get(key_span, existing.data(),
-                                        existing.size(), &existing_size);
-        if (get_rc != 0) {
-            if (!noreply) co_await conn.send_full(
-                kNotStored.data(), kNotStored.size(), 0);
-            co_return 0;
-        }
+        // Read-modify-write: replace only the version that was read, and
+        // start over if another client changed it in between.
+        for (;;) {
+            // The whole stored value, however long: its metadata is at
+            // the end, where a copy into a fixed buffer would cut it off.
+            GetBuffer got;
+            uint64_t version = kAnyVersion;
+            int get_rc = co_await store.get(key_span, &got, &version);
+            if (get_rc != 0) {
+                if (!noreply) co_await conn.send_full(
+                    kNotStored.data(), kNotStored.size(), 0);
+                co_return 0;
+            }
 
-        // Extract existing metadata.
-        if (existing_size < kMetaSize) {
-            if (!noreply) co_await conn.send_full(
-                kServerError.data(), kServerError.size(), 0);
-            co_return 0;
-        }
-        int64_t old_expiry;
-        uint32_t old_flags;
-        decode_metadata(existing.data(), existing_size, old_expiry, old_flags);
-        size_t old_data_len = existing_size - kMetaSize;
+            const uint8_t* existing = got.value().data();
+            const size_t existing_size = got.value().size();
+            // Extract existing metadata.
+            if (existing_size < kMetaSize) {
+                if (!noreply) co_await conn.send_full(
+                    kServerError.data(), kServerError.size(), 0);
+                co_return 0;
+            }
+            int64_t old_expiry;
+            uint32_t old_flags;
+            decode_metadata(existing, existing_size, old_expiry, old_flags);
+            size_t old_data_len = existing_size - kMetaSize;
+            if (old_data_len + value_len >
+                MemcacheServer<Store>::kMaxValueLen) {
+                rc = -E2BIG;  // as a set of that size would be refused
+                break;
+            }
 
-        // Build merged value.
-        std::vector<uint8_t> merged(old_data_len + value_len + kMetaSize);
-        if (req == ReqType::kAppend) {
-            std::memcpy(merged.data(), existing.data(), old_data_len);
-            std::memcpy(merged.data() + old_data_len, value_data, value_len);
-        } else {
-            std::memcpy(merged.data(), value_data, value_len);
-            std::memcpy(merged.data() + value_len, existing.data(),
-                        old_data_len);
-        }
-        encode_metadata(merged.data() + old_data_len + value_len,
-                        expiry, flags);
+            // Build merged value.
+            std::vector<uint8_t> merged(old_data_len + value_len + kMetaSize);
+            if (req == ReqType::kAppend) {
+                std::memcpy(merged.data(), existing, old_data_len);
+                std::memcpy(merged.data() + old_data_len, value_data,
+                            value_len);
+            } else {
+                std::memcpy(merged.data(), value_data, value_len);
+                std::memcpy(merged.data() + value_len, existing,
+                            old_data_len);
+            }
+            encode_metadata(merged.data() + old_data_len + value_len,
+                            expiry, flags);
 
-        auto merged_span = std::span<const uint8_t>(
-            merged.data(), merged.size());
-        rc = co_await store.put(key_span, merged_span);
+            auto merged_span = std::span<const uint8_t>(
+                merged.data(), merged.size());
+            rc = co_await store.put(key_span, merged_span, PutMode::kReplace,
+                                    version);
+            if (rc != -ESTALE) break;
+        }
     }
 
     if (!noreply) {
         if (rc == 0) {
             co_await conn.send_full(kStored.data(), kStored.size(), kSendFlags);
             bytes_stored.fetch_add(value_len, std::memory_order_relaxed);
+        } else if (rc == -E2BIG) {
+            static constexpr std::string_view msg =
+                "SERVER_ERROR object too large for cache\r\n";
+            co_await conn.send_full(msg.data(), msg.size(), kSendFlags);
         } else {
             co_await conn.send_full(kNotStored.data(), kNotStored.size(), kSendFlags);
         }
@@ -297,19 +302,22 @@ static CoroTask<int> handle_get(
         auto key_span = std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(key.data()), key.size());
 
-        std::vector<uint8_t> val_buf(kMetaSize + 1024 * 1024);
-        size_t val_size = 0;
-        int rc = co_await store.get(key_span, val_buf.data(),
-                                    val_buf.size(), &val_size);
+        // Zero copy, and the whole value: its metadata is at the end.
+        GetBuffer got;
+        uint64_t version = kAnyVersion;
+        int rc = co_await store.get(key_span, &got, &version);
+        const uint8_t* val = got.value().data();
+        const size_t val_size = got.value().size();
         if (rc != 0 || val_size < kMetaSize)
             continue;
 
         int64_t expiry;
         uint32_t flags;
-        decode_metadata(val_buf.data(), val_size, expiry, flags);
+        decode_metadata(val, val_size, expiry, flags);
 
         if (is_expired(expiry)) {
-            co_await store.del(key_span);
+            // Only the expired value: a set that landed since must survive.
+            (void)co_await store.del(key_span, version);
             continue;
         }
 
@@ -323,7 +331,7 @@ static CoroTask<int> handle_get(
 
         co_await conn.send_full(header, static_cast<size_t>(hlen), kSendFlags);
         if (data_len > 0)
-            co_await conn.send_full(val_buf.data(), data_len, kSendFlags);
+            co_await conn.send_full(val, data_len, kSendFlags);
         co_await conn.send_full(kCRLF.data(), kCRLF.size(), kSendFlags);
     }
     co_await conn.send_full(kEnd.data(), kEnd.size(), kSendFlags);
@@ -356,58 +364,81 @@ static CoroTask<int> handle_arithmetic(
     auto key_span = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(key.data()), key.size());
 
-    std::vector<uint8_t> val_buf(kMetaSize + 128);
-    size_t val_size = 0;
-    int rc = co_await store.get(key_span, val_buf.data(),
-                                val_buf.size(), &val_size);
-    if (rc != 0 || val_size < kMetaSize) {
-        if (!noreply)
-            co_await conn.send_full(kNotFound.data(), kNotFound.size(), kSendFlags);
-        co_return 0;
-    }
-
-    int64_t expiry;
-    uint32_t flags;
-    decode_metadata(val_buf.data(), val_size, expiry, flags);
-
-    if (is_expired(expiry)) {
-        co_await store.del(key_span);
-        if (!noreply)
-            co_await conn.send_full(kNotFound.data(), kNotFound.size(), kSendFlags);
-        co_return 0;
-    }
-
-    size_t data_len = val_size - kMetaSize;
-    std::string_view old_val(reinterpret_cast<char*>(val_buf.data()), data_len);
-
-    uint64_t num = 0;
-    auto r = std::from_chars(old_val.data(), old_val.data() + old_val.size(),
-                             num);
-    if (r.ec != std::errc{}) {
-        if (!noreply) {
-            static constexpr std::string_view msg =
-                "CLIENT_ERROR cannot increment or decrement non-numeric value\r\n";
-            co_await conn.send_full(msg.data(), msg.size(), kSendFlags);
-        }
-        co_return 0;
-    }
-
-    if (is_incr)
-        num += delta;
-    else
-        num = (delta > num) ? 0 : num - delta;
-
     char new_val_str[32];
-    auto [ptr, ec] = std::to_chars(new_val_str, new_val_str + sizeof(new_val_str), num);
-    size_t new_data_len = static_cast<size_t>(ptr - new_val_str);
+    size_t new_data_len = 0;
+    int rc;
+    // Read-modify-write: replace only the version that was read, and start
+    // over if another client changed it in between.
+    for (;;) {
+        // The whole value, as in handle_get.
+        GetBuffer got;
+        uint64_t version = kAnyVersion;
+        rc = co_await store.get(key_span, &got, &version);
+        const uint8_t* val = got.value().data();
+        const size_t val_size = got.value().size();
+        if (rc != 0 || val_size < kMetaSize) {
+            if (!noreply)
+                co_await conn.send_full(kNotFound.data(), kNotFound.size(),
+                                        kSendFlags);
+            co_return 0;
+        }
 
-    // Build new stored value with same flags/expiry.
-    std::vector<uint8_t> new_stored(new_data_len + kMetaSize);
-    std::memcpy(new_stored.data(), new_val_str, new_data_len);
-    encode_metadata(new_stored.data() + new_data_len, expiry, flags);
+        int64_t expiry;
+        uint32_t flags;
+        decode_metadata(val, val_size, expiry, flags);
 
-    auto val_span = std::span<const uint8_t>(new_stored.data(), new_stored.size());
-    rc = co_await store.put(key_span, val_span);
+        if (is_expired(expiry)) {
+            (void)co_await store.del(key_span, version);
+            if (!noreply)
+                co_await conn.send_full(kNotFound.data(), kNotFound.size(),
+                                        kSendFlags);
+            co_return 0;
+        }
+
+        size_t data_len = val_size - kMetaSize;
+        std::string_view old_val(reinterpret_cast<const char*>(val),
+                                 data_len);
+
+        uint64_t num = 0;
+        auto r = std::from_chars(old_val.data(),
+                                 old_val.data() + old_val.size(), num);
+        if (r.ec != std::errc{}) {
+            if (!noreply) {
+                static constexpr std::string_view msg =
+                    "CLIENT_ERROR cannot increment or decrement non-numeric "
+                    "value\r\n";
+                co_await conn.send_full(msg.data(), msg.size(), kSendFlags);
+            }
+            co_return 0;
+        }
+
+        if (is_incr)
+            num += delta;
+        else
+            num = (delta > num) ? 0 : num - delta;
+
+        auto [ptr, ec] = std::to_chars(new_val_str,
+                                       new_val_str + sizeof(new_val_str), num);
+        new_data_len = static_cast<size_t>(ptr - new_val_str);
+
+        // Build new stored value with same flags/expiry.
+        std::vector<uint8_t> new_stored(new_data_len + kMetaSize);
+        std::memcpy(new_stored.data(), new_val_str, new_data_len);
+        encode_metadata(new_stored.data() + new_data_len, expiry, flags);
+
+        auto val_span = std::span<const uint8_t>(new_stored.data(),
+                                                 new_stored.size());
+        rc = co_await store.put(key_span, val_span, PutMode::kReplace,
+                                version);
+        if (rc != -ESTALE) break;
+    }
+
+    if (rc == -ENOENT) {  // deleted between the get and the put
+        if (!noreply)
+            co_await conn.send_full(kNotFound.data(), kNotFound.size(),
+                                    kSendFlags);
+        co_return 0;
+    }
 
     if (!noreply) {
         if (rc == 0) {
@@ -670,14 +701,19 @@ void MemcacheServer<Store>::stop() {
 
     running_.store(false, std::memory_order_release);
 
-    if (listen_fd_ >= 0) {
+    // shutdown() wakes the accept thread; the fd is closed only once that
+    // thread is gone, since its number could otherwise be reused while
+    // accept_loop is still about to accept() on it.
+    if (listen_fd_ >= 0)
         shutdown(listen_fd_, SHUT_RDWR);
-        ::close(listen_fd_);
-        listen_fd_ = -1;
-    }
 
     if (accept_thread_.joinable())
         accept_thread_.join();
+
+    if (listen_fd_ >= 0) {
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+    }
 
     // Force-close all tracked connection fds so handler coroutines unblock.
     {

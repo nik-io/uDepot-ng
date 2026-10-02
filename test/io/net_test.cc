@@ -4,6 +4,7 @@
 #include "udepot/io/net.h"
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <cstring>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -295,4 +296,62 @@ TEST_F(EpollNetTest, ConcurrentRegistrationAndPolling) {
     }
     EXPECT_EQ(echoed, kBurst);
     es_.close_fd(listen_fd);
+}
+
+
+// Regression: the poller thread can resume a waiter for an EPOLLIN event
+// whose data the waiter already read in await_ready(). The retried recv
+// then failed with EAGAIN, which Connection::recv returned as an error, and
+// memcache treated it as a closed connection (seen as an intermittent
+// SIGPIPE in memcache_test). Connection operations now wait again on a
+// spurious wakeup.
+//
+// The window: a connection is registered with its first request already
+// queued. The handler reads it without suspending while the poller wakes
+// for the same data; if the handler replies and starts waiting for the
+// second request first, the poller's stale event resumes that wait.
+TEST_F(EpollNetTest, ConnectionRecvSurvivesSpuriousWakeups) {
+    auto [listen_fd, port] = make_listener();
+    ASSERT_EQ(::listen(listen_fd, 64), 0);
+
+    constexpr int kConnections = 1000;
+    std::atomic<int> client_errors{0};
+    std::thread client([&] {
+        for (int i = 0; i < kConnections; ++i) {
+            int fd = connect_to(port);
+            if (fd < 0) { client_errors.fetch_add(1); continue; }
+            char c = 'a';
+            if (::send(fd, &c, 1, 0) != 1 || ::recv(fd, &c, 1, 0) != 1 ||
+                ::send(fd, &c, 1, 0) != 1 || ::recv(fd, &c, 1, 0) != 1)
+                client_errors.fetch_add(1);
+            ::close(fd);
+        }
+    });
+
+    int failures = 0;
+    for (int i = 0; i < kConnections; ++i) {
+        int fd = ::accept(listen_fd, nullptr, nullptr);
+        ASSERT_GE(fd, 0);
+        // Let the first request arrive before the fd is registered.
+        char peek;
+        ASSERT_EQ(::recv(fd, &peek, 1, MSG_PEEK), 1);
+        es_.register_fd(fd, EPOLLIN);
+
+        auto handler = [&]() -> udepot::CoroTask<int> {
+            Connection conn(es_, fd);
+            for (int req = 0; req < 2; ++req) {
+                char c;
+                if (co_await conn.recv(&c, 1, 0) != 1) co_return -1;
+                if (co_await conn.send(&c, 1, 0) != 1) co_return -1;
+            }
+            co_return 0;
+        }();
+        if (handler.run_sync() != 0) ++failures;
+        es_.close_fd(fd);
+    }
+    client.join();
+    ::close(listen_fd);
+
+    EXPECT_EQ(failures, 0)
+        << "recv returned early: spurious wakeup surfaced as an error";
 }

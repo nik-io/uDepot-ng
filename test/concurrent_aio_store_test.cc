@@ -5,6 +5,8 @@
 #include "udepot/io/aio.h"
 
 #include <atomic>
+#include <barrier>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -164,7 +166,9 @@ TEST_F(ConcurrentAioStoreTest, ConcurrentReadersAndWriters) {
         readers.emplace_back([&] {
             uint64_t local_reads = 0;
             int local_mismatches = 0;
-            while (!stop.load(std::memory_order_relaxed)) {
+            // do-while: under load the writers can finish before this thread
+            // is first scheduled; it must still run at least once.
+            do {
                 int w = static_cast<int>(local_reads % kWriters);
                 int i = static_cast<int>(local_reads % kOpsPerWriter);
                 std::string key = make_key(w, i);
@@ -180,7 +184,7 @@ TEST_F(ConcurrentAioStoreTest, ConcurrentReadersAndWriters) {
                     }
                 }
                 ++local_reads;
-            }
+            } while (!stop.load(std::memory_order_relaxed));
             reads.fetch_add(local_reads, std::memory_order_relaxed);
             read_mismatches.fetch_add(local_mismatches,
                                       std::memory_order_relaxed);
@@ -301,7 +305,9 @@ TEST_F(ConcurrentAioStoreTest, ConcurrentExistsWhileWriting) {
         checkers.emplace_back([&] {
             uint64_t local = 0;
             int local_mismatches = 0;
-            while (!stop.load(std::memory_order_relaxed)) {
+            // do-while: under load the writers can finish before this thread
+            // is first scheduled; it must still run at least once.
+            do {
                 int w = static_cast<int>(local % kWriters);
                 int i = static_cast<int>(local % kOpsPerWriter);
                 std::string key = make_key(w, i);
@@ -311,7 +317,7 @@ TEST_F(ConcurrentAioStoreTest, ConcurrentExistsWhileWriting) {
                 if (rc == 0 && val_size != expected_val.size())
                     ++local_mismatches;
                 ++local;
-            }
+            } while (!stop.load(std::memory_order_relaxed));
             checks.fetch_add(local, std::memory_order_relaxed);
             size_mismatches.fetch_add(local_mismatches,
                                       std::memory_order_relaxed);
@@ -326,4 +332,45 @@ TEST_F(ConcurrentAioStoreTest, ConcurrentExistsWhileWriting) {
     EXPECT_GT(checks.load(), 0u);
     EXPECT_EQ(size_mismatches.load(), 0)
         << "exists() reported wrong value size for a present key";
+}
+
+// Regression: put() looked the key up with no lock held and took the table
+// lock only inside insert(). Two puts of a new key both missed and both
+// inserted, leaving two directory entries; a later del() removed one and
+// get() still returned the other. The lookup is now re-checked under the
+// table lock, in the same critical section as the write.
+TEST_F(ConcurrentAioStoreTest, ConcurrentPutsOfOneKeyLeaveOneEntry) {
+    constexpr int kThreads = 8;
+    constexpr int kRounds = 300;
+    std::atomic<int> errors{0};
+    std::barrier sync(kThreads + 1);
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int r = 0; r < kRounds; ++r) {
+                sync.arrive_and_wait();
+                std::string key = "same_" + std::to_string(r);
+                if (store_.put(key, make_val(t, r)).run_sync() != 0)
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                sync.arrive_and_wait();
+            }
+        });
+    }
+
+    int survivors = 0;
+    for (int r = 0; r < kRounds; ++r) {
+        sync.arrive_and_wait();
+        sync.arrive_and_wait();
+        std::string key = "same_" + std::to_string(r);
+        EXPECT_EQ(store_.del(key).run_sync(), 0) << key;
+        size_t val_size = 0;
+        if (store_.get(key, nullptr, 0, &val_size).run_sync() != -ENOENT)
+            ++survivors;
+    }
+    for (auto& th : threads) th.join();
+
+    EXPECT_EQ(errors.load(), 0);
+    EXPECT_EQ(survivors, 0)
+        << "keys still readable after del(): duplicate directory entries";
 }

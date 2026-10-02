@@ -5,6 +5,8 @@
 #include "udepot/io/posix.h"
 
 #include <atomic>
+#include <barrier>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -121,7 +123,9 @@ TEST_F(ConcurrentStoreTest, ConcurrentReadersAndWriters) {
             uint64_t local_reads = 0;
             uint64_t local_hits = 0;
             int local_mismatches = 0;
-            while (!stop.load(std::memory_order_relaxed)) {
+            // do-while: under load the writers can finish before this thread
+            // is first scheduled; it must still run at least once.
+            do {
                 int w = static_cast<int>(local_reads % kWriters);
                 int i = static_cast<int>(local_reads % kOpsPerWriter);
                 std::string key = make_key(w, i);
@@ -138,7 +142,7 @@ TEST_F(ConcurrentStoreTest, ConcurrentReadersAndWriters) {
                     }
                 }
                 ++local_reads;
-            }
+            } while (!stop.load(std::memory_order_relaxed));
             reads.fetch_add(local_reads, std::memory_order_relaxed);
             read_hits.fetch_add(local_hits, std::memory_order_relaxed);
             read_mismatches.fetch_add(local_mismatches,
@@ -304,7 +308,9 @@ TEST_F(ConcurrentStoreTest, ConcurrentExistsWhileWriting) {
         checkers.emplace_back([&, c] {
             uint64_t local = 0;
             int local_mismatches = 0;
-            while (!stop.load(std::memory_order_relaxed)) {
+            // do-while: under load the writers can finish before this thread
+            // is first scheduled; it must still run at least once.
+            do {
                 int w = static_cast<int>(local % kWriters);
                 int i = static_cast<int>(local % kOpsPerWriter);
                 std::string key = make_key(w, i);
@@ -314,7 +320,7 @@ TEST_F(ConcurrentStoreTest, ConcurrentExistsWhileWriting) {
                 if (rc == 0 && val_size != expected_val.size())
                     ++local_mismatches;
                 ++local;
-            }
+            } while (!stop.load(std::memory_order_relaxed));
             checks.fetch_add(local, std::memory_order_relaxed);
             size_mismatches.fetch_add(local_mismatches,
                                       std::memory_order_relaxed);
@@ -329,4 +335,112 @@ TEST_F(ConcurrentStoreTest, ConcurrentExistsWhileWriting) {
     EXPECT_GT(checks.load(), 0u);
     EXPECT_EQ(size_mismatches.load(), 0)
         << "exists() reported wrong value size for a present key";
+}
+
+// Regression: put() looked the key up with no lock held and took the table
+// lock only inside insert(). Two puts of a new key both missed and both
+// inserted, leaving two directory entries; a later del() removed one and
+// get() still returned the other. The lookup is now re-checked under the
+// table lock, in the same critical section as the write.
+TEST_F(ConcurrentStoreTest, ConcurrentPutsOfOneKeyLeaveOneEntry) {
+    constexpr int kThreads = 8;
+    constexpr int kRounds = 300;
+    std::atomic<int> errors{0};
+    std::barrier sync(kThreads + 1);
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int r = 0; r < kRounds; ++r) {
+                sync.arrive_and_wait();
+                std::string key = "same_" + std::to_string(r);
+                if (store_.put(key, make_val(t, r)).run_sync() != 0)
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                sync.arrive_and_wait();
+            }
+        });
+    }
+
+    int survivors = 0;
+    for (int r = 0; r < kRounds; ++r) {
+        sync.arrive_and_wait();
+        sync.arrive_and_wait();
+        std::string key = "same_" + std::to_string(r);
+        EXPECT_EQ(store_.del(key).run_sync(), 0) << key;
+        size_t val_size = 0;
+        if (store_.get(key, nullptr, 0, &val_size).run_sync() != -ENOENT)
+            ++survivors;
+    }
+    for (auto& th : threads) th.join();
+
+    EXPECT_EQ(errors.load(), 0);
+    EXPECT_EQ(survivors, 0)
+        << "keys still readable after del(): duplicate directory entries";
+}
+
+// Regression: when concurrent puts of one key finish out of allocation
+// order, the directory must still point at the copy crash recovery treats
+// as newest; otherwise a reopen silently changes the key's value. The
+// legacy total-order check (rewrite if not newer) restores this.
+TEST_F(ConcurrentStoreTest, ConcurrentPutsOfOneKeySurviveReopen) {
+    constexpr int kThreads = 8;
+    constexpr int kKeys = 300;
+    std::barrier sync(kThreads);
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int k = 0; k < kKeys; ++k) {
+                sync.arrive_and_wait();
+                (void)store_.put("order_" + std::to_string(k),
+                                 make_val(t, k)).run_sync();
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    std::vector<std::string> before(kKeys);
+    for (int k = 0; k < kKeys; ++k) {
+        uint8_t val[128];
+        size_t n = 0;
+        ASSERT_EQ(store_.get("order_" + std::to_string(k), val, sizeof(val),
+                             &n).run_sync(), 0);
+        before[k].assign(reinterpret_cast<char*>(val), n);
+    }
+
+    store_.close();
+    config_.force_destroy = false;
+    ASSERT_EQ(store_.open(config_), 0);
+
+    int changed = 0;
+    for (int k = 0; k < kKeys; ++k) {
+        uint8_t val[128];
+        size_t n = 0;
+        ASSERT_EQ(store_.get("order_" + std::to_string(k), val, sizeof(val),
+                             &n).run_sync(), 0);
+        if (before[k] != std::string(reinterpret_cast<char*>(val), n))
+            ++changed;
+    }
+    EXPECT_EQ(changed, 0) << "values changed across reopen";
+}
+
+// Regression: a thread's RCU slot was never released when it exited, so a
+// server that creates threads per connection (memcache: two each) ran the
+// store out of its 256 slots after ~128 connections and then wrote past
+// the slot array. Thread exit now releases them.
+TEST_F(ConcurrentStoreTest, ThreadChurnDoesNotLeakRcuSlots) {
+    constexpr int kThreads = 2 * udepot::Rcu::kMaxThreads;
+    int errors = 0;
+    for (int t = 0; t < kThreads; ++t) {
+        std::thread th([&, t] {
+            std::string key = "churn_" + std::to_string(t);
+            if (store_.put(key, "v").run_sync() != 0) ++errors;
+            size_t n = 0;
+            if (store_.get(key, nullptr, 0, &n).run_sync() != 0) ++errors;
+        });
+        th.join();
+    }
+    EXPECT_EQ(errors, 0);
+    // The test thread, the GC token and one churn thread at a time.
+    EXPECT_LE(store_.rcu().thread_count(), 4u);
 }

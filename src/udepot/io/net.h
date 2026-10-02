@@ -37,10 +37,13 @@ class EpollState;
 //  1. await_ready():   try the syscall. If it succeeds (or fails with a hard
 //                      error), cache the result and return true (no suspend).
 //                      If EAGAIN/EWOULDBLOCK, return false.
-//  2. await_suspend(): store the coroutine handle into the per-fd map so the
-//                      poller can resume us when epoll fires.
-//  3. await_resume():  retry the syscall (level-triggered epoll guarantees
-//                      the fd is ready). Register the new fd on accept path.
+//  2. await_suspend(): publish this awaitable in the per-fd map so the poller
+//                      can complete it when epoll fires.
+//  3. The poller retries the syscall. EAGAIN means the readiness event was
+//     stale (the data was consumed in an earlier await_ready on another
+//     thread), so the awaitable stays published; otherwise the poller
+//     records the result and resumes the coroutine.
+//  4. await_resume():  return the result. Register the new fd on accept path.
 // ─────────────────────────────────────────────────────────────────────────────
 struct EpollOpAwaitable {
     EpollState* es_;
@@ -48,7 +51,9 @@ struct EpollOpAwaitable {
     EpollOpType ty_;
     std::function<ssize_t()> syscall_;
     ssize_t ret_ = -1;
+    int errno_ = 0;     // errno of ret_ when set by the poller
     bool ready_ = false;
+    bool published_ = false;  // counted in pending_waits_
     bool reg_ = false;  // register new fd after accept
     std::coroutine_handle<> handle_;
 
@@ -75,14 +80,16 @@ class EpollState {
     friend struct EpollOpAwaitable;
 
     enum class State { kUninitialized, kReady, kDraining, kDone };
-    State state_ = State::kUninitialized;
+    std::atomic<State> state_{State::kUninitialized};
     int epfd_ = -1;
 
+    // Waiters are published and taken under fds_mu_. Once published, an
+    // awaitable belongs to the poller (or shutdown_all) until resumed.
     struct FdInfo {
         uint32_t event_mask;
         int old_flags;
-        std::coroutine_handle<> handle_in_;
-        std::coroutine_handle<> handle_out_;
+        EpollOpAwaitable* waiter_in_ = nullptr;
+        EpollOpAwaitable* waiter_out_ = nullptr;
 
         FdInfo(uint32_t mask, int fl)
             : event_mask(mask), old_flags(fl) {}
@@ -124,7 +131,7 @@ public:
     int close_fd(int fd);
 
     bool is_running() const noexcept {
-        return state_ == State::kReady;
+        return state_.load(std::memory_order_acquire) == State::kReady;
     }
 
 private:

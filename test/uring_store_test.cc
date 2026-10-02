@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -150,4 +151,26 @@ TEST_F(UringStoreTest, ManyKeysRoundTrip) {
                   expected)
             << "i=" << i;
     }
+}
+
+// ── Zero-copy interface ─────────────────────────────────────────────────────
+
+namespace {
+std::span<const uint8_t> zc_bytes(std::string_view s) {
+    return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
+}
+std::string_view zc_text(std::span<const uint8_t> s) {
+    return {reinterpret_cast<const char*>(s.data()), s.size()};
+}
+}  // namespace
+
+TEST_F(UringStoreTest, ZeroCopyRoundTrip) {
+    const std::string val(5000, 'q');
+    auto pb = store_.alloc_put_buffer(4, val.size());
+    ASSERT_TRUE(pb.valid());
+    std::memcpy(pb.value().data(), val.data(), val.size());
+    ASSERT_EQ(store_.put(zc_bytes("zkey"), pb).run_sync(), 0);
+    udepot::GetBuffer gb;
+    ASSERT_EQ(store_.get(zc_bytes("zkey"), &gb).run_sync(), 0);
+    EXPECT_EQ(zc_text(gb.value()), val);
 }
