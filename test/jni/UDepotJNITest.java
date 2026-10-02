@@ -146,6 +146,19 @@ class UDepotJNITest {
         }
     }
 
+    // Before init and after shutdown, operations fail instead of
+    // crashing the JVM.
+    static int testClosedStoreRejectsOps() {
+        uDepotJNI kv = new uDepotJNI();
+        byte[] key = "k".getBytes();
+        byte[] buf = new byte[16];
+        int bad = 0;
+        if (kv.get(key, key.length, buf, buf.length) >= 0) bad++;
+        if (kv.put(key, key.length, buf, buf.length) >= 0) bad++;
+        if (kv.del(key, key.length) >= 0) bad++;
+        return bad;
+    }
+
     public static void main(String[] argv) throws Exception {
         String fname;
         if (argv.length > 0) {
@@ -159,7 +172,9 @@ class UDepotJNITest {
         System.out.println("JNI test with file=" + fname +
                            " size=" + (size >> 20) + " MiB");
 
+        int closed_failures = testClosedStoreRejectsOps();
         UDepotJNITest test = new UDepotJNITest(fname, size);
+        test.check(closed_failures == 0, "ops before init fail");
         try {
             test.testPutThenGet();
             test.testGetNonexistentKey();
@@ -172,6 +187,7 @@ class UDepotJNITest {
             test.shutdown();
             Files.deleteIfExists(Path.of(fname));
         }
+        test.check(testClosedStoreRejectsOps() == 0, "ops after shutdown fail");
 
         System.out.println("Passed: " + test.passed +
                            ", Failed: " + test.failed);

@@ -3,6 +3,7 @@
 
 #include "com_ibm_udepot_uDepotJNI.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -14,10 +15,17 @@
 using Store = udepot::UDepot<udepot::AioIO>;
 
 // As in uDepot's JNI binding, get/put/del do not take g_mtx: the caller
-// must ensure none is in progress during shutdown(), or follows it.
+// must ensure none is in progress during shutdown(). One that comes before
+// init() or after shutdown() gets -EINVAL instead of crashing the JVM:
+// g_open is written only under g_mtx, and get/put/del only load it, so
+// its cache line stays shared.
 static Store g_store;
-static bool g_open = false;  // guarded by g_mtx
+static std::atomic<bool> g_open{false};
 static std::mutex g_mtx;
+
+static bool store_open() {
+    return g_open.load(std::memory_order_acquire);
+}
 
 JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_init(
     JNIEnv* env, jobject, jstring fname, jlong size, jboolean force_destroy) {
@@ -27,7 +35,7 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_init(
     if (!path) return ENOMEM;
 
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (g_open) {
+    if (g_open.load(std::memory_order_relaxed)) {
         env->ReleaseStringUTFChars(fname, path);
         return 0;
     }
@@ -41,16 +49,16 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_init(
 
     int rc = g_store.open(config);
     env->ReleaseStringUTFChars(fname, path);
-    g_open = (rc == 0);
+    g_open.store(rc == 0, std::memory_order_release);
     return rc;
 }
 
 JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_shutdown(
     JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (g_open) {
+    if (g_open.load(std::memory_order_relaxed)) {
+        g_open.store(false, std::memory_order_release);
         g_store.close();
-        g_open = false;
     }
     return 0;
 }
@@ -58,6 +66,7 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_shutdown(
 JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_get(
     JNIEnv* env, jobject, jbyteArray key, jlong key_size,
     jbyteArray val, jlong val_size) {
+    if (!store_open()) return -EINVAL;
     auto* key_ptr = static_cast<jbyte*>(
         env->GetPrimitiveArrayCritical(key, nullptr));
     if (!key_ptr) return -ENOMEM;
@@ -88,6 +97,7 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_get(
 JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_put(
     JNIEnv* env, jobject, jbyteArray key, jlong key_size,
     jbyteArray val, jlong val_size) {
+    if (!store_open()) return -EINVAL;
     auto* key_ptr = static_cast<jbyte*>(
         env->GetPrimitiveArrayCritical(key, nullptr));
     if (!key_ptr) return ENOMEM;
@@ -114,6 +124,7 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_put(
 
 JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_del(
     JNIEnv* env, jobject, jbyteArray key, jlong key_size) {
+    if (!store_open()) return -EINVAL;
     auto* key_ptr = static_cast<jbyte*>(
         env->GetPrimitiveArrayCritical(key, nullptr));
     if (!key_ptr) return ENOMEM;
@@ -137,6 +148,6 @@ JNIEXPORT jlong JNICALL Java_com_ibm_udepot_uDepotJNI_getSize(
 JNIEXPORT jlong JNICALL Java_com_ibm_udepot_uDepotJNI_getRawDeviceCapacity(
     JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (!g_open) return 0;
+    if (!g_open.load(std::memory_order_relaxed)) return 0;
     return static_cast<jlong>(g_store.io().get_size());
 }
