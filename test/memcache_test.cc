@@ -170,8 +170,8 @@ protected:
                 ("udepot_memcache_test_" + std::to_string(getpid()));
         StoreConfig config;
         config.path = path_.c_str();
-        config.size = kStoreSize;
-        config.grain_size = 512;
+        config.size = store_size();
+        config.grain_size = grain_size();
         config.initial_tables = 2;
         config.index_bits = 10;
         config.force_destroy = true;
@@ -193,6 +193,9 @@ protected:
         store_.close();
         std::filesystem::remove(path_);
     }
+
+    virtual size_t store_size() const { return kStoreSize; }
+    virtual uint32_t grain_size() const { return 512; }
 
     std::filesystem::path path_;
     UDepot<PosixIO> store_;
@@ -641,3 +644,75 @@ TEST_F(MemcacheTest, ConcurrentAppendLosesNoUpdates) {
     EXPECT_EQ(result.data.size(), size_t{kClients * kAppends});
 }
 
+
+// Regression (PR #3 review, finding 12): reads copied into a fixed buffer
+// but decoded the metadata at the end of the full stored size, past the
+// buffer. INCR used 140 bytes, so a long value's flags came from the heap.
+TEST_F(MemcacheTest, IncrKeepsFlagsOfLongValue) {
+    McClient client;
+    ASSERT_TRUE(client.connect(port_));
+
+    std::string val = "5" + std::string(199, ' ');
+    ASSERT_TRUE(client.send_cmd("set lc 7 0 " + std::to_string(val.size()) +
+                                "\r\n" + val + "\r\n"));
+    EXPECT_EQ(client.recv_line(), "STORED");
+
+    ASSERT_TRUE(client.send_cmd("incr lc 3\r\n"));
+    EXPECT_EQ(client.recv_line(), "8");
+
+    ASSERT_TRUE(client.send_cmd("get lc\r\n"));
+    auto result = client.recv_get_response();
+    EXPECT_TRUE(result.found);
+    EXPECT_EQ(result.data, "8");
+    EXPECT_EQ(result.flags, 7u);
+}
+
+// 4 KiB grains: records up to ~8 MiB, past memcache's 1 MiB limit.
+class MemcacheLargeGrainTest : public MemcacheTest {
+protected:
+    size_t store_size() const override { return 128 * 1024 * 1024 + 4096; }
+    uint32_t grain_size() const override { return 4096; }
+};
+
+// GET used a 1 MiB buffer: a longer stored value was decoded and sent from
+// past its end.
+TEST_F(MemcacheLargeGrainTest, GetReturnsWholeValueLongerThanOneMiB) {
+    std::string data(1536 * 1024, 'L');
+    for (size_t i = 0; i < data.size(); i += 4096) data[i] = 'a' + i % 26;
+    // Stored as the server lays it out: data, expiry (never), flags.
+    std::string stored = data;
+    int64_t expiry = 0;
+    uint32_t flags = 9;
+    stored.append(reinterpret_cast<const char*>(&expiry), sizeof(expiry));
+    stored.append(reinterpret_cast<const char*>(&flags), sizeof(flags));
+    ASSERT_EQ(store_.put("huge", stored).run_sync(), 0);
+
+    McClient client;
+    ASSERT_TRUE(client.connect(port_));
+    ASSERT_TRUE(client.send_cmd("get huge\r\n"));
+    auto result = client.recv_get_response();
+    EXPECT_TRUE(result.found);
+    EXPECT_EQ(result.flags, 9u);
+    EXPECT_TRUE(result.data == data) << "got " << result.data.size()
+                                     << " bytes";
+}
+
+// APPEND has the same limit as SET, so values stay readable.
+TEST_F(MemcacheLargeGrainTest, AppendBeyondMaxValueIsRefused) {
+    McClient client;
+    ASSERT_TRUE(client.connect(port_));
+
+    const size_t max = MemcacheServer<UDepot<PosixIO>>::kMaxValueLen;
+    std::string val(max, 'M');
+    ASSERT_TRUE(client.send_cmd("set full 0 0 " + std::to_string(max) +
+                                "\r\n" + val + "\r\n"));
+    EXPECT_EQ(client.recv_line(), "STORED");
+
+    ASSERT_TRUE(client.send_cmd("append full 0 0 1\r\nx\r\n"));
+    EXPECT_EQ(client.recv_line(), "SERVER_ERROR object too large for cache");
+
+    ASSERT_TRUE(client.send_cmd("get full\r\n"));
+    auto result = client.recv_get_response();
+    EXPECT_TRUE(result.found);
+    EXPECT_TRUE(result.data == val);
+}

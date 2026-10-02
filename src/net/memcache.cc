@@ -224,19 +224,20 @@ static CoroTask<int> handle_store(
     } else if (req == ReqType::kAppend || req == ReqType::kPrepend) {
         // Read-modify-write: replace only the version that was read, and
         // start over if another client changed it in between.
-        std::vector<uint8_t> existing(kMetaSize + 1024 * 1024);
         for (;;) {
-            size_t existing_size = 0;
+            // The whole stored value, however long: its metadata is at
+            // the end, where a copy into a fixed buffer would cut it off.
+            GetBuffer got;
             uint64_t version = kAnyVersion;
-            int get_rc = co_await store.get(key_span, existing.data(),
-                                            existing.size(), &existing_size,
-                                            &version);
+            int get_rc = co_await store.get(key_span, &got, &version);
             if (get_rc != 0) {
                 if (!noreply) co_await conn.send_full(
                     kNotStored.data(), kNotStored.size(), 0);
                 co_return 0;
             }
 
+            const uint8_t* existing = got.value().data();
+            const size_t existing_size = got.value().size();
             // Extract existing metadata.
             if (existing_size < kMetaSize) {
                 if (!noreply) co_await conn.send_full(
@@ -245,19 +246,23 @@ static CoroTask<int> handle_store(
             }
             int64_t old_expiry;
             uint32_t old_flags;
-            decode_metadata(existing.data(), existing_size, old_expiry,
-                            old_flags);
+            decode_metadata(existing, existing_size, old_expiry, old_flags);
             size_t old_data_len = existing_size - kMetaSize;
+            if (old_data_len + value_len >
+                MemcacheServer<Store>::kMaxValueLen) {
+                rc = -E2BIG;  // as a set of that size would be refused
+                break;
+            }
 
             // Build merged value.
             std::vector<uint8_t> merged(old_data_len + value_len + kMetaSize);
             if (req == ReqType::kAppend) {
-                std::memcpy(merged.data(), existing.data(), old_data_len);
+                std::memcpy(merged.data(), existing, old_data_len);
                 std::memcpy(merged.data() + old_data_len, value_data,
                             value_len);
             } else {
                 std::memcpy(merged.data(), value_data, value_len);
-                std::memcpy(merged.data() + value_len, existing.data(),
+                std::memcpy(merged.data() + value_len, existing,
                             old_data_len);
             }
             encode_metadata(merged.data() + old_data_len + value_len,
@@ -275,6 +280,10 @@ static CoroTask<int> handle_store(
         if (rc == 0) {
             co_await conn.send_full(kStored.data(), kStored.size(), kSendFlags);
             bytes_stored.fetch_add(value_len, std::memory_order_relaxed);
+        } else if (rc == -E2BIG) {
+            static constexpr std::string_view msg =
+                "SERVER_ERROR object too large for cache\r\n";
+            co_await conn.send_full(msg.data(), msg.size(), kSendFlags);
         } else {
             co_await conn.send_full(kNotStored.data(), kNotStored.size(), kSendFlags);
         }
@@ -293,17 +302,18 @@ static CoroTask<int> handle_get(
         auto key_span = std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(key.data()), key.size());
 
-        std::vector<uint8_t> val_buf(kMetaSize + 1024 * 1024);
-        size_t val_size = 0;
+        // Zero copy, and the whole value: its metadata is at the end.
+        GetBuffer got;
         uint64_t version = kAnyVersion;
-        int rc = co_await store.get(key_span, val_buf.data(),
-                                    val_buf.size(), &val_size, &version);
+        int rc = co_await store.get(key_span, &got, &version);
+        const uint8_t* val = got.value().data();
+        const size_t val_size = got.value().size();
         if (rc != 0 || val_size < kMetaSize)
             continue;
 
         int64_t expiry;
         uint32_t flags;
-        decode_metadata(val_buf.data(), val_size, expiry, flags);
+        decode_metadata(val, val_size, expiry, flags);
 
         if (is_expired(expiry)) {
             // Only the expired value: a set that landed since must survive.
@@ -321,7 +331,7 @@ static CoroTask<int> handle_get(
 
         co_await conn.send_full(header, static_cast<size_t>(hlen), kSendFlags);
         if (data_len > 0)
-            co_await conn.send_full(val_buf.data(), data_len, kSendFlags);
+            co_await conn.send_full(val, data_len, kSendFlags);
         co_await conn.send_full(kCRLF.data(), kCRLF.size(), kSendFlags);
     }
     co_await conn.send_full(kEnd.data(), kEnd.size(), kSendFlags);
@@ -354,17 +364,18 @@ static CoroTask<int> handle_arithmetic(
     auto key_span = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(key.data()), key.size());
 
-    std::vector<uint8_t> val_buf(kMetaSize + 128);
     char new_val_str[32];
     size_t new_data_len = 0;
     int rc;
     // Read-modify-write: replace only the version that was read, and start
     // over if another client changed it in between.
     for (;;) {
-        size_t val_size = 0;
+        // The whole value, as in handle_get.
+        GetBuffer got;
         uint64_t version = kAnyVersion;
-        rc = co_await store.get(key_span, val_buf.data(), val_buf.size(),
-                                &val_size, &version);
+        rc = co_await store.get(key_span, &got, &version);
+        const uint8_t* val = got.value().data();
+        const size_t val_size = got.value().size();
         if (rc != 0 || val_size < kMetaSize) {
             if (!noreply)
                 co_await conn.send_full(kNotFound.data(), kNotFound.size(),
@@ -374,7 +385,7 @@ static CoroTask<int> handle_arithmetic(
 
         int64_t expiry;
         uint32_t flags;
-        decode_metadata(val_buf.data(), val_size, expiry, flags);
+        decode_metadata(val, val_size, expiry, flags);
 
         if (is_expired(expiry)) {
             (void)co_await store.del(key_span, version);
@@ -385,7 +396,7 @@ static CoroTask<int> handle_arithmetic(
         }
 
         size_t data_len = val_size - kMetaSize;
-        std::string_view old_val(reinterpret_cast<char*>(val_buf.data()),
+        std::string_view old_val(reinterpret_cast<const char*>(val),
                                  data_len);
 
         uint64_t num = 0;
