@@ -77,6 +77,51 @@ enum class PutMode {
 // if the key still holds that value (-ESTALE otherwise).
 inline constexpr uint64_t kAnyVersion = UINT64_MAX;
 
+// Zero-copy values (uDepot's Mbuff interface). A PutBuffer, from
+// UDepot::alloc_put_buffer(), is laid out as the on-disk record with room
+// around the value: the caller writes the value in place and put() writes
+// the buffer to storage as is, filling in header, key and checksum. A
+// GetBuffer receives the buffer get() read the record into, and value()
+// views the value inside it. Both are movable, not copyable.
+class PutBuffer {
+public:
+    PutBuffer() = default;
+    PutBuffer(PutBuffer&&) noexcept = default;
+    PutBuffer& operator=(PutBuffer&&) noexcept = default;
+
+    bool valid() const noexcept { return buf_.data != nullptr; }
+    std::span<uint8_t> value() noexcept {
+        return {static_cast<uint8_t*>(buf_.data) + sizeof(KvHeader) +
+                    key_size_,
+                val_size_};
+    }
+    size_t key_size() const noexcept { return key_size_; }
+
+private:
+    template <typename> friend class UDepot;
+    IoBuffer buf_;
+    uint16_t key_size_ = 0;
+    uint32_t val_size_ = 0;
+};
+
+class GetBuffer {
+public:
+    GetBuffer() = default;
+    GetBuffer(GetBuffer&&) noexcept = default;
+    GetBuffer& operator=(GetBuffer&&) noexcept = default;
+
+    bool valid() const noexcept { return buf_.data != nullptr; }
+    std::span<const uint8_t> value() const noexcept {
+        return {static_cast<const uint8_t*>(buf_.data) + val_off_, val_size_};
+    }
+
+private:
+    template <typename> friend class UDepot;
+    IoBuffer buf_;
+    size_t val_off_ = 0;
+    uint32_t val_size_ = 0;
+};
+
 // High-performance KV store, parameterized on the I/O backend.
 //
 // Uses RCU-protected directory for lock-free reads, salsa for grain
@@ -98,14 +143,37 @@ public:
 
     // A non-default if_version implies kReplace: -ENOENT if the key is
     // missing, -ESTALE if it holds a different version.
+    //
+    // Copies the value into a record buffer; see the zero-copy overload.
     CoroTask<int> put(std::span<const uint8_t> key,
                       std::span<const uint8_t> val,
                       PutMode mode = PutMode::kUpsert,
                       uint64_t if_version = kAnyVersion);
 
+    // Copies the value out of the record it reads; see the zero-copy
+    // overload.
     CoroTask<int> get(std::span<const uint8_t> key,
                       uint8_t* val_out, size_t val_buf_size,
                       size_t* val_size_out,
+                      uint64_t* version_out = nullptr);
+
+    // Zero copy. A buffer for a key of key_size bytes and a value of
+    // val_size bytes, to fill through value() and pass to put(); invalid
+    // (!valid()) if the sizes cannot be stored or allocation fails.
+    PutBuffer alloc_put_buffer(size_t key_size, size_t val_size);
+
+    // Zero copy: writes `val` in place. key.size() must be the size the
+    // buffer was allocated for (-EINVAL otherwise). The buffer stays the
+    // caller's, and must stay alive and unmodified until the put completes;
+    // it may be reused afterwards. The key is copied before the first
+    // suspension.
+    CoroTask<int> put(std::span<const uint8_t> key, PutBuffer& val,
+                      PutMode mode = PutMode::kUpsert,
+                      uint64_t if_version = kAnyVersion);
+
+    // Zero copy: on success, *val_out holds the buffer the record was read
+    // into, and val_out->value() the value. On error it is left empty.
+    CoroTask<int> get(std::span<const uint8_t> key, GetBuffer* val_out,
                       uint64_t* version_out = nullptr);
 
     CoroTask<int> del(std::span<const uint8_t> key,
@@ -278,6 +346,19 @@ private:
                             KeyProbe& probe);
     static bool probe_settled(const HashTable& table, uint64_t hash,
                               const KeyProbe& probe, HashEntry* match);
+
+    // Validates sizes; 0 or -EINVAL.
+    int check_sizes(size_t key_size, size_t val_size) const;
+    // The one put path: writes `*zc` if non-null (zero copy), else
+    // `owned` (the copying put's record, moved into this frame).
+    CoroTask<int> put_record(std::span<const uint8_t> key, PutBuffer* zc,
+                             PutBuffer owned, int prep_rc, PutMode mode,
+                             uint64_t if_version);
+    // The one get path: hands the record buffer to *zc if non-null, else
+    // copies the value to val_out.
+    CoroTask<int> get_record(std::span<const uint8_t> key, GetBuffer* zc,
+                             uint8_t* val_out, size_t val_buf_size,
+                             size_t* val_size_out, uint64_t* version_out);
 
     // Results of commit_put/commit_del besides 0 and -errno.
     static constexpr int kRetryProbe = 1;  // unverified entry appeared

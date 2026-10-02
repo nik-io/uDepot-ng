@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -585,4 +586,112 @@ TEST_F(StoreTest, DelIfVersion) {
     ASSERT_EQ(store_.get("k", nullptr, 0, &n, &v2).run_sync(), 0);
     EXPECT_EQ(store_.del("k", v2).run_sync(), 0);
     EXPECT_EQ(store_.get("k", nullptr, 0, &n).run_sync(), -ENOENT);
+}
+
+// ── Zero-copy interface ─────────────────────────────────────────────────────
+
+namespace {
+std::span<const uint8_t> bytes(std::string_view s) {
+    return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
+}
+std::string_view text(std::span<const uint8_t> s) {
+    return {reinterpret_cast<const char*>(s.data()), s.size()};
+}
+}  // namespace
+
+TEST_F(StoreTest, ZeroCopyPutThenZeroCopyGet) {
+    const std::string val(3000, 'z');
+    auto pb = store_.alloc_put_buffer(5, val.size());
+    ASSERT_TRUE(pb.valid());
+    ASSERT_EQ(pb.value().size(), val.size());
+    std::memcpy(pb.value().data(), val.data(), val.size());
+    ASSERT_EQ(store_.put(bytes("zckey"), pb).run_sync(), 0);
+
+    udepot::GetBuffer gb;
+    uint64_t version = 0;
+    ASSERT_EQ(store_.get(bytes("zckey"), &gb, &version).run_sync(), 0);
+    ASSERT_TRUE(gb.valid());
+    EXPECT_EQ(text(gb.value()), val);
+    EXPECT_NE(version, 0u);
+
+    // The copying interface reads the same record.
+    std::string out(val.size(), '\0');
+    size_t n = 0;
+    ASSERT_EQ(store_.get("zckey", reinterpret_cast<uint8_t*>(out.data()),
+                         out.size(), &n).run_sync(), 0);
+    EXPECT_EQ(out, val);
+}
+
+TEST_F(StoreTest, ZeroCopyGetSeesCopyingPut) {
+    ASSERT_EQ(store_.put("plain", "value").run_sync(), 0);
+    udepot::GetBuffer gb;
+    ASSERT_EQ(store_.get(bytes("plain"), &gb).run_sync(), 0);
+    EXPECT_EQ(text(gb.value()), "value");
+}
+
+// A PutBuffer stays the caller's: it can be refilled and put again, under
+// the same key (overwrite) or another of the same size.
+TEST_F(StoreTest, ZeroCopyPutBufferIsReusable) {
+    auto pb = store_.alloc_put_buffer(4, 8);
+    ASSERT_TRUE(pb.valid());
+    std::memcpy(pb.value().data(), "aaaaaaaa", 8);
+    ASSERT_EQ(store_.put(bytes("key1"), pb).run_sync(), 0);
+    std::memcpy(pb.value().data(), "bbbbbbbb", 8);
+    ASSERT_EQ(store_.put(bytes("key2"), pb).run_sync(), 0);
+    std::memcpy(pb.value().data(), "cccccccc", 8);
+    ASSERT_EQ(store_.put(bytes("key1"), pb).run_sync(), 0);
+
+    udepot::GetBuffer gb;
+    ASSERT_EQ(store_.get(bytes("key1"), &gb).run_sync(), 0);
+    EXPECT_EQ(text(gb.value()), "cccccccc");
+    ASSERT_EQ(store_.get(bytes("key2"), &gb).run_sync(), 0);
+    EXPECT_EQ(text(gb.value()), "bbbbbbbb");
+}
+
+TEST_F(StoreTest, ZeroCopyPutHonoursModes) {
+    auto pb = store_.alloc_put_buffer(3, 1);
+    ASSERT_TRUE(pb.valid());
+    pb.value()[0] = 'x';
+    EXPECT_EQ(store_.put(bytes("abc"), pb, udepot::PutMode::kReplace)
+                  .run_sync(), -ENOENT);
+    EXPECT_EQ(store_.put(bytes("abc"), pb, udepot::PutMode::kCreate)
+                  .run_sync(), 0);
+    EXPECT_EQ(store_.put(bytes("abc"), pb, udepot::PutMode::kCreate)
+                  .run_sync(), -EEXIST);
+}
+
+TEST_F(StoreTest, ZeroCopyErrors) {
+    // Sizes the store cannot hold give no buffer.
+    EXPECT_FALSE(store_.alloc_put_buffer(0, 10).valid());
+    EXPECT_FALSE(store_.alloc_put_buffer(UINT16_MAX + 1, 10).valid());
+    EXPECT_FALSE(store_.alloc_put_buffer(10, 2u << 20).valid());
+
+    // A key of another size than the buffer was made for, or no buffer.
+    auto pb = store_.alloc_put_buffer(4, 4);
+    ASSERT_TRUE(pb.valid());
+    EXPECT_EQ(store_.put(bytes("toolong"), pb).run_sync(), -EINVAL);
+    udepot::PutBuffer empty;
+    EXPECT_EQ(store_.put(bytes("k"), empty).run_sync(), -EINVAL);
+
+    // A missing key leaves the GetBuffer empty, even if it held a value.
+    ASSERT_EQ(store_.put("have", "it").run_sync(), 0);
+    udepot::GetBuffer gb;
+    ASSERT_EQ(store_.get(bytes("have"), &gb).run_sync(), 0);
+    EXPECT_EQ(store_.get(bytes("missing"), &gb).run_sync(), -ENOENT);
+    EXPECT_FALSE(gb.valid());
+    EXPECT_EQ(store_.get(std::span<const uint8_t>{}, &gb).run_sync(), -EINVAL);
+}
+
+// Recovery reads zero-copy records like any other.
+TEST_F(StoreTest, ZeroCopyPutSurvivesReopen) {
+    auto pb = store_.alloc_put_buffer(7, 100);
+    ASSERT_TRUE(pb.valid());
+    std::memset(pb.value().data(), 'r', 100);
+    ASSERT_EQ(store_.put(bytes("durable"), pb).run_sync(), 0);
+    store_.close();
+    config_.force_destroy = false;
+    ASSERT_EQ(store_.open(config_), 0);
+    udepot::GetBuffer gb;
+    ASSERT_EQ(store_.get(bytes("durable"), &gb).run_sync(), 0);
+    EXPECT_EQ(text(gb.value()), std::string(100, 'r'));
 }

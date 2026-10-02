@@ -901,42 +901,80 @@ int UDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
 }
 
 template <typename IO>
+int UDepot<IO>::check_sizes(size_t key_size, size_t val_size) const {
+    if (key_size == 0 || key_size > UINT16_MAX) return -EINVAL;
+    if (val_size > UINT32_MAX) return -EINVAL;
+    if (kv_total_grains(key_size, val_size) > HashEntry::kKvSizeMask)
+        return -EINVAL;
+    return 0;
+}
+
+template <typename IO>
+PutBuffer UDepot<IO>::alloc_put_buffer(size_t key_size, size_t val_size) {
+    PutBuffer pb;
+    if (check_sizes(key_size, val_size) != 0) return pb;
+    size_t total = kv_total_grains(key_size, val_size) * grain_size_;
+    pb.buf_ = io_.alloc_buffer(total);
+    if (!pb.buf_.data) return pb;
+    pb.buf_.length = total;
+    pb.key_size_ = static_cast<uint16_t>(key_size);
+    pb.val_size_ = static_cast<uint32_t>(val_size);
+    // The grain padding past the record is written too; put() never
+    // touches it, so zeroing it once covers every reuse of the buffer.
+    size_t used = kv_total_bytes(key_size, val_size);
+    std::memset(static_cast<uint8_t*>(pb.buf_.data) + used, 0, total - used);
+    return pb;
+}
+
+// Not coroutines: both hand over to put_record(), so the copying put
+// costs one coroutine frame, like the zero-copy one.
+template <typename IO>
 CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
                               std::span<const uint8_t> val,
                               PutMode mode, uint64_t if_version) {
-    if (key.empty() || key.size() > UINT16_MAX)
-        co_return -EINVAL;
-    if (val.size() > UINT32_MAX)
-        co_return -EINVAL;
+    PutBuffer rec;
+    int rc = check_sizes(key.size(), val.size());
+    if (rc == 0) {
+        rec = alloc_put_buffer(key.size(), val.size());
+        if (rec.valid())
+            std::memcpy(rec.value().data(), val.data(), val.size());
+        else
+            rc = -ENOMEM;
+    }
+    return put_record(key, nullptr, std::move(rec), rc, mode, if_version);
+}
 
-    uint64_t hash = hash_key(key);
-    uint64_t grains_needed = kv_total_grains(key.size(), val.size());
+template <typename IO>
+CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key, PutBuffer& val,
+                              PutMode mode, uint64_t if_version) {
+    int rc = (!val.valid() || key.size() != val.key_size_) ? -EINVAL : 0;
+    return put_record(key, &val, PutBuffer{}, rc, mode, if_version);
+}
 
-    if (grains_needed > HashEntry::kKvSizeMask)
-        co_return -EINVAL;
+template <typename IO>
+CoroTask<int> UDepot<IO>::put_record(std::span<const uint8_t> key_in,
+                                     PutBuffer* zc, PutBuffer owned,
+                                     int prep_rc, PutMode mode,
+                                     uint64_t if_version) {
+    if (prep_rc != 0) co_return prep_rc;
+    PutBuffer& rec = zc ? *zc : owned;
+    IoBuffer& buf = rec.buf_;
+    const size_t val_size = rec.val_size_;
+    const size_t total = buf.length;
+    const uint64_t grains_needed = kv_total_grains(key_in.size(), val_size);
 
-    std::optional<Rcu::ReadGuard> guard(std::in_place, rcu_);
-
-    // Build the on-disk entry.  Must happen before any co_await so that
-    // key/val data is copied while the caller's buffers are still alive.
-    size_t total = grains_needed * grain_size_;
-    IoBuffer buf = io_.alloc_buffer(total);
-    if (!buf.data) co_return -ENOMEM;
-
+    // The record already holds the value. Copy the key in before the first
+    // suspension and use that copy from here on, so the caller's key need
+    // not outlive it.
     auto* p = static_cast<uint8_t*>(buf.data);
     KvHeader hdr;
-    hdr.key_size = static_cast<uint16_t>(key.size());
-    hdr.val_size = static_cast<uint32_t>(val.size());
-    std::memcpy(p + sizeof(hdr), key.data(), key.size());
-    std::memcpy(p + sizeof(hdr) + key.size(), val.data(), val.size());
+    hdr.key_size = static_cast<uint16_t>(key_in.size());
+    hdr.val_size = static_cast<uint32_t>(val_size);
+    std::memcpy(p + sizeof(hdr), key_in.data(), key_in.size());
+    std::span<const uint8_t> key(p + sizeof(hdr), key_in.size());
+    uint64_t hash = hash_key(key);
 
-    // Zero any padding between the suffix and the end of the grain-aligned
-    // region.
-    size_t used = kv_total_bytes(key.size(), val.size());
-    if (total > used)
-        std::memset(p + used, 0, total - used);
-
-    buf.length = total;
+    std::optional<Rcu::ReadGuard> guard(std::in_place, rcu_);
 
     KeyProbe probe;
     for (;;) {
@@ -950,7 +988,7 @@ CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
         std::memcpy(p, &hdr, sizeof(hdr));
         KvSuffix suffix;
         suffix.crc16 = compute_crc16(hdr);
-        std::memcpy(p + sizeof(hdr) + key.size() + val.size(),
+        std::memcpy(p + sizeof(hdr) + key.size() + val_size,
                     &suffix, sizeof(suffix));
 
         ssize_t written = co_await io_.pwrite(buf.data, total,
@@ -1042,6 +1080,23 @@ template <typename IO>
 CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
                               uint8_t* val_out, size_t val_buf_size,
                               size_t* val_size_out, uint64_t* version_out) {
+    return get_record(key, nullptr, val_out, val_buf_size, val_size_out,
+                      version_out);
+}
+
+template <typename IO>
+CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
+                              GetBuffer* val_out, uint64_t* version_out) {
+    if (val_out) *val_out = GetBuffer{};
+    return get_record(key, val_out, nullptr, 0, nullptr, version_out);
+}
+
+template <typename IO>
+CoroTask<int> UDepot<IO>::get_record(std::span<const uint8_t> key,
+                                     GetBuffer* zc, uint8_t* val_out,
+                                     size_t val_buf_size,
+                                     size_t* val_size_out,
+                                     uint64_t* version_out) {
     if (key.empty()) co_return -EINVAL;
 
     uint64_t hash = hash_key(key);
@@ -1091,7 +1146,12 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
 
         if (val_size_out) *val_size_out = hdr.val_size;
         if (version_out) *version_out = pba;
-        if (val_out && val_buf_size > 0) {
+        if (zc) {
+            // Zero copy: the caller gets the buffer the record was read into.
+            zc->val_off_ = sizeof(hdr) + hdr.key_size;
+            zc->val_size_ = hdr.val_size;
+            zc->buf_ = std::move(buf);
+        } else if (val_out && val_buf_size > 0) {
             size_t to_copy = std::min(val_buf_size,
                                       static_cast<size_t>(hdr.val_size));
             std::memcpy(val_out, p + sizeof(hdr) + hdr.key_size, to_copy);

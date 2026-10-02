@@ -306,14 +306,22 @@ struct IoBuffer {
 };
 ```
 
-Zero-copy works the same way:
-- **put**: caller passes their buffer → backend writes from it directly.
-- **get**: caller passes a pre-allocated buffer → backend reads into it.
-- **SPDK path**: `store.alloc_buffer()` returns a DMA-safe buffer.
+Zero copy is uDepot's Mbuff interface, with the record laid out in one
+contiguous buffer instead of a chain of nodes:
 
-For the memcache server, SET receives the value into an `IoBuffer` from the
-storage backend's allocator and writes it directly; GET reads into an
-`IoBuffer` and sends it over the network. No linked list needed.
+- **put**: `alloc_put_buffer(key_size, val_size)` returns a `PutBuffer`
+  shaped like the on-disk record. The caller writes the value into
+  `value()`, and `put(key, PutBuffer&)` fills in the header, key and checksum
+  around it and writes the buffer as is. On SPDK the buffer is DMA memory.
+- **get**: `get(key, GetBuffer*)` hands over the buffer the record was read
+  into; `value()` views the value inside it.
+- The span-based `put`/`get` copy the value into, or out of, such a record
+  buffer. Both interfaces run the same coroutine (`put_record` and
+  `get_record`), so they differ only in that copy. `scripts/perf-zerocopy.sh`
+  gates on it: zero copy must not be slower, on any backend.
+
+The memcache server and the Python and JNI bindings still use the copying
+interface.
 
 ### 8. Network Backend and Memcache Server
 
