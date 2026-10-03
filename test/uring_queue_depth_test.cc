@@ -32,6 +32,7 @@ struct UringTraits {
     static void configure(udepot::StoreConfig& config) {
         config.path = path().c_str();
         config.size = 16 * 1024 * 1024;
+        qd::make_device_file(path(), config.size);
     }
     static void cleanup(const udepot::StoreConfig&) {
         std::filesystem::remove(path());

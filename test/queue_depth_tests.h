@@ -55,6 +55,7 @@
 #include <vector>
 
 #include <sys/sysinfo.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -95,6 +96,31 @@ inline double median(std::vector<double> v) {
     size_t n = v.size();
     if (n % 2 == 1) return v[n / 2];
     return (v[n / 2 - 1] + v[n / 2]) / 2.0;
+}
+
+// A store file written out in full, as a device is: the timed tests measure
+// the store's pipeline, not the filesystem. A sparse file makes every first
+// O_DIRECT write into a hole allocate blocks (and ext4 can block io_submit
+// on that); in CI, 64 such writes at once took twice as long as one at a
+// time, failing DeeperQueueFasterWrites on a disk the store never sees in
+// production. Kept across the tests of a run (cleanup removes it).
+inline void make_device_file(const std::string& path, size_t size) {
+    if (FILE* f = std::fopen(path.c_str(), "rb")) {  // already written out
+        std::fseek(f, 0, SEEK_END);
+        const long have = std::ftell(f);
+        std::fclose(f);
+        if (have >= static_cast<long>(size)) return;
+    }
+    FILE* f = std::fopen(path.c_str(), "wb");
+    ASSERT_NE(f, nullptr) << path;
+    std::vector<char> zeros(1 << 20, 0);
+    for (size_t off = 0; off < size; off += zeros.size())
+        ASSERT_EQ(std::fwrite(zeros.data(), 1,
+                              std::min(zeros.size(), size - off), f),
+                  std::min(zeros.size(), size - off));
+    ASSERT_EQ(std::fflush(f), 0);
+    ASSERT_EQ(fsync(fileno(f)), 0);
+    std::fclose(f);
 }
 
 struct ReadCtx {
