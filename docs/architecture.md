@@ -293,30 +293,34 @@ concept IoBackend = requires(T io, void* buf, size_t n, off_t off) {
 };
 ```
 
-**Queue depth.** A caller may have any number of I/Os outstanding; no
-backend caps it. The intended use: preallocate zero-copy buffers for the
+**Queue depth.** The intended use: preallocate zero-copy buffers for the
 depth you choose (`alloc_put_buffer`, `alloc_get_buffer`), issue that many
 operations, wait for them, reuse the buffers. uDepot allocates no data
-buffers for depth. `StoreConfig::queue_depth` only sizes each backend's
-tracking state for it: the AIO context (`io_setup`), the io_uring ring, and
-the SPDK request pool of queue pairs created afterwards (per thread). It is
-not a limit:
+buffers for depth. `StoreConfig::queue_depth` sizes each backend's queue for
+it: the AIO context (`io_setup`), the io_uring ring, and the SPDK request
+pool of queue pairs created afterwards (per thread). Nothing in uDepot caps
+the depth below what the backend takes.
 
-- io_uring takes submissions past the ring's size; the kernel keeps the
-  extra completions on its overflow list.
-- An I/O that AIO or SPDK refuses because its context or request pool is
-  full (EAGAIN, ENOMEM) waits for room, in submission order, and is
-  submitted as completions free it: by the poller (AIO), or by the owning
-  thread's poll (SPDK). io_uring does the same if the kernel refuses
-  submissions (EBUSY/EAGAIN) until the submission queue fills. Waiting
-  allocates nothing: the requests are linked through themselves, in the
-  suspended coroutines' frames. Nothing spins, and a coroutine resumed on
-  the poller can submit without waiting on itself.
+When the backend cannot take another I/O, the operation fails with
+`-EAGAIN`, on every backend, as uDepot failed it: AIO's `io_submit`
+refuses (EAGAIN), SPDK has no free request (ENOMEM), or io_uring has no
+free submission entry (only while the kernel refuses submissions; it
+otherwise takes I/O past the ring's size, keeping the extra completions on
+its overflow list). The operation leaves nothing behind, so the caller can
+retry it once some of its outstanding ones complete. Nothing waits or
+spins for room: on EBUSY/EAGAIN from `io_uring_submit` the SQEs, already
+published, are left for the poller to push after it reaps, since the
+submitter may be the poller itself.
 
-This diverges from uDepot, which failed an I/O whose submission found the
-queue full. `QueueDepthTest` (`test/queue_depth_tests.h`, run per backend)
-holds completions back and puts 4096 operations in flight against a backend
-sized for 4.
+Only the caller's operations report `-EAGAIN`. uDepot's own synchronous
+I/O (recovery, index persistence, GC) shares the queue, so it retries a
+refused submission once some complete (`run_internal`), and SPDK's
+`pwrite_sync` polls its queue pair and retries.
+
+`QueueDepthTest` (`test/queue_depth_tests.h`, run per backend) sizes the
+backend for 4, puts 4096 operations in flight while nothing is reaped,
+requires each to succeed with its data or fail with exactly `-EAGAIN`
+(AIO and SPDK must refuse some), and retries until all are done.
 
 ### 7. Simplified Buffer (Replacing Mbuff)
 

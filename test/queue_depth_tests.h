@@ -12,9 +12,10 @@
 //
 // and check that batched gets and puts return the right data at every
 // depth, that deeper queues are faster than serial ones, that a get reads
-// into the caller's buffer rather than a new one, and that a depth beyond
-// what the backend's own queue holds (the AIO context, the io_uring ring,
-// the SPDK request pool) is still served rather than failed.
+// into the caller's buffer rather than a new one, and that operations
+// beyond what the backend's queue holds (the AIO context, the SPDK request
+// pool) fail with -EAGAIN, cleanly enough to retry, rather than with
+// another error or a wrong result.
 //
 // Each backend's test file defines a traits type and instantiates the suite:
 //
@@ -23,9 +24,9 @@
 //       // Completions are resumed on a backend thread (AIO, io_uring),
 //       // not by the submitting thread's poll (SPDK).
 //       static constexpr bool kPollerThread = ...;
-//       // Submissions past a full queue are refused and must wait.
-//       static constexpr bool kFullQueueWaits = ...;
-//       static uint64_t waited(IO& io);   // I/Os that had to wait
+//       // The backend refuses submissions past a full queue (AIO, SPDK);
+//       // io_uring's kernel takes them.
+//       static constexpr bool kQueueFills = ...;
 //       static void suite_setup();        // e.g. SPDK's global_init
 //       static void suite_teardown();
 //       static void configure(udepot::StoreConfig& config);  // path, size
@@ -98,13 +99,19 @@ struct ReadCtx {
 
 // Gets `key`, then holds the thread that resumed it, the backend's poller,
 // until *state is 2, so nothing is reaped meanwhile. Sets *state to 1 once
-// holding. Then gets the key again: a submission from the poller thread
+// holding, or to 3 if the get completed without suspending (nothing to
+// hold). Then gets the key again: a submission from the poller thread
 // itself, while the queue is full.
 template <typename Store>
 udepot::CoroTask<int> hold_completions(Store& store, std::string key,
                                        std::atomic<int>* state) {
+    const auto caller = std::this_thread::get_id();
     ReadCtx ctx;
     int rc = co_await store.get(key, ctx.val, sizeof(ctx.val), &ctx.val_size);
+    if (std::this_thread::get_id() == caller) {
+        state->store(3, std::memory_order_release);
+        co_return rc;
+    }
     state->store(1, std::memory_order_release);
     while (state->load(std::memory_order_acquire) != 2)
         std::this_thread::yield();
@@ -174,59 +181,70 @@ protected:
                 << "put i=" << i;
     }
 
-    // Step 2: issues puts of keys [first, first + n) from the preallocated
-    // buffers; n must not exceed them. The keys must outlive the tasks.
-    void issue_puts(int first, int n, std::vector<std::string>& keys,
+    // Step 2: issues puts of keys first + idx[k] from the preallocated
+    // buffers (slot k); idx must not outnumber them. The keys must outlive
+    // the tasks.
+    void issue_puts(int first, const std::vector<int>& idx,
+                    std::vector<std::string>& keys,
                     std::vector<udepot::CoroTask<int>>& tasks) {
-        keys.resize(n);
+        keys.resize(idx.size());
         tasks.clear();
-        tasks.reserve(n);
-        for (int j = 0; j < n; ++j) {
-            keys[j] = qd::make_key(first + j);
-            const std::string val = qd::make_val(first + j);
-            ASSERT_EQ(keys[j].size(), qd::kKeySize);
+        tasks.reserve(idx.size());
+        for (size_t k = 0; k < idx.size(); ++k) {
+            keys[k] = qd::make_key(first + idx[k]);
+            const std::string val = qd::make_val(first + idx[k]);
+            ASSERT_EQ(keys[k].size(), qd::kKeySize);
             ASSERT_EQ(val.size(), qd::kValSize);
-            std::memcpy(put_bufs_[j].value().data(), val.data(), val.size());
-            tasks.push_back(store_.put(qd::bytes(keys[j]), put_bufs_[j]));
+            std::memcpy(put_bufs_[k].value().data(), val.data(), val.size());
+            tasks.push_back(store_.put(qd::bytes(keys[k]), put_bufs_[k]));
         }
     }
 
     // Step 2, for gets into the preallocated buffers.
-    void issue_gets(int first, int n, std::vector<std::string>& keys,
+    void issue_gets(int first, const std::vector<int>& idx,
+                    std::vector<std::string>& keys,
                     std::vector<udepot::CoroTask<int>>& tasks) {
-        keys.resize(n);
+        keys.resize(idx.size());
         tasks.clear();
-        tasks.reserve(n);
-        for (int j = 0; j < n; ++j) {
-            keys[j] = qd::make_key(first + j);
-            tasks.push_back(store_.get(qd::bytes(keys[j]), &get_bufs_[j]));
+        tasks.reserve(idx.size());
+        for (size_t k = 0; k < idx.size(); ++k) {
+            keys[k] = qd::make_key(first + idx[k]);
+            tasks.push_back(store_.get(qd::bytes(keys[k]), &get_bufs_[k]));
         }
     }
 
-    // Step 4: waits for every task, then checks them. Every task is waited
-    // for before anything is asserted: returning early would destroy tasks
-    // whose I/O is still in flight.
-    void harvest(std::vector<udepot::CoroTask<int>>& tasks, int first,
-                 const char* what, int depth) {
+    static std::vector<int> iota(int n) {
+        std::vector<int> v(n);
+        for (int i = 0; i < n; ++i) v[i] = i;
+        return v;
+    }
+
+    // Step 4: waits for every task. Every one is waited for before anything
+    // is checked: returning early would destroy tasks whose I/O is still in
+    // flight.
+    static std::vector<int> wait_all(std::vector<udepot::CoroTask<int>>& tasks) {
         std::vector<int> rcs;
         rcs.reserve(tasks.size());
         for (auto& t : tasks) rcs.push_back(t.run_sync());
+        return rcs;
+    }
+
+    void expect_all_ok(const std::vector<int>& rcs, int first,
+                       const char* what, int depth) {
         for (size_t j = 0; j < rcs.size(); ++j)
             EXPECT_EQ(rcs[j], 0) << what << " failed at i=" << (first + j)
                                  << " depth=" << depth;
     }
 
-    // The values the last issue_gets read, and that each went into the
-    // caller's own buffer: the same place as every earlier get into it.
-    void check_gets(int first, int n, int depth) {
-        for (int j = 0; j < n; ++j) {
-            EXPECT_EQ(qd::text(get_bufs_[j].value()), qd::make_val(first + j))
-                << "wrong value at i=" << (first + j) << " depth=" << depth;
-            const uint8_t* at = get_bufs_[j].value().data();
-            if (!get_at_[j]) get_at_[j] = at;
-            EXPECT_EQ(at, get_at_[j])
-                << "get did not reuse the caller's buffer " << j;
-        }
+    // The value a get into slot k read, and that it went into the caller's
+    // own buffer: the same place as every earlier get into that slot.
+    void check_get(size_t k, int i) {
+        EXPECT_EQ(qd::text(get_bufs_[k].value()), qd::make_val(i))
+            << "wrong value at i=" << i;
+        const uint8_t* at = get_bufs_[k].value().data();
+        if (!get_at_[k]) get_at_[k] = at;
+        EXPECT_EQ(at, get_at_[k]) << "get did not reuse the caller's buffer "
+                                  << k;
     }
 
     // Gets keys [first, first + n) in batches of `depth`: every operation
@@ -237,9 +255,12 @@ protected:
         std::vector<udepot::CoroTask<int>> tasks;
         for (int start = first; start < first + n; start += depth) {
             const int batch = std::min(depth, first + n - start);
-            issue_gets(start, batch, keys, tasks);
-            harvest(tasks, start, "get", depth);
-            if (check) check_gets(start, batch, depth);
+            issue_gets(start, iota(batch), keys, tasks);
+            const std::vector<int> rcs = wait_all(tasks);
+            expect_all_ok(rcs, start, "get", depth);
+            if (!check) continue;
+            for (int j = 0; j < batch; ++j)
+                if (rcs[j] == 0) check_get(j, start + j);
         }
     }
 
@@ -250,8 +271,8 @@ protected:
         std::vector<udepot::CoroTask<int>> tasks;
         for (int start = first; start < first + n; start += depth) {
             const int batch = std::min(depth, first + n - start);
-            issue_puts(start, batch, keys, tasks);
-            harvest(tasks, start, "put", depth);
+            issue_puts(start, iota(batch), keys, tasks);
+            expect_all_ok(wait_all(tasks), start, "put", depth);
         }
     }
 
@@ -267,49 +288,102 @@ protected:
         }
     }
 
-    // Issues `depth` puts (or gets) of keys from `first` while nothing is
-    // being reaped, so far more are outstanding than the backend's queue
-    // holds, then lets completions run and checks every one. On a backend
-    // whose completions are resumed by a poller thread, a coroutine holds
-    // that thread; on SPDK, nothing polls until the tasks are waited on.
-    void issue_beyond_the_queue(int first, int depth, bool puts) {
-        ensure_buffers(depth);
+    // Issues puts (or gets) of keys first + idx[k], all at once, while
+    // nothing is being reaped, so far more are outstanding than the
+    // backend's queue holds; then lets completions run. On a backend whose
+    // completions are resumed by a poller thread, a coroutine holds that
+    // thread; on SPDK, nothing polls until the tasks are waited on. Each
+    // operation must succeed, with its data, or fail with -EAGAIN: those
+    // are returned, for the caller to retry.
+    std::vector<int> issue_beyond_the_queue(int first,
+                                            const std::vector<int>& idx,
+                                            bool puts) {
+        ensure_buffers(static_cast<int>(idx.size()));
         std::atomic<int> state{0};
         std::optional<udepot::CoroTask<int>> holder;
         if constexpr (Traits::kPollerThread) {
             holder.emplace(qd::hold_completions(store_, qd::make_key(0),
                                                 &state));
             const double deadline = qd::now_secs() + 30;
-            while (state.load(std::memory_order_acquire) != 1 &&
+            while (state.load(std::memory_order_acquire) == 0 &&
                    qd::now_secs() < deadline)
                 std::this_thread::yield();
-            ASSERT_EQ(state.load(), 1) << "the poller was never held";
+            if (state.load() != 1) {
+                ADD_FAILURE() << "the poller was never held";
+                state.store(2);
+                if (state.load() == 2 && holder) (void)holder->run_sync();
+                return {};
+            }
         }
 
-        const uint64_t waited0 = Traits::waited(store_.io());
         std::vector<std::string> keys;
         std::vector<udepot::CoroTask<int>> tasks;
         if (puts)
-            issue_puts(first, depth, keys, tasks);
+            issue_puts(first, idx, keys, tasks);
         else
-            issue_gets(first, depth, keys, tasks);
-        const uint64_t waited = Traits::waited(store_.io()) - waited0;
+            issue_gets(first, idx, keys, tasks);
 
         state.store(2, std::memory_order_release);  // let the poller go
         if (holder) {
-            EXPECT_EQ(holder->run_sync(), 0);
+            // Its second get is submitted from the poller thread itself,
+            // into a full queue: it may be refused, never stuck.
+            const int rc = holder->run_sync();
+            EXPECT_TRUE(rc == 0 || rc == -EAGAIN) << "rc=" << rc;
         }
-        harvest(tasks, first, puts ? "put" : "get", depth);
-        if (!puts) check_gets(first, depth, depth);
+        const std::vector<int> rcs = wait_all(tasks);
 
-        fprintf(stderr, "  %s: %d outstanding, %llu waited for room\n",
-                puts ? "PUT" : "GET", depth,
-                static_cast<unsigned long long>(waited));
-        if constexpr (Traits::kFullQueueWaits) {
-            // Otherwise the queue never filled and this test showed
-            // nothing about a full one.
-            EXPECT_GT(waited, 0u)
-                << "no I/O found the queue full; raise the depth";
+        std::vector<int> refused;
+        for (size_t k = 0; k < idx.size(); ++k) {
+            const int i = first + idx[k];
+            if (rcs[k] == -EAGAIN) {
+                refused.push_back(idx[k]);
+                continue;
+            }
+            EXPECT_EQ(rcs[k], 0) << (puts ? "put" : "get") << " i=" << i;
+            if (!puts && rcs[k] == 0) check_get(k, i);
+        }
+        return refused;
+    }
+
+    // Issues all n at once, beyond the queue, then, as a caller would,
+    // retries what was refused at the depth it sized the store for
+    // (`retry_depth` at a time) until nothing is.
+    void beyond_the_queue_until_done(int first, int n, bool puts,
+                                     int retry_depth) {
+        std::vector<int> todo = issue_beyond_the_queue(first, iota(n), puts);
+        fprintf(stderr, "  %s: %d outstanding, %zu refused (-EAGAIN)\n",
+                puts ? "PUT" : "GET", n, todo.size());
+        if constexpr (Traits::kQueueFills) {
+            // Otherwise the queue never filled and this showed nothing
+            // about a full one.
+            EXPECT_GT(todo.size(), 0u)
+                << "no operation found the queue full; raise the depth";
+        }
+        std::vector<std::string> keys;
+        std::vector<udepot::CoroTask<int>> tasks;
+        while (!todo.empty()) {
+            std::vector<int> refused;
+            for (size_t at = 0; at < todo.size(); at += retry_depth) {
+                const size_t end =
+                    std::min(todo.size(), at + static_cast<size_t>(retry_depth));
+                const std::vector<int> idx(todo.begin() + at,
+                                           todo.begin() + end);
+                if (puts)
+                    issue_puts(first, idx, keys, tasks);
+                else
+                    issue_gets(first, idx, keys, tasks);
+                const std::vector<int> rcs = wait_all(tasks);
+                for (size_t k = 0; k < idx.size(); ++k) {
+                    if (rcs[k] == -EAGAIN) {
+                        refused.push_back(idx[k]);
+                        continue;
+                    }
+                    EXPECT_EQ(rcs[k], 0) << "retry i=" << (first + idx[k]);
+                    if (!puts && rcs[k] == 0) check_get(k, first + idx[k]);
+                }
+            }
+            ASSERT_LT(refused.size(), todo.size()) << "retries made no progress";
+            todo = std::move(refused);
         }
     }
 
@@ -343,10 +417,13 @@ TYPED_TEST_P(QueueDepthTest, BatchedWritesCorrectAtAllDepths) {
 
 // The backend is sized for a queue depth of 4, and the caller has 4096
 // operations outstanding at once with nothing reaped meanwhile: the AIO
-// context and the SPDK request pool fill up, and io_uring's completion
-// queue overflows. Each operation must still complete, with its data, not
-// fail. 4096 is above the AIO context the kernel allocates for 4 on hosts
-// of up to ~500 CPUs (it allocates at least 8 per possible CPU).
+// context and the SPDK request pool fill up (io_uring's kernel takes them
+// all, overflowing the completion queue). What the backend cannot take
+// fails with -EAGAIN and nothing else: no -EIO, no -ENOENT for a key that
+// is there, no half-done put. Retried at the queue depth the store was
+// sized for, everything completes, with its data.
+// 4096 is above the AIO context the kernel allocates for 4 on hosts of up
+// to ~500 CPUs (it allocates at least 8 per possible CPU).
 TYPED_TEST_P(QueueDepthTest, DepthBeyondTheBackendQueue) {
     constexpr unsigned kQueueDepth = 4;
     constexpr int kDepth = 4096;
@@ -354,10 +431,10 @@ TYPED_TEST_P(QueueDepthTest, DepthBeyondTheBackendQueue) {
     this->put_keys(0, 1);  // the key hold_completions gets
     // A fresh thread: on SPDK its queue pair is created at the new size.
     std::thread t([&] {
-        this->issue_beyond_the_queue(1, kDepth, /*puts=*/true);
-        this->issue_beyond_the_queue(1, kDepth, /*puts=*/false);
-        // And once more into the same buffers.
-        this->issue_beyond_the_queue(1, kDepth, /*puts=*/false);
+        this->beyond_the_queue_until_done(1, kDepth, /*puts=*/true,
+                                          kQueueDepth);
+        this->beyond_the_queue_until_done(1, kDepth, /*puts=*/false,
+                                          kQueueDepth);
     });
     t.join();
     this->check_keys(1, kDepth);

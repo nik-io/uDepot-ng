@@ -80,10 +80,11 @@ struct StoreConfig {
     // Destroy any existing data on the device and start fresh.
     bool force_destroy = false;
     // I/Os the caller expects to have in flight at once (per thread on
-    // SPDK). It sizes the backend's tracking state (AIO context, io_uring
-    // ring, SPDK request pool) and is not a limit: deeper submissions are
-    // still served. 0 = the backend's default. Buffers are the caller's:
-    // see alloc_put_buffer() and alloc_get_buffer().
+    // SPDK). It sizes the backend's queue (AIO context, io_uring ring,
+    // SPDK request pool); uDepot allocates no data buffers for it, see
+    // alloc_put_buffer() and alloc_get_buffer(). An operation whose I/O
+    // the backend refuses because its queue is full fails with -EAGAIN.
+    // 0 = the backend's default.
     unsigned queue_depth = 0;
 };
 
@@ -160,6 +161,10 @@ public:
     // As in uDepot, the caller orders open() and close() against
     // operations: none may start before open() returns, run concurrently
     // with close(), or follow it.
+    //
+    // Any operation fails with -EAGAIN if the backend cannot take another
+    // I/O (its queue is full of the caller's operations); it may be retried
+    // once some of those complete. See StoreConfig::queue_depth.
     int open(const StoreConfig& config);
     void close();
 
@@ -379,6 +384,19 @@ private:
     bool validate_seg_md(const salsa::salsa_seg_md& md) const;
     // Reads and validates the metadata of the segment starting at seg_base.
     bool read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md);
+
+    // uDepot's own synchronous I/O (recovery, index persistence, GC). It
+    // shares the backend's queue with the caller's operations, so a
+    // submission refused for a full queue (-EAGAIN) is retried once some
+    // complete: only the caller's own operations report -EAGAIN.
+    template <typename Start>
+    static auto run_internal(Start&& start);
+    ssize_t pread_internal(void* buf, size_t count, off_t offset) {
+        return run_internal([&] { return io_.pread(buf, count, offset); });
+    }
+    ssize_t pwrite_internal(const void* buf, size_t count, off_t offset) {
+        return run_internal([&] { return io_.pwrite(buf, count, offset); });
+    }
 
     // ── Index segments (paper §4.4) ─────────────────────────────────────
     // close() flushes the hash tables to index segments, and an open after

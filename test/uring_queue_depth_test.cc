@@ -15,10 +15,9 @@ namespace {
 struct UringTraits {
     using IO = udepot::UringIO;
     static constexpr bool kPollerThread = true;
-    // The kernel takes submissions past the ring's size (completions go to
-    // its overflow list), so nothing waits.
-    static constexpr bool kFullQueueWaits = false;
-    static uint64_t waited(IO& io) { return io.waited_count(); }
+    // The kernel takes submissions past the ring's size, keeping the
+    // extra completions on its overflow list.
+    static constexpr bool kQueueFills = false;
     static void suite_setup() {}
     static void suite_teardown() {}
     static std::string& path() {

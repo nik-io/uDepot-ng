@@ -15,9 +15,7 @@ struct SpdkTraits {
     // Completions are harvested by the submitting thread's own poll.
     static constexpr bool kPollerThread = false;
     // Every request of the queue pair taken: ENOMEM.
-    static constexpr bool kFullQueueWaits = true;
-    // The calling thread's queue pair.
-    static uint64_t waited(IO&) { return udepot::SpdkIO::thread_waited_count(); }
+    static constexpr bool kQueueFills = true;
     static void suite_setup() {
         ASSERT_EQ(udepot::SpdkIO::global_init(), 0)
             << "SpdkIO::global_init() failed — is an NVMe namespace or "

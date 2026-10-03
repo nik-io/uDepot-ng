@@ -93,6 +93,17 @@ uint64_t UDepot<IO>::dev_md_grain_offset() const {
 }
 
 template <typename IO>
+template <typename Start>
+auto UDepot<IO>::run_internal(Start&& start) {
+    for (;;) {
+        auto r = start().run_sync();
+        if (r != -EAGAIN) return r;
+        // This thread's own completions (SPDK) free room only when polled.
+        if (!poll_this_thread()) std::this_thread::yield();
+    }
+}
+
+template <typename IO>
 int UDepot<IO>::persist_dev_md() {
     salsa::salsa_dev_md md{};
     md.physical_size = static_cast<u64>(total_grains_ * grain_size_);
@@ -111,8 +122,8 @@ int UDepot<IO>::persist_dev_md() {
     std::memset(buf.data, 0, aligned);
     std::memcpy(buf.data, &md, sizeof(md));
 
-    ssize_t w = io_.pwrite(buf.data, aligned,
-                           grain_to_offset(dev_md_grain_offset())).run_sync();
+    ssize_t w = pwrite_internal(buf.data, aligned,
+                                grain_to_offset(dev_md_grain_offset()));
     return (w == static_cast<ssize_t>(aligned)) ? 0 : -EIO;
 }
 
@@ -122,8 +133,8 @@ bool UDepot<IO>::validate_dev_md(salsa::salsa_dev_md* md_out) {
     IoBuffer buf = io_.alloc_buffer(aligned);
     if (!buf.data) return false;
 
-    ssize_t r = io_.pread(buf.data, aligned,
-                          grain_to_offset(dev_md_grain_offset())).run_sync();
+    ssize_t r = pread_internal(buf.data, aligned,
+                               grain_to_offset(dev_md_grain_offset()));
     if (r < static_cast<ssize_t>(sizeof(salsa::salsa_dev_md)))
         return false;
 
@@ -191,8 +202,8 @@ bool UDepot<IO>::read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md) {
     size_t md_bytes = static_cast<size_t>(seg_md_grains_) * grain_size_;
     IoBuffer md_buf = io_.alloc_buffer(md_bytes);
     if (!md_buf.data) return false;
-    ssize_t r = io_.pread(md_buf.data, md_bytes,
-                          grain_to_offset(md_grain)).run_sync();
+    ssize_t r = pread_internal(md_buf.data, md_bytes,
+                               grain_to_offset(md_grain));
     if (r < static_cast<ssize_t>(sizeof(salsa::salsa_seg_md))) return false;
     std::memcpy(md, md_buf.data, sizeof(*md));
     return validate_seg_md(*md);
@@ -209,7 +220,7 @@ int UDepot<IO>::recover_record(uint64_t hash, std::span<const uint8_t> key,
     // verified against the key, so another key with the same tag earlier in
     // the neighborhood cannot hide this key's entry.
     KeyProbe probe;
-    int rc = probe_key(hash, key, probe).run_sync();
+    int rc = run_internal([&] { return probe_key(hash, key, probe); });
     if (rc != 0) return rc;
 
     for (;;) {
@@ -263,9 +274,8 @@ int UDepot<IO>::read_segment(uint64_t grain, uint64_t grains, IoBuffer& buf) {
     auto* dst = static_cast<uint8_t*>(buf.data);
     for (size_t off = 0; off < bytes; off += kChunk) {
         size_t n = std::min(kChunk, bytes - off);
-        ssize_t r = io_.pread(dst + off, n,
-                              grain_to_offset(grain) + static_cast<off_t>(off))
-                        .run_sync();
+        ssize_t r = pread_internal(
+            dst + off, n, grain_to_offset(grain) + static_cast<off_t>(off));
         if (r != static_cast<ssize_t>(n)) return r < 0 ? static_cast<int>(r) : -EIO;
     }
     return 0;
@@ -521,9 +531,8 @@ int UDepot<IO>::flush_index() {
             for (size_t off = 0; off < net_bytes && rc == 0; off += chunk) {
                 size_t n = std::min(chunk, net_bytes - off);
                 fill(dst, off, n, hdr);
-                ssize_t w = io_.pwrite(dst, n, grain_to_offset(grain) +
-                                                   static_cast<off_t>(off))
-                                .run_sync();
+                ssize_t w = pwrite_internal(
+                    dst, n, grain_to_offset(grain) + static_cast<off_t>(off));
                 if (w != static_cast<ssize_t>(n)) rc = -EIO;
             }
         }
@@ -549,9 +558,8 @@ int UDepot<IO>::flush_index() {
         ftr.slot_nr = p.hdr.slot_nr;
         ftr.csum = index_md_csum(ftr);
         std::memcpy(dst + md_chunk - kIndexMdBytes, &ftr, sizeof(ftr));
-        ssize_t w = io_.pwrite(dst, md_chunk, grain_to_offset(p.grain) +
-                                                  static_cast<off_t>(pos))
-                        .run_sync();
+        ssize_t w = pwrite_internal(
+            dst, md_chunk, grain_to_offset(p.grain) + static_cast<off_t>(pos));
         if (w != static_cast<ssize_t>(md_chunk)) rc = -EIO;
     }
 
@@ -569,6 +577,7 @@ CoroTask<int> UDepot<IO>::tombstone_grains(uint64_t pba, uint64_t seg_ts,
     IoBuffer buf = io_.alloc_buffer(grain_size_);
     if (!buf.data) co_return -ENOMEM;
     ssize_t r = co_await io_.pread(buf.data, grain_size_, grain_to_offset(pba));
+    if (r < 0) co_return static_cast<int>(r);
     if (r != static_cast<ssize_t>(grain_size_)) co_return -EIO;
     KvHeader hdr;
     std::memcpy(&hdr, buf.data, sizeof(hdr));
@@ -599,9 +608,9 @@ int UDepot<IO>::restore_index(bool* restored) {
     if (!md_buf.data) return -ENOMEM;
     auto read_md = [&](uint64_t grain, size_t pos, void* out, size_t len,
                        size_t at) {
-        ssize_t r = io_.pread(md_buf.data, md_chunk,
-                              grain_to_offset(grain) + static_cast<off_t>(pos))
-                        .run_sync();
+        ssize_t r = pread_internal(md_buf.data, md_chunk,
+                                   grain_to_offset(grain) +
+                                       static_cast<off_t>(pos));
         if (r != static_cast<ssize_t>(md_chunk)) return false;
         std::memcpy(out, static_cast<uint8_t*>(md_buf.data) + at, len);
         return true;
@@ -697,9 +706,9 @@ int UDepot<IO>::restore_index(bool* restored) {
                     buf = io_.alloc_buffer(n);
                     if (!buf.data) return -ENOMEM;
                 }
-                ssize_t r = io_.pread(buf.data, n, grain_to_offset(f->grain) +
-                                                       static_cast<off_t>(off))
-                                .run_sync();
+                ssize_t r = pread_internal(
+                    buf.data, n,
+                    grain_to_offset(f->grain) + static_cast<off_t>(off));
                 if (r != static_cast<ssize_t>(n)) {
                     ok = false;
                     break;
@@ -761,10 +770,17 @@ int UDepot<IO>::restore_index(bool* restored) {
                 tasks.push_back(tombstone_grains(
                     tombs[i + j].first, data_ts[tombs[i + j].second],
                     &grains[j]));
-            for (size_t j = 0; j < n; ++j)
-                if (tasks[j].run_sync() != 0 ||
-                    !account(tombs[i + j].first, grains[j]))
+            for (size_t j = 0; j < n; ++j) {
+                int rc = tasks[j].run_sync();
+                if (rc == -EAGAIN)  // the batch overran the backend's queue
+                    rc = run_internal([&] {
+                        return tombstone_grains(tombs[i + j].first,
+                                                data_ts[tombs[i + j].second],
+                                                &grains[j]);
+                    });
+                if (rc != 0 || !account(tombs[i + j].first, grains[j]))
                     ok = false;
+            }
         }
     }
 
@@ -773,10 +789,9 @@ int UDepot<IO>::restore_index(bool* restored) {
     // the log moves on.
     std::memset(md_buf.data, 0, md_chunk);
     for (const Found& f : found) {
-        ssize_t w = io_.pwrite(md_buf.data, md_chunk,
-                               grain_to_offset(f.grain) +
-                                   static_cast<off_t>(net_bytes - md_chunk))
-                        .run_sync();
+        ssize_t w = pwrite_internal(md_buf.data, md_chunk,
+                                    grain_to_offset(f.grain) +
+                                        static_cast<off_t>(net_bytes - md_chunk));
         if (w != static_cast<ssize_t>(md_chunk)) return -EIO;
     }
     if (!ok) return 0;
@@ -1636,9 +1651,8 @@ CoroTask<int> UDepot<IO>::verify_key_at_pba(
 
     ssize_t nread = co_await io_.pread(buf.data, aligned_size,
                                        grain_to_offset(pba));
-    if (nread < static_cast<ssize_t>(read_size)) {
-        co_return -EIO;
-    }
+    if (nread < 0) co_return static_cast<int>(nread);
+    if (nread < static_cast<ssize_t>(read_size)) co_return -EIO;
 
     auto* p = static_cast<const uint8_t*>(buf.data);
     KvHeader hdr;
@@ -1707,6 +1721,7 @@ CoroTask<int> UDepot<IO>::get_record(std::span<const uint8_t> key,
             hook(key);
         ssize_t nread = co_await io_.pread(into->data, read_bytes,
                                            grain_to_offset(pba));
+        if (nread < 0) co_return static_cast<int>(nread);
         if (nread < static_cast<ssize_t>(sizeof(KvHeader)))
             continue;
 

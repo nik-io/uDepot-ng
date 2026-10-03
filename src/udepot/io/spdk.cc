@@ -299,9 +299,6 @@ SpdkQpair::SpdkQpair(SpdkQpair&& o) noexcept
     : ns(std::exchange(o.ns, nullptr)),
       qpair(std::exchange(o.qpair, nullptr)),
       npending(std::exchange(o.npending, 0)),
-      wait_head(std::exchange(o.wait_head, nullptr)),
-      wait_tail(std::exchange(o.wait_tail, nullptr)),
-      waited(std::exchange(o.waited, 0)),
       ready(std::move(o.ready)),
       gs(std::exchange(o.gs, nullptr)),
       bounced(std::exchange(o.bounced, 0)) {
@@ -312,18 +309,13 @@ SpdkQpair::SpdkQpair(SpdkQpair&& o) noexcept
 }
 
 int32_t SpdkQpair::execute_completions(uint32_t max_completions) {
-    if (idle())
+    if (npending == 0)
         return 0;
-    int32_t r = 0;
-    if (npending > 0) {
-        r = spdk_nvme_qpair_process_completions(qpair, max_completions);
-        if (r < 0) {
-            fprintf(stderr, "spdk_nvme_qpair_process_completions returned error. Aborting\n");
-            abort();
-        }
+    int32_t r = spdk_nvme_qpair_process_completions(qpair, max_completions);
+    if (r < 0) {
+        fprintf(stderr, "spdk_nvme_qpair_process_completions returned error. Aborting\n");
+        abort();
     }
-    if (wait_head)
-        submit_waiting();
     return r;
 }
 
@@ -354,72 +346,34 @@ struct SpdkRequest {
     uint64_t lba;
     uint32_t lba_cnt;
     bool write;
-    SpdkRequest* next = nullptr;     // in the queue pair's wait queue
 };
-
-static void complete_request(SpdkRequest* req) {
-    if (req->handle)
-        req->qp->ready.push_back(req->handle);
-    else
-        *req->done = true;
-}
 
 static void spdk_io_cb(void* ctx, const struct spdk_nvme_cpl* cpl) {
     auto* req = static_cast<SpdkRequest*>(ctx);
     assert(req->qp->npending > 0);
     --req->qp->npending;
     req->result = spdk_nvme_cpl_is_error(cpl) ? -EIO : 0;
-    complete_request(req);
+    if (req->handle)
+        req->qp->ready.push_back(req->handle);
+    else
+        *req->done = true;
 }
 
-int SpdkQpair::submit_now(SpdkRequest* req) {
+int SpdkQpair::submit(SpdkRequest* req) {
+    req->qp = this;
     int err = req->write
         ? spdk_nvme_ns_cmd_write(ns->ns, qpair, req->buf, req->lba,
                                  req->lba_cnt, spdk_io_cb, req, 0)
         : spdk_nvme_ns_cmd_read(ns->ns, qpair, req->buf, req->lba,
                                 req->lba_cnt, spdk_io_cb, req, 0);
-    if (err == 0) ++npending;
+    if (err == 0) {
+        ++npending;
+        return 0;
+    }
+    if (err == -ENOMEM) return -EAGAIN;  // every request taken
+    fprintf(stderr, "spdk: submitting %s request failed err=%d\n",
+            req->write ? "write" : "read", err);
     return err;
-}
-
-// ENOMEM means every request of the queue pair is taken. With I/Os in
-// flight, one completing frees a request, so the I/O waits for that; with
-// none, nothing will, and it fails.
-int SpdkQpair::submit(SpdkRequest* req) {
-    req->qp = this;
-    if (!wait_head) {  // otherwise behind the waiting ones
-        int err = submit_now(req);
-        if (err == 0) return 0;
-        if (err != -ENOMEM || npending == 0) {
-            fprintf(stderr, "spdk: submitting %s request failed err=%d\n",
-                    req->write ? "write" : "read", err);
-            return err;
-        }
-    }
-    req->next = nullptr;
-    if (wait_tail)
-        wait_tail->next = req;
-    else
-        wait_head = req;
-    wait_tail = req;
-    ++waited;
-    return 0;
-}
-
-void SpdkQpair::submit_waiting() {
-    while (wait_head) {
-        SpdkRequest* req = wait_head;
-        int err = submit_now(req);
-        if (err == -ENOMEM && npending > 0) return;
-        wait_head = req->next;
-        if (!wait_head) wait_tail = nullptr;
-        if (err != 0) {
-            fprintf(stderr, "spdk: submitting %s request failed err=%d\n",
-                    req->write ? "write" : "read", err);
-            req->result = err;
-            complete_request(req);
-        }
-    }
 }
 
 // Submit an NVMe command on the calling thread's queue pair and suspend;
@@ -603,7 +557,7 @@ bool SpdkIO::poll_thread_qpair() {
         ready.swap(qp->ready);
         for (auto h : ready) h.resume();
     }
-    return !qp->idle();
+    return qp->npending > 0;
 }
 
 // Whether the device can transfer straight to or from buf: memory SPDK can
@@ -626,11 +580,6 @@ static bool direct_io_ok(const void* buf, size_t count, off_t offset,
 uint64_t SpdkIO::thread_bounce_count() {
     SpdkQpair* qp = thread_qpair_.get();
     return qp ? qp->bounced : 0;
-}
-
-uint64_t SpdkIO::thread_waited_count() {
-    SpdkQpair* qp = thread_qpair_.get();
-    return qp ? qp->waited : 0;
 }
 
 ssize_t SpdkIO::pwrite_sync(const void* buf, size_t count, off_t offset) {
@@ -656,7 +605,12 @@ ssize_t SpdkIO::pwrite_sync(const void* buf, size_t count, off_t offset) {
     bool done = false;
     SpdkRequest req{qp, 0, {}, &done, dma_buf, lba_start,
                     static_cast<uint32_t>(nlbas), true};
-    int rc = qp->submit(&req);
+    // uDepot's own metadata write: a queue pair full of this thread's I/O
+    // frees a request as soon as one completes, so poll and retry rather
+    // than fail the write.
+    int rc;
+    while ((rc = qp->submit(&req)) == -EAGAIN && qp->npending > 0)
+        qp->execute_completions(0);
     if (rc == 0) {
         // Completions of this thread's suspended coroutines that arrive
         // meanwhile are queued for its next poll, not resumed here.

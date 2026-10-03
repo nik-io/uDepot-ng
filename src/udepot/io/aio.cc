@@ -84,107 +84,34 @@ struct AioRequest {
     struct iocb cb;
     ssize_t result;
     std::coroutine_handle<> handle;
-    AioRequest* next;  // in AioIO's wait queue, or its failed list
 };
 
 struct AioSubmitAwaitable {
     AioRequest* req;
-    AioIO* io;
+    aio_context_t ctx;
+    std::atomic<size_t>* pending;
 
     bool await_ready() noexcept { return false; }
 
     bool await_suspend(std::coroutine_handle<> h) noexcept {
         req->handle = h;
-        // Behind waiting requests, if any: they go first.
-        if (io->waiting_.load(std::memory_order_seq_cst) == 0) {
-            int err = io->submit_one(req);
-            if (err == 0) return true;
-            if (err != EAGAIN) {
-                req->result = -err;
-                return false;
-            }
+        struct iocb* cbs[1] = {&req->cb};
+        // Counted before submitting: the completion can arrive, and be
+        // counted down, before io_submit returns.
+        pending->fetch_add(1, std::memory_order_release);
+        tsan_release_to_kernel(req);
+        int rc = sys_io_submit(ctx, 1, cbs);
+        if (rc != 1) {
+            // EAGAIN: the context is full.
+            req->result = (rc < 0) ? -errno : -EIO;
+            pending->fetch_sub(1, std::memory_order_relaxed);
+            return false;
         }
-        return io->wait_for_room(req);
+        return true;
     }
 
     ssize_t await_resume() noexcept { return req->result; }
 };
-
-int AioIO::submit_one(AioRequest* req) noexcept {
-    struct iocb* cbs[1] = {&req->cb};
-    // Counted before submitting: the completion can arrive, and be counted
-    // down, before io_submit returns.
-    pending_.fetch_add(1, std::memory_order_seq_cst);
-    tsan_release_to_kernel(req);
-    int rc = sys_io_submit(ctx_, 1, cbs);
-    if (rc == 1) return 0;
-    int err = (rc < 0) ? errno : EIO;
-    pending_.fetch_sub(1, std::memory_order_seq_cst);
-    return err;
-}
-
-// The waiter counts itself in waiting_ and then retries; the poller reaps
-// (freeing room) and then looks at waiting_. Both are seq_cst, so whichever
-// goes second sees the other: room freed while a request is being queued
-// is used by one of them, never by neither.
-bool AioIO::wait_for_room(AioRequest* req) {
-    AioRequest* failed = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(wait_mu_);
-        req->next = nullptr;
-        if (wait_tail_)
-            wait_tail_->next = req;
-        else
-            wait_head_ = req;
-        wait_tail_ = req;
-        waiting_.fetch_add(1, std::memory_order_seq_cst);
-        waited_total_.fetch_add(1, std::memory_order_relaxed);
-        submit_waiting_locked(&failed);
-    }
-    // A request that was submitted may already have completed and been
-    // resumed by the poller, so req is compared, not dereferenced, unless
-    // it is on the failed list.
-    bool req_failed = false;
-    while (failed) {
-        AioRequest* r = failed;
-        failed = r->next;
-        if (r == req)
-            req_failed = true;
-        else
-            r->handle.resume();
-    }
-    return !req_failed;
-}
-
-void AioIO::submit_waiting_locked(AioRequest** failed) {
-    while (wait_head_) {
-        AioRequest* r = wait_head_;
-        AioRequest* next = r->next;  // r may complete once submitted
-        int err = submit_one(r);
-        if (err == EAGAIN) return;  // still full; the poller retries
-        wait_head_ = next;
-        if (!wait_head_) wait_tail_ = nullptr;
-        waiting_.fetch_sub(1, std::memory_order_seq_cst);
-        if (err != 0) {
-            r->result = -err;
-            r->next = *failed;
-            *failed = r;
-        }
-    }
-}
-
-void AioIO::submit_waiting() {
-    AioRequest* failed = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(wait_mu_);
-        submit_waiting_locked(&failed);
-    }
-    while (failed) {
-        AioRequest* r = failed;
-        failed = r->next;
-        r->handle.resume();
-    }
-}
 
 AioIO::~AioIO() { close(); }
 
@@ -214,7 +141,6 @@ int AioIO::open(const char* path, size_t size) {
     }
 
     size_ = size;
-    waited_total_.store(0, std::memory_order_relaxed);
 
     ctx_ = 0;
     if (sys_io_setup(queue_depth_, &ctx_) < 0) {
@@ -258,7 +184,7 @@ CoroTask<ssize_t> AioIO::pread(void* buf, size_t count, off_t offset) {
     req.cb.aio_offset = offset;
     req.cb.aio_data = reinterpret_cast<uint64_t>(&req);
 
-    ssize_t result = co_await AioSubmitAwaitable{&req, this};
+    ssize_t result = co_await AioSubmitAwaitable{&req, ctx_, &pending_};
     co_return result;
 }
 
@@ -273,7 +199,7 @@ CoroTask<ssize_t> AioIO::pwrite(const void* buf, size_t count, off_t offset) {
     req.cb.aio_offset = offset;
     req.cb.aio_data = reinterpret_cast<uint64_t>(&req);
 
-    ssize_t result = co_await AioSubmitAwaitable{&req, this};
+    ssize_t result = co_await AioSubmitAwaitable{&req, ctx_, &pending_};
     co_return result;
 }
 
@@ -286,12 +212,11 @@ void AioIO::poller_loop() {
     static constexpr int kMaxEvents = 8;
     struct io_event events[kMaxEvents];
 
-    // After close() clears running_, keep going until every submitted or
-    // waiting I/O has completed; returning earlier would leave those
-    // coroutines suspended forever.
+    // After close() clears running_, keep going until every submitted I/O
+    // has completed; returning earlier would leave those coroutines
+    // suspended forever.
     while (running_.load(std::memory_order_acquire) ||
-           pending_.load(std::memory_order_acquire) > 0 ||
-           waiting_.load(std::memory_order_acquire) > 0) {
+           pending_.load(std::memory_order_acquire) > 0) {
         int n = 0;
         if (aio_ring_valid(ctx_))
             n = aio_ring_getevents(ctx_, kMaxEvents, events);
@@ -312,13 +237,9 @@ void AioIO::poller_loop() {
             } else {
                 req->result = static_cast<ssize_t>(events[i].res);
             }
-            pending_.fetch_sub(1, std::memory_order_seq_cst);
+            pending_.fetch_sub(1, std::memory_order_relaxed);
             req->handle.resume();
         }
-
-        // Also after a timeout, as a backstop.
-        if (waiting_.load(std::memory_order_seq_cst) > 0)
-            submit_waiting();
     }
 }
 

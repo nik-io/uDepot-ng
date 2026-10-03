@@ -15,9 +15,8 @@ namespace {
 struct AioTraits {
     using IO = udepot::AioIO;
     static constexpr bool kPollerThread = true;
-    // The kernel refuses io_submit (EAGAIN) once the context is full.
-    static constexpr bool kFullQueueWaits = true;
-    static uint64_t waited(IO& io) { return io.waited_count(); }
+    // io_submit fails with EAGAIN once the context is full.
+    static constexpr bool kQueueFills = true;
     static void suite_setup() {}
     static void suite_teardown() {}
     static std::string& path() {
