@@ -14,6 +14,9 @@
 #     not: their absolute throughput differed by up to ~1.7x, and AIO's GET
 #     once read 13.7% slower with zero copy in CI, on code where every paired
 #     comparison has it faster.
+#   - Every buffer is allocated and filled before any timing, uDepot's own
+#     (alloc_put_buffer/alloc_get_buffer) for zero copy and plain memory for
+#     copy, so a batch times only the operations.
 #   - The gate is the median of RUNS such per-run deltas, never throughputs
 #     from different runs set against each other.
 #   - The store lives on /dev/shm (tmpfs: RAM-backed, buffered), so both

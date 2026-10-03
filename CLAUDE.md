@@ -151,7 +151,15 @@ operation done two ways, so there is no stored baseline to drift.
 The comparison is paired, inside one process: `udepot_ng_bench --compare`
 runs rounds of a copy batch and a zero-copy batch back to back on one store
 (which goes first alternates), and reports the median of the rounds'
-zero-copy/copy ratios; the gate is the median of 5 such runs. The two
+zero-copy/copy ratios; the gate is the median of 5 such runs. Zero copy is
+uDepot's property, not the caller's: given a buffer it handed out
+(`alloc_put_buffer()`, `alloc_get_buffer()`), put and get do their I/O on
+it directly, and given other memory they copy through one of their own. So
+the bench sets both modes up as a caller would, outside the timing: every
+buffer allocated and every value written up front, plain memory for the
+copying API and uDepot's buffers for the zero-copy one, the same values in
+both. The timed loops only issue operations; gets are checked afterwards.
+An earlier version allocated a `PutBuffer` per put inside the timed loop. The two
 batches of a round share whatever drifts (the runner, GC, a network
 target), so the ratio isolates the copies zero copy avoids. It used to
 compare separate runs of each, by median: absolute throughput differs by up
