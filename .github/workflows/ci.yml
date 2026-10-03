@@ -168,7 +168,7 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DUDEPOT_BUILD_SPDK=ON -DUDEPOT_BUILD_PYTHON=OFF
-          cmake --build build -j"$(nproc)" --target spdk_test spdk_store_test
+          cmake --build build -j"$(nproc)" --target spdk_tests
 
       # As uDepot's CI: the SPDK backend as an NVMe-oF initiator against a
       # loopback nvmf_tgt exporting a RAM-backed bdev. No NVMe hardware.

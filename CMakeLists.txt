@@ -277,6 +277,15 @@ if(UDEPOT_BUILD_TESTS)
         set_tests_properties(spdk_store_test PROPERTIES TIMEOUT 120)
         udepot_add_test(spdk_queue_depth_test test/spdk_queue_depth_test.cc)
         set_tests_properties(spdk_queue_depth_test PROPERTIES TIMEOUT 300)
+
+        # Every SPDK test, in one place: CI builds `spdk_tests`, and
+        # scripts/spdk-nvmef-test.sh runs what spdk_tests.txt names. A new
+        # SPDK test added here is built and run by both; listing it in either
+        # by hand let them drift (a test the script required was never built).
+        set(UDEPOT_SPDK_TESTS spdk_test spdk_store_test spdk_queue_depth_test)
+        add_custom_target(spdk_tests DEPENDS ${UDEPOT_SPDK_TESTS})
+        list(JOIN UDEPOT_SPDK_TESTS "\n" _spdk_tests_list)
+        file(WRITE ${CMAKE_BINARY_DIR}/spdk_tests.txt "${_spdk_tests_list}\n")
     endif()
 
     # Perf benchmark binary (not a gtest — standalone executable).

@@ -27,9 +27,8 @@ SPDK_DIR="${SPDK_DIR:-$HERE/extern/spdk}"
 RPC="$SPDK_DIR/scripts/rpc.py"
 TGT_BIN="$SPDK_DIR/build/bin/nvmf_tgt"
 DPDK_LIB="$SPDK_DIR/dpdk/build/lib"
-STORE_TEST="$HERE/$BUILD_DIR/spdk_store_test"
-IO_TEST="$HERE/$BUILD_DIR/spdk_test"
-QD_TEST="$HERE/$BUILD_DIR/spdk_queue_depth_test"
+# The SPDK tests to run, as CMake lists them (the `spdk_tests` target).
+TEST_LIST="$HERE/$BUILD_DIR/spdk_tests.txt"
 
 NQN="nqn.2016-06.io.spdk:cnode1"
 TADDR="127.0.0.1"
@@ -66,9 +65,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-[ -x "$STORE_TEST" ] || fail "$STORE_TEST not found -- build with -DUDEPOT_BUILD_SPDK=ON"
-[ -x "$IO_TEST" ]    || fail "$IO_TEST not found -- build with -DUDEPOT_BUILD_SPDK=ON"
-[ -x "$QD_TEST" ]    || fail "$QD_TEST not found -- build with -DUDEPOT_BUILD_SPDK=ON"
+[ -f "$TEST_LIST" ] || fail "$TEST_LIST not found -- configure with -DUDEPOT_BUILD_SPDK=ON"
+TESTS=()
+while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    t="$HERE/$BUILD_DIR/$name"
+    [ -x "$t" ] || fail "$t not found -- build the spdk_tests target"
+    TESTS+=("$t")
+done < "$TEST_LIST"
+[ ${#TESTS[@]} -gt 0 ] || fail "$TEST_LIST lists no tests"
 [ -x "$TGT_BIN" ]    || fail "$TGT_BIN not found -- build SPDK first"
 
 # ── hugepages ────────────────────────────────────────────────────────────────
@@ -128,7 +133,7 @@ PIN=()
 if [ "$NCPU" -ge 3 ]; then
     PIN=(taskset -c "1-$((NCPU-1))")
 fi
-for t in "$IO_TEST" "$STORE_TEST" "$QD_TEST"; do
+for t in "${TESTS[@]}"; do
     log "running $(basename "$t") on ${NCPU} cpus"
     # Bounded: a run normally takes well under a minute. A per-I/O stall
     # (the initiator's EAL once pinned it onto the target's core, costing
