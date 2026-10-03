@@ -27,6 +27,8 @@
 //       // The backend refuses submissions past a full queue (AIO, SPDK);
 //       // io_uring's kernel takes them.
 //       static constexpr bool kQueueFills = ...;
+//       // The kernel bounds the queue size (AIO, io_uring).
+//       static constexpr bool kQueueSizeLimited = ...;
 //       static void suite_setup();        // e.g. SPDK's global_init
 //       static void suite_teardown();
 //       static void configure(udepot::StoreConfig& config);  // path, size
@@ -41,6 +43,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -50,6 +53,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <sys/sysinfo.h>
 
 #include <gtest/gtest.h>
 
@@ -164,14 +169,17 @@ protected:
             get_bufs_.push_back(store_.alloc_get_buffer(qd::kKeySize,
                                                         qd::kValSize));
             ASSERT_TRUE(get_bufs_.back().valid());
-            get_at_.push_back(nullptr);
+            // Fresh from alloc_get_buffer, value() is the buffer's start.
+            get_base_.push_back(get_bufs_.back().value().data());
+            exists_size_.push_back(0);
         }
     }
 
     void free_buffers() {
         put_bufs_.clear();
         get_bufs_.clear();
-        get_at_.clear();
+        get_base_.clear();
+        exists_size_.clear();
     }
 
     void put_keys(int first, int n) {
@@ -197,6 +205,20 @@ protected:
             ASSERT_EQ(val.size(), qd::kValSize);
             std::memcpy(put_bufs_[k].value().data(), val.data(), val.size());
             tasks.push_back(store_.put(qd::bytes(keys[k]), put_bufs_[k]));
+        }
+    }
+
+    // Step 2, for exists().
+    void issue_exists(int first, const std::vector<int>& idx,
+                      std::vector<std::string>& keys,
+                      std::vector<udepot::CoroTask<int>>& tasks) {
+        keys.resize(idx.size());
+        tasks.clear();
+        tasks.reserve(idx.size());
+        for (size_t k = 0; k < idx.size(); ++k) {
+            keys[k] = qd::make_key(first + idx[k]);
+            exists_size_[k] = 0;
+            tasks.push_back(store_.exists(qd::bytes(keys[k]), &exists_size_[k]));
         }
     }
 
@@ -236,15 +258,39 @@ protected:
                                  << " depth=" << depth;
     }
 
-    // The value a get into slot k read, and that it went into the caller's
-    // own buffer: the same place as every earlier get into that slot.
+    // The value a get into slot k read, and that it went into the buffer
+    // alloc_get_buffer gave that slot: the record is read to the buffer's
+    // start, so the value sits right past its header and key.
     void check_get(size_t k, int i) {
         EXPECT_EQ(qd::text(get_bufs_[k].value()), qd::make_val(i))
             << "wrong value at i=" << i;
-        const uint8_t* at = get_bufs_[k].value().data();
-        if (!get_at_[k]) get_at_[k] = at;
-        EXPECT_EQ(at, get_at_[k]) << "get did not reuse the caller's buffer "
-                                  << k;
+        EXPECT_EQ(get_bufs_[k].value().data(),
+                  get_base_[k] + sizeof(udepot::KvHeader) + qd::kKeySize)
+            << "get did not read into the caller's buffer " << k;
+    }
+
+    enum class Op { kPut, kGet, kExists };
+    static const char* op_name(Op op) {
+        return op == Op::kPut ? "PUT" : op == Op::kGet ? "GET" : "EXISTS";
+    }
+
+    void issue(Op op, int first, const std::vector<int>& idx,
+               std::vector<std::string>& keys,
+               std::vector<udepot::CoroTask<int>>& tasks) {
+        switch (op) {
+            case Op::kPut: issue_puts(first, idx, keys, tasks); break;
+            case Op::kGet: issue_gets(first, idx, keys, tasks); break;
+            case Op::kExists: issue_exists(first, idx, keys, tasks); break;
+        }
+    }
+
+    // What a successful operation in slot k for key i must have returned.
+    void check_done(Op op, size_t k, int i) {
+        if (op == Op::kGet) {
+            check_get(k, i);
+        } else if (op == Op::kExists) {
+            EXPECT_EQ(exists_size_[k], qd::kValSize) << "exists i=" << i;
+        }
     }
 
     // Gets keys [first, first + n) in batches of `depth`: every operation
@@ -288,7 +334,7 @@ protected:
         }
     }
 
-    // Issues puts (or gets) of keys first + idx[k], all at once, while
+    // Issues an operation on each key first + idx[k], all at once, while
     // nothing is being reaped, so far more are outstanding than the
     // backend's queue holds; then lets completions run. On a backend whose
     // completions are resumed by a poller thread, a coroutine holds that
@@ -297,7 +343,7 @@ protected:
     // are returned, for the caller to retry.
     std::vector<int> issue_beyond_the_queue(int first,
                                             const std::vector<int>& idx,
-                                            bool puts) {
+                                            Op op) {
         ensure_buffers(static_cast<int>(idx.size()));
         std::atomic<int> state{0};
         std::optional<udepot::CoroTask<int>> holder;
@@ -318,10 +364,7 @@ protected:
 
         std::vector<std::string> keys;
         std::vector<udepot::CoroTask<int>> tasks;
-        if (puts)
-            issue_puts(first, idx, keys, tasks);
-        else
-            issue_gets(first, idx, keys, tasks);
+        issue(op, first, idx, keys, tasks);
 
         state.store(2, std::memory_order_release);  // let the poller go
         if (holder) {
@@ -339,8 +382,8 @@ protected:
                 refused.push_back(idx[k]);
                 continue;
             }
-            EXPECT_EQ(rcs[k], 0) << (puts ? "put" : "get") << " i=" << i;
-            if (!puts && rcs[k] == 0) check_get(k, i);
+            EXPECT_EQ(rcs[k], 0) << op_name(op) << " i=" << i;
+            if (rcs[k] == 0) check_done(op, k, i);
         }
         return refused;
     }
@@ -348,11 +391,11 @@ protected:
     // Issues all n at once, beyond the queue, then, as a caller would,
     // retries what was refused at the depth it sized the store for
     // (`retry_depth` at a time) until nothing is.
-    void beyond_the_queue_until_done(int first, int n, bool puts,
+    void beyond_the_queue_until_done(int first, int n, Op op,
                                      int retry_depth) {
-        std::vector<int> todo = issue_beyond_the_queue(first, iota(n), puts);
+        std::vector<int> todo = issue_beyond_the_queue(first, iota(n), op);
         fprintf(stderr, "  %s: %d outstanding, %zu refused (-EAGAIN)\n",
-                puts ? "PUT" : "GET", n, todo.size());
+                op_name(op), n, todo.size());
         if constexpr (Traits::kQueueFills) {
             // Otherwise the queue never filled and this showed nothing
             // about a full one.
@@ -368,18 +411,16 @@ protected:
                     std::min(todo.size(), at + static_cast<size_t>(retry_depth));
                 const std::vector<int> idx(todo.begin() + at,
                                            todo.begin() + end);
-                if (puts)
-                    issue_puts(first, idx, keys, tasks);
-                else
-                    issue_gets(first, idx, keys, tasks);
+                issue(op, first, idx, keys, tasks);
                 const std::vector<int> rcs = wait_all(tasks);
                 for (size_t k = 0; k < idx.size(); ++k) {
                     if (rcs[k] == -EAGAIN) {
                         refused.push_back(idx[k]);
                         continue;
                     }
-                    EXPECT_EQ(rcs[k], 0) << "retry i=" << (first + idx[k]);
-                    if (!puts && rcs[k] == 0) check_get(k, first + idx[k]);
+                    EXPECT_EQ(rcs[k], 0) << "retry " << op_name(op)
+                                         << " i=" << (first + idx[k]);
+                    if (rcs[k] == 0) check_done(op, k, first + idx[k]);
                 }
             }
             ASSERT_LT(refused.size(), todo.size()) << "retries made no progress";
@@ -391,7 +432,8 @@ protected:
     Store store_;
     std::vector<udepot::PutBuffer> put_bufs_;
     std::vector<udepot::GetBuffer> get_bufs_;
-    std::vector<const uint8_t*> get_at_;
+    std::vector<const uint8_t*> get_base_;  // each get buffer's start
+    std::vector<size_t> exists_size_;
 };
 
 TYPED_TEST_SUITE_P(QueueDepthTest);
@@ -415,29 +457,75 @@ TYPED_TEST_P(QueueDepthTest, BatchedWritesCorrectAtAllDepths) {
     }
 }
 
-// The backend is sized for a queue depth of 4, and the caller has 4096
-// operations outstanding at once with nothing reaped meanwhile: the AIO
+// The backend is sized for a queue depth of 4, and the caller has thousands
+// of operations outstanding at once with nothing reaped meanwhile: the AIO
 // context and the SPDK request pool fill up (io_uring's kernel takes them
 // all, overflowing the completion queue). What the backend cannot take
-// fails with -EAGAIN and nothing else: no -EIO, no -ENOENT for a key that
-// is there, no half-done put. Retried at the queue depth the store was
-// sized for, everything completes, with its data.
-// 4096 is above the AIO context the kernel allocates for 4 on hosts of up
-// to ~500 CPUs (it allocates at least 8 per possible CPU).
+// fails with -EAGAIN and nothing else: no -EIO, no -ENOENT for a key that is
+// there (from get or exists), no half-done put. Retried at the queue depth
+// the store was sized for, everything completes, with its data.
 TYPED_TEST_P(QueueDepthTest, DepthBeyondTheBackendQueue) {
     constexpr unsigned kQueueDepth = 4;
-    constexpr int kDepth = 4096;
+    // Above any backend's queue: the AIO context the kernel allocates for 4
+    // holds at least 8 I/Os per possible CPU, and SPDK's request pool 512.
+    const int depth = std::max(4096, 16 * get_nprocs_conf() + 1024);
+    using Op = typename TestFixture::Op;
     this->reopen(kQueueDepth);
     this->put_keys(0, 1);  // the key hold_completions gets
     // A fresh thread: on SPDK its queue pair is created at the new size.
     std::thread t([&] {
-        this->beyond_the_queue_until_done(1, kDepth, /*puts=*/true,
-                                          kQueueDepth);
-        this->beyond_the_queue_until_done(1, kDepth, /*puts=*/false,
-                                          kQueueDepth);
+        for (Op op : {Op::kPut, Op::kGet, Op::kExists})
+            this->beyond_the_queue_until_done(1, depth, op, kQueueDepth);
     });
     t.join();
-    this->check_keys(1, kDepth);
+    this->check_keys(1, depth);
+}
+
+// Values larger than one transfer at the smallest queue depth: SPDK splits
+// such an I/O into child requests from the queue pair's pool, and a pool
+// sized to the depth alone could never take one, so it was refused with
+// -EAGAIN forever, and a depth of 1 aborted the process (PR #4 review).
+TYPED_TEST_P(QueueDepthTest, LargeValuesAtTheSmallestQueueDepth) {
+    // Above the 128 KiB transfer limit of SPDK's TCP target.
+    constexpr size_t kValBytes = 200 * 1024;
+    this->reopen(1);
+    std::thread t([&] {  // on SPDK, a queue pair created at depth 1
+        for (int i = 0; i < 4; ++i) {
+            const std::string val(kValBytes, static_cast<char>('a' + i));
+            ASSERT_EQ(this->store_.put(qd::make_key(i), val).run_sync(), 0)
+                << "i=" << i;
+        }
+        std::string out(kValBytes, '\0');
+        for (int i = 0; i < 4; ++i) {
+            size_t n = 0;
+            ASSERT_EQ(this->store_.get(qd::make_key(i),
+                                       reinterpret_cast<uint8_t*>(out.data()),
+                                       out.size(), &n).run_sync(), 0);
+            ASSERT_EQ(n, kValBytes);
+            EXPECT_EQ(out, std::string(kValBytes, static_cast<char>('a' + i)));
+        }
+    });
+    t.join();
+}
+
+// A depth the backend cannot set up fails open() with -EINVAL, not the
+// -EAGAIN an operation's caller retries (AIO's io_setup reports EAGAIN
+// past aio-max-nr).
+TYPED_TEST_P(QueueDepthTest, DepthTheBackendCannotSetUpFailsOpen) {
+    if constexpr (TypeParam::kQueueSizeLimited) {
+        this->store_.close();
+        udepot::StoreConfig config = this->config_;
+        // Past AIO's system-wide limit, and past io_uring's 32768 entries.
+        uint64_t aio_max_nr = 65536;
+        if (FILE* f = std::fopen("/proc/sys/fs/aio-max-nr", "r")) {
+            if (std::fscanf(f, "%" SCNu64, &aio_max_nr) != 1) aio_max_nr = 65536;
+            std::fclose(f);
+        }
+        config.queue_depth = static_cast<unsigned>(std::min<uint64_t>(
+            std::max<uint64_t>(aio_max_nr + 1, 32769), UINT32_MAX));
+        EXPECT_EQ(this->store_.open(config), -EINVAL);
+        ASSERT_EQ(this->store_.open(this->config_), 0);  // for TearDown
+    }
 }
 
 // Depths are interleaved within each iteration, so machine drift over the
@@ -492,4 +580,6 @@ TYPED_TEST_P(QueueDepthTest, DeeperQueueFasterWrites) {
 REGISTER_TYPED_TEST_SUITE_P(QueueDepthTest, BatchedReadsCorrectAtAllDepths,
                             BatchedWritesCorrectAtAllDepths,
                             DepthBeyondTheBackendQueue,
+                            LargeValuesAtTheSmallestQueueDepth,
+                            DepthTheBackendCannotSetUpFailsOpen,
                             DeeperQueueFasterReads, DeeperQueueFasterWrites);

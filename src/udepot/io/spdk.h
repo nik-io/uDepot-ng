@@ -106,8 +106,8 @@ struct SpdkQpair {
     uint64_t bounced = 0;
 
     SpdkQpair() = default;
-    // queue_depth sizes the request pool (and caps the device queue at
-    // it); 0 keeps SPDK's defaults.
+    // queue_depth enlarges the request pool past SPDK's default; 0 (or a
+    // smaller depth) keeps SPDK's defaults.
     SpdkQpair(SpdkNamespace* namespace_ptr, SpdkGlobalState* owner,
               unsigned queue_depth = 0);
     ~SpdkQpair();
@@ -183,11 +183,12 @@ public:
     static uint64_t thread_bounce_count();
 
     // Before open(): the number of I/Os the caller expects to have in
-    // flight at once on a thread; 0 keeps SPDK's defaults. It sizes the
-    // request pool of queue pairs created from then on; an I/O that finds
-    // every request taken fails with -EAGAIN. Queue pairs are per thread
-    // and shared by every SpdkIO, so one a thread already has keeps its
-    // size.
+    // flight at once on a thread. It enlarges the request pool of queue
+    // pairs created from then on, if it is beyond SPDK's default (which
+    // stays the minimum); an I/O that finds every request taken fails with
+    // -EAGAIN. Queue pairs are per thread and shared by every SpdkIO, so
+    // one a thread already has keeps its size, and the depth set by the
+    // last open() applies to every queue pair created after it.
     void set_queue_depth(unsigned n) noexcept { queue_depth_ = n; }
     unsigned queue_depth() const noexcept { return queue_depth_; }
 

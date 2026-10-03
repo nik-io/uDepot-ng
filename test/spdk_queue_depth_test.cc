@@ -16,6 +16,8 @@ struct SpdkTraits {
     static constexpr bool kPollerThread = false;
     // Every request of the queue pair taken: ENOMEM.
     static constexpr bool kQueueFills = true;
+    // A depth only enlarges the request pool; no limit to test.
+    static constexpr bool kQueueSizeLimited = false;
     static void suite_setup() {
         ASSERT_EQ(udepot::SpdkIO::global_init(), 0)
             << "SpdkIO::global_init() failed — is an NVMe namespace or "

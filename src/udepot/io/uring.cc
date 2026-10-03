@@ -67,7 +67,10 @@ struct UringSubmitAwaitable {
 // Anything else means the ring itself is unusable.
 void UringIO::submit_locked() noexcept {
     while (io_uring_sq_ready(&ring_) > 0) {
-        int rc = io_uring_submit(&ring_);
+        int rc = 0;
+        if (auto hook = submit_test_hook.load(std::memory_order_relaxed))
+            rc = hook();
+        if (rc == 0) rc = io_uring_submit(&ring_);
         if (rc >= 0 || rc == -EINTR) continue;
         if (rc == -EBUSY || rc == -EAGAIN) {
             sq_backlog_.store(true, std::memory_order_release);

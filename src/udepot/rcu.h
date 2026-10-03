@@ -108,7 +108,6 @@ private:
     uint32_t claim_slot() noexcept;
     bool drained(uint32_t idx) const noexcept;
     static void release_slot_if_alive(uint64_t id, uint32_t s) noexcept;
-    static bool alive(uint64_t id) noexcept;
     static uint64_t next_id() noexcept;
 
     friend struct ThreadSlots;

@@ -27,8 +27,6 @@
 
 #include <gtest/gtest.h>
 
-#include "record_checksum.h"
-
 using udepot::AioIO;
 using udepot::PosixIO;
 using udepot::StoreConfig;
@@ -678,12 +676,11 @@ TEST_F(StoreGcTest, RelocationNeverMovesIntoAnOlderSegment) {
 }
 
 // Whether the store file holds, in a segment older than ts, a record of key
-// that crash recovery would replay: one whose checksum binds it to its
-// segment's timestamp and the device seed. Reads the file directly, so it
+// that crash recovery would replay: the segment's metadata still carries
+// that timestamp, and so does the record. Reads the file directly, so it
 // does not trust the store's own bookkeeping.
 static bool older_copy_on_disk(const std::filesystem::path& path,
-                               std::span<const uint8_t> key, uint64_t ts,
-                               uint64_t seed) {
+                               std::span<const uint8_t> key, uint64_t ts) {
     constexpr size_t kGrain = 512;
     constexpr size_t kSegGrains = 2048;  // gc_config's segment_size
     constexpr size_t kSegBytes = kGrain * kSegGrains;
@@ -702,15 +699,9 @@ static bool older_copy_on_disk(const std::filesystem::path& path,
             const char* rec = seg.data() + g * kGrain;
             udepot::KvHeader hdr;
             std::memcpy(&hdr, rec, sizeof(hdr));
-            if (hdr.key_size != key.size() || udepot::is_tombstone(hdr) ||
-                std::memcmp(rec + sizeof(hdr), key.data(), key.size()) != 0)
-                continue;
-            const size_t crc_at = sizeof(hdr) + hdr.key_size + hdr.val_size;
-            if (g * kGrain + crc_at + 2 > kSegBytes - kGrain) continue;
-            uint16_t crc;
-            std::memcpy(&crc, rec + crc_at, sizeof(crc));
-            if (crc == record_checksum(reinterpret_cast<const uint8_t*>(rec),
-                                       seg_ts, seed))
+            if (hdr.timestamp == seg_ts && hdr.key_size == key.size() &&
+                !udepot::is_tombstone(hdr) &&
+                std::memcmp(rec + sizeof(hdr), key.data(), key.size()) == 0)
                 return true;
         }
     }
@@ -727,15 +718,13 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
     static std::filesystem::path path;
     static std::atomic<int> drops{0};
     static std::atomic<int> unsafe{0};
-    static std::atomic<uint64_t> seed{0};
     path = path_;
     drops = 0;
     unsafe = 0;
     UDepot<PosixIO>::gc_tombstone_drop_test_hook =
         [](std::span<const uint8_t> key, uint64_t victim_ts) {
             drops.fetch_add(1);
-            if (older_copy_on_disk(path, key, victim_ts, seed.load()))
-                unsafe.fetch_add(1);
+            if (older_copy_on_disk(path, key, victim_ts)) unsafe.fetch_add(1);
         };
     struct ResetHook {
         ~ResetHook() {
@@ -744,7 +733,6 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
     } reset_hook;
 
     ASSERT_EQ(store_.open(config_), 0);
-    seed = store_.seed();
     std::mt19937 rng(1);
     const std::string val(2500, 'v');
     constexpr int kKeys = 6000;

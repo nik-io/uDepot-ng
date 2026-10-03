@@ -54,6 +54,11 @@ public:
     size_t get_size() const noexcept { return size_; }
     IoBuffer alloc_buffer(size_t size);
 
+    // Test seam, never set in production: called before each
+    // io_uring_submit; a negative return is used as its result instead
+    // (e.g. -EBUSY, which this kernel never returns), 0 submits for real.
+    inline static std::atomic<int (*)()> submit_test_hook{nullptr};
+
 private:
     friend struct UringSubmitAwaitable;
 

@@ -144,7 +144,9 @@ int AioIO::open(const char* path, size_t size) {
 
     ctx_ = 0;
     if (sys_io_setup(queue_depth_, &ctx_) < 0) {
-        int err = errno;
+        // EAGAIN here means a depth past the system's AIO limit (aio-max-nr),
+        // not a retryable condition: report it as a bad depth.
+        int err = errno == EAGAIN ? EINVAL : errno;
         ::close(fd_);
         fd_ = -1;
         return -err;

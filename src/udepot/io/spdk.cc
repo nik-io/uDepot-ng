@@ -270,12 +270,15 @@ SpdkQpair::SpdkQpair(SpdkNamespace* namespace_ptr, SpdkGlobalState* owner,
     : ns(namespace_ptr), gs(owner) {
     struct spdk_nvme_io_qpair_opts opts;
     spdk_nvme_ctrlr_get_default_io_qpair_opts(ns->ctlr, &opts, sizeof(opts));
-    if (queue_depth > 0) {
-        // Requests beyond the device queue are queued by SPDK itself; the
-        // pool must hold at least the device queue.
-        opts.io_queue_size = std::min(opts.io_queue_size, queue_depth);
-        opts.io_queue_requests = std::max(queue_depth, opts.io_queue_size);
-    }
+    // A depth beyond SPDK's default gets a bigger request pool, never a
+    // smaller one: an I/O larger than the transfer limit is split into
+    // child requests from the same pool, so a pool sized to the caller's
+    // depth alone could never take a large value, or the store's own 4 MiB
+    // reads, and they would be refused forever (PR #4 review). Requests
+    // beyond the device queue are queued by SPDK itself, so the device
+    // queue keeps SPDK's size (which must be at least 2).
+    if (queue_depth > opts.io_queue_requests)
+        opts.io_queue_requests = queue_depth;
     qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns->ctlr, &opts, sizeof(opts));
     if (!qpair) {
         fprintf(stderr, "spdk: queue pair allocation failed\n");

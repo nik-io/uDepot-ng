@@ -17,6 +17,8 @@ struct AioTraits {
     static constexpr bool kPollerThread = true;
     // io_submit fails with EAGAIN once the context is full.
     static constexpr bool kQueueFills = true;
+    // A depth past the kernel's limits fails open().
+    static constexpr bool kQueueSizeLimited = true;
     static void suite_setup() {}
     static void suite_teardown() {}
     static std::string& path() {

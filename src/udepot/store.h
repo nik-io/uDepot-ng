@@ -33,21 +33,20 @@
 
 namespace udepot {
 
-// On-disk KV entry layout, as uDepot's (paper, section 4.4):
-//   [u16 key_size][u32 val_size][key][value][u16 crc16]
-// Total: 8 + key_size + val_size bytes. A record carries no timestamp of
-// its own: its order is its segment's, and the checksum binds it to that
-// segment's timestamp (compute_crc16).
+// On-disk KV entry layout (unchanged from uDepot):
+//   [u16 key_size][u32 val_size][u64 timestamp][key][value][u16 crc16]
+// Total: 16 + key_size + val_size bytes.
 struct __attribute__((packed)) KvHeader {
     uint16_t key_size;
     uint32_t val_size;
+    uint64_t timestamp;
 };
 
 struct __attribute__((packed)) KvSuffix {
     uint16_t crc16;
 };
 
-static_assert(sizeof(KvHeader) == 6);
+static_assert(sizeof(KvHeader) == 14);
 static_assert(sizeof(KvSuffix) == 2);
 
 inline constexpr size_t kKvOverhead = sizeof(KvHeader) + sizeof(KvSuffix);
@@ -204,7 +203,9 @@ public:
 
     // Zero copy, for gets: a buffer that holds a record of a key of
     // key_size bytes and a value of up to val_size bytes. Invalid
-    // (!valid()) if the sizes cannot be stored or allocation fails.
+    // (!valid()) if the sizes cannot be stored or allocation fails. Use it
+    // with the store that allocated it: on SPDK that is DMA memory, and
+    // another buffer still works but is copied through one.
     GetBuffer alloc_get_buffer(size_t key_size, size_t val_size);
 
     // Zero copy: on success, *val_out holds the buffer the record was read
@@ -302,8 +303,6 @@ public:
     Rcu& rcu() { return rcu_; }
     IO& io() { return io_; }
     uint32_t grain_size() const { return grain_size_; }
-    // Grains per segment, its metadata included. For tests.
-    uint64_t segment_grains() const { return get_seg_size(); }
     // The device seed: binds segment metadata and records to this store.
     uint64_t seed() const noexcept { return seed_; }
 
@@ -373,12 +372,7 @@ private:
     // candidate, only when all of its grains are released.
     void release_grains(uint64_t grain, uint64_t count, bool reloc = false);
 
-    // seg_ts: the timestamp of the segment the record is in.
-    uint16_t compute_crc16(const KvHeader& hdr, uint64_t seg_ts) const;
-    // Whether rec, a record of hdr's sizes, carries the checksum of a record
-    // written into a segment of timestamp seg_ts.
-    bool crc_matches(const KvHeader& hdr, const uint8_t* rec,
-                     uint64_t seg_ts) const;
+    uint16_t compute_crc16(const KvHeader& hdr) const;
     static uint32_t compute_crc32(uint32_t seed, const uint8_t* data,
                                   size_t len);
 
@@ -575,7 +569,7 @@ private:
     // GC: move one record still referenced by the directory to a new
     // location, or drop it if it is a tombstone that can no longer matter.
     int gc_record(uint64_t grain, uint64_t entry_grains, const uint8_t* rec,
-                  uint64_t victim_ts, bool drop_tombstones);
+                  bool drop_tombstones);
 };
 
 }  // namespace udepot

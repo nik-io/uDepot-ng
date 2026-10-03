@@ -298,16 +298,23 @@ depth you choose (`alloc_put_buffer`, `alloc_get_buffer`), issue that many
 operations, wait for them, reuse the buffers. uDepot allocates no data
 buffers for depth. `StoreConfig::queue_depth` sizes each backend's queue for
 it: the AIO context (`io_setup`), the io_uring ring, and the SPDK request
-pool of queue pairs created afterwards (per thread). Nothing in uDepot caps
-the depth below what the backend takes.
+pool of queue pairs created afterwards (per thread). SPDK's own pool size
+stays the minimum: a large I/O takes several requests (one per transfer-size
+piece), so a pool sized to a small depth could never take it. Nothing in
+uDepot caps the depth below what the backend takes. A depth the backend
+cannot set up at all makes `open()` fail with `-EINVAL`.
 
 When the backend cannot take another I/O, the operation fails with
 `-EAGAIN`, on every backend, as uDepot failed it: AIO's `io_submit`
 refuses (EAGAIN), SPDK has no free request (ENOMEM), or io_uring has no
 free submission entry (only while the kernel refuses submissions; it
 otherwise takes I/O past the ring's size, keeping the extra completions on
-its overflow list). The operation leaves nothing behind, so the caller can
-retry it once some of its outstanding ones complete. Nothing waits or
+its overflow list). The caller can retry it once some of its outstanding
+operations complete. A put or del refused after it wrote its record ends
+like any failure after the write (paper section 4.5, "PUT writes before it
+checks"): the directory is unchanged, so a clean restart, which restores
+the index, never sees the record; but it stays in the log, and after a
+crash the log scan restores it if it is the key's newest. Nothing waits or
 spins for room: on EBUSY/EAGAIN from `io_uring_submit` the SQEs, already
 published, are left for the poller to push after it reaps, since the
 submitter may be the poller itself.
@@ -318,9 +325,11 @@ refused submission once some complete (`run_internal`), and SPDK's
 `pwrite_sync` polls its queue pair and retries.
 
 `QueueDepthTest` (`test/queue_depth_tests.h`, run per backend) sizes the
-backend for 4, puts 4096 operations in flight while nothing is reaped,
-requires each to succeed with its data or fail with exactly `-EAGAIN`
-(AIO and SPDK must refuse some), and retries until all are done.
+backend for 4, puts thousands of puts, gets and exists in flight while
+nothing is reaped, requires each to succeed with its data or fail with
+exactly `-EAGAIN` (AIO and SPDK must refuse some), and retries until all
+are done. `LargeValuesAtTheSmallestQueueDepth` puts and gets values larger
+than one transfer with a queue depth of 1.
 
 ### 7. Simplified Buffer (Replacing Mbuff)
 
@@ -525,13 +534,21 @@ store can read each other. **Known divergences:**
 
 ### Record identity
 
-A record is uDepot's: a 6-byte header (key size, value size), the key, the
-value and a 2-byte checksum. It carries no timestamp of its own; its order
-is its segment's. As uDepot's `checksum16(timestamp, md)`, the checksum is a
-CRC32 seeded with the segment's timestamp, over the header, then over the
-device seed, truncated to 16 bits, and recovery and GC accept a record only
-if it matches. (uDepot-ng's header once added an 8-byte copy of the segment
-timestamp; it is gone, so the format is uDepot's again.) A store
+A record is uDepot's (`uDepotSalsaStore`): a 14-byte header (key size,
+value size, and the timestamp of the segment it was written into), the key,
+the value and a 2-byte checksum. The paper describes a 6-byte header; uDepot's
+code has always carried the timestamp, and uDepot-ng follows the code. As
+uDepot's `checksum16(timestamp, md)`, the checksum is a CRC32 seeded with the
+segment's timestamp, over the header, then over the device seed, truncated to
+16 bits.
+
+Recovery and GC accept a record only if its header carries its segment's
+timestamp *and* the checksum matches; uDepot checks the checksum alone. The
+timestamp check is what rejects records left from a segment's previous use:
+CRC32 is linear, so for a given pair of old and new segment timestamps the
+16-bit checksum of every stale record either passes or fails alike (about one
+segment reuse in 65536 would let a whole stale tail through), while the
+64-bit timestamp of a previous use never equals the current one. A store
 created over an earlier one (`force_destroy`) restarts its timestamps from
 the same values on the same segments; without the seed in the checksum, a
 crash brought back the earlier store's records left past what the new one
