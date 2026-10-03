@@ -31,12 +31,21 @@
 # I/O through a bounce buffer (exact).
 #
 # Usage: perf-zerocopy.sh <backend> [build_dir] [batch] [runs] [min_gain%]
-#   <backend>  posix, aio, uring or spdk
+#   <backend>  aio, uring or spdk. Not posix: PosixIO is buffered
+#              pread/pwrite, so the kernel copies every value through the page
+#              cache and there is no zero copy to gate. Zero copy needs
+#              O_DIRECT (AIO, io_uring) or SPDK.
 #   [batch]    ops per batch (default 500; 200 on SPDK, whose namespace is
 #              513 MiB); a run is 2 x ROUNDS batches per phase
 set -uo pipefail
 
-BACKEND="${1:?usage: perf-zerocopy.sh <posix|aio|uring|spdk> [build_dir] [batch] [runs] [min_gain%]}"
+BACKEND="${1:?usage: perf-zerocopy.sh <aio|uring|spdk> [build_dir] [batch] [runs] [min_gain%]}"
+case "$BACKEND" in
+    aio|uring|spdk) ;;
+    posix) echo "FATAL: posix is buffered I/O, which cannot be zero copy; gate aio, uring or spdk" >&2
+           exit 2 ;;
+    *) echo "FATAL: unknown backend $BACKEND (aio, uring or spdk)" >&2; exit 2 ;;
+esac
 BUILD_DIR="${2:-build}"
 DEFAULT_BATCH=500
 [ "$BACKEND" = "spdk" ] && DEFAULT_BATCH=200
