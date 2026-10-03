@@ -170,6 +170,13 @@ uint32_t Rcu::claim_slot() noexcept {
     return kShared;
 }
 
+bool Rcu::alive(uint64_t id) noexcept {
+    std::lock_guard<std::mutex> lock(live_mu());
+    return live().count(id) != 0;
+}
+
+size_t Rcu::this_thread_instances() noexcept { return tl_slots.owned.size(); }
+
 void Rcu::release_slot_if_alive(uint64_t id, uint32_t s) noexcept {
     std::lock_guard<std::mutex> lock(live_mu());
     auto it = live().find(id);
@@ -188,6 +195,11 @@ uint32_t Rcu::this_thread_slot() noexcept {
             return o.slot;
         }
     }
+    // First use of this instance on this thread. Forget the instances that
+    // have been destroyed since (their slots went with them), so a thread
+    // that outlives many stores keeps, and scans, only the live ones.
+    std::erase_if(t.owned,
+                  [](const ThreadSlots::Owned& o) { return !alive(o.rcu_id); });
     uint32_t s = claim_slot();
     // The shared slot is not recorded as owned, so a later lookup that
     // misses the cache tries again to claim a slot of its own.
