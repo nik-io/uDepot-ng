@@ -227,14 +227,16 @@ jobs:
       # copy compared batch by batch within one process. No stored
       # baselines: an invariant measured in one run survives a shared
       # runner's drift; a recorded number does not. An invariant that holds
-      # on one backend only is not one, so every backend runs: SPDK's is the
-      # "zero-copy perf invariant (SPDK)" check, in the spdk job.
-      - name: Zero-copy invariant (posix)
-        timeout-minutes: 10
-        run: scripts/perf-zerocopy.sh posix build
+      # on one backend only is not one, so every zero-copy backend runs:
+      # AIO and io_uring here (O_DIRECT), SPDK as the "zero-copy perf
+      # invariant (SPDK)" check in the spdk job. Not posix: buffered
+      # pread/pwrite copies through the page cache, so it is not zero copy.
       - name: Zero-copy invariant (aio)
         timeout-minutes: 15
         run: scripts/perf-zerocopy.sh aio build
+      # Runs even when AIO failed: both backends' numbers on the same
+      # runner tell a backend problem from a machine one.
       - name: Zero-copy invariant (io_uring)
+        if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: scripts/perf-zerocopy.sh uring build
