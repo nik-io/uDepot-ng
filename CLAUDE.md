@@ -139,13 +139,13 @@ ctest --test-dir build
   loopback NVMe-oF software target, as uDepot's CI does, on a Debug build.
   SPDK is built with `--target-arch=x86-64-v2` and its tree cached per
   submodule revision.
-- **zero-copy perf invariant**, below: one check for posix, AIO and
-  io_uring, and **zero-copy perf invariant (SPDK)**, a second entry of the
+- **zero-copy perf invariant**, below: one check for AIO and io_uring,
+  and **zero-copy perf invariant (SPDK)**, a second entry of the
   SPDK job (`spdk-nvmef-test.sh build perf`) on a Release build.
 
 ### Zero-copy perf invariant
 
-As in uDepot: `scripts/perf-zerocopy.sh <posix|aio|uring>` (or
+As in uDepot: `scripts/perf-zerocopy.sh <aio|uring>` (or
 `cmake --build build --target run_perf_test` for all of them) compares the
 copying and the zero-copy put/get on a `/dev/shm` store, and fails unless
 zero copy is strictly faster than copy on PUT and GET: it runs less code
@@ -153,6 +153,10 @@ and copies nothing, so "as fast" is already a regression. (uDepot allowed
 zero copy to be up to 5% slower; on the paired comparison below, zero copy
 was ahead in every run measured, by medians of +3% to +28%.) It compares
 one operation done two ways, so there is no stored baseline to drift.
+Posix is not gated: `PosixIO` is buffered `pread`/`pwrite`, so the kernel
+copies every value through the page cache and zero copy has nothing to
+save there. Zero copy needs O_DIRECT (AIO, io_uring, as uDepot opens them)
+or SPDK, the backends the store is built to perform on.
 
 The comparison is paired, inside one process: `udepot_ng_bench --compare`
 runs rounds of a copy batch and a zero-copy batch back to back on one store

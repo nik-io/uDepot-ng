@@ -300,7 +300,9 @@ if(UDEPOT_BUILD_TESTS)
     # Zero-copy invariant (scripts/perf-zerocopy.sh), as uDepot's
     # `make run_perf_test`: on every backend, zero-copy put/get must not be
     # slower than the copying interface. Meaningful in Release only.
-    set(_perf_backends posix aio)
+    # Not posix: buffered pread/pwrite copies through the page cache, so
+    # it cannot be zero copy (zero copy needs O_DIRECT or SPDK).
+    set(_perf_backends aio)
     if(UDEPOT_BUILD_URING)
         list(APPEND _perf_backends uring)
     endif()
