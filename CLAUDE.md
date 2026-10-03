@@ -152,22 +152,22 @@ one run, so there is no stored baseline to drift. Which of a pair runs
 first alternates: on SPDK the second run of every pair was consistently
 slower, which read as a 22-37% zero-copy loss until the order was swapped.
 
-**SPDK** has its own gate, run by `scripts/spdk-nvmef-test.sh` (CI's SPDK
-job) against the NVMe-oF target: `perf-zerocopy.sh spdk`. It is exact rather
-than timed: zero copy over SPDK means the device transfers straight to and
-from the store's DMA buffers, so a zero-copy run must bounce no I/O through
-a copy (SPDK counts them; a mutation handing out non-DMA buffers failed it
-with 75126 bounces). The throughput comparison is printed but not gated
-there: the ops are I/O bound over loopback TCP, and on unchanged code the
-GET delta ranged from -20% to +52% across runs, far wider than the ~5% a
-32 KiB copy costs.
+**SPDK** is gated too, by `scripts/spdk-nvmef-test.sh` (CI's SPDK job)
+against the NVMe-oF target: `perf-zerocopy.sh spdk`. Two checks:
 
-Values are 32 KiB: at 1 KiB a copy is ~2% of a put, and a zero-copy path
-that copied twice still passed. Even at 32 KiB, one stray extra copy is
-about 5% of a put, at the edge of the tolerance: in a mutation test it
-failed the gate on io_uring and passed it on posix and AIO. The gate
-catches a zero-copy path that does clearly more work than the copying one,
-not every lost copy.
+- Zero copy must not be slower than copy, as on the other backends, but
+  measured inside one process: `udepot_ng_bench --compare` runs rounds of a
+  copy batch and a zero-copy batch back to back (order alternating) on one
+  store, and each run reports the median of its rounds' zero-copy/copy
+  ratios; the gate takes the median over runs. Separate processes cannot be
+  compared over a network target: each is a new connection, absolute
+  throughput differed up to ~1.7x between them, and comparing them showed
+  zero copy anywhere from 37% slower to 52% faster on unchanged code.
+  Paired, zero copy was faster in all 25 runs measured (PUT +0.5 to +7%,
+  GET +1 to +11%).
+- A zero-copy run must bounce no I/O through a DMA copy (SPDK counts them):
+  the device transfers straight to and from the store's buffers. A mutation
+  handing out non-DMA buffers failed it with 75126 bounces.
 
 ### Performance regression gate
 

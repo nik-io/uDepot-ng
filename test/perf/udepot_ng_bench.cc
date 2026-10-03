@@ -11,6 +11,7 @@
 #include "udepot/io/spdk.h"
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -44,6 +45,10 @@ struct BenchConfig {
     // otherwise identical: the only difference is the value copies the
     // zero-copy path avoids.
     bool zero_copy = false;
+    // Compare copy and zero copy in one process instead (--compare R):
+    // R rounds, each a batch of `ops` copying operations and a batch of
+    // `ops` zero-copy ones, in alternating order, against the same store.
+    int compare_rounds = 0;
 };
 
 static double now_secs() {
@@ -185,6 +190,113 @@ static ThreadResult run_thread(UDepot<IO>& store,
     return result;
 }
 
+static double median(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    if (n == 0) return 0;
+    return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
+}
+
+// Copy against zero copy, batch by batch within one store. Separate runs
+// of each compare two processes, and on a backend whose device is reached
+// over a network (SPDK's NVMe-oF target) the drift between processes is
+// far larger than the copy being measured; adjacent batches share it.
+// Prints, per phase, each mode's median batch throughput and the median of
+// the per-round ratios zero copy / copy: a round's two batches run back to
+// back, so the ratio cancels what drifts (the target, the network, GC).
+template <typename IO>
+static int run_compare(UDepot<IO>& store, const BenchConfig& cfg) {
+    const uint64_t batch = cfg.ops;
+    std::vector<uint8_t> val(cfg.val_size, 0), val_out(cfg.val_size);
+    udepot::GetBuffer gb;
+    uint8_t keyb[32] = {};
+    auto key_of = [&](uint64_t i, uint64_t* valu) {
+        const uint64_t key = (cfg.seed + i) * kPrime;
+        *valu = key * kPrime;
+        std::memcpy(keyb, &key, sizeof(key));
+        return std::span<const uint8_t>(keyb, 8 + key % 24);
+    };
+    auto put_batch = [&](uint64_t first, bool zc) -> double {
+        const double t0 = now_secs();
+        for (uint64_t i = first; i < first + batch; ++i) {
+            uint64_t valu;
+            auto key = key_of(i, &valu);
+            int rc;
+            if (zc) {
+                auto pb = store.alloc_put_buffer(key.size(), cfg.val_size);
+                std::memcpy(pb.value().data(), &valu, sizeof(valu));
+                rc = store.put(key, pb).run_sync();
+            } else {
+                std::memcpy(val.data(), &valu, sizeof(valu));
+                rc = store.put(key, std::span<const uint8_t>(val)).run_sync();
+            }
+            if (rc != 0) {
+                fprintf(stderr, "put failed: i=%lu rc=%d\n",
+                        static_cast<unsigned long>(i), rc);
+                return -1;
+            }
+        }
+        return now_secs() - t0;
+    };
+    auto get_batch = [&](uint64_t first, bool zc) -> double {
+        const double t0 = now_secs();
+        for (uint64_t i = first; i < first + batch; ++i) {
+            uint64_t valu;
+            auto key = key_of(i, &valu);
+            const uint8_t* got = val_out.data();
+            size_t n = 0;
+            int rc;
+            if (zc) {
+                rc = store.get(key, &gb).run_sync();
+                got = gb.value().data();
+            } else {
+                rc = store.get(key, val_out.data(), val_out.size(), &n)
+                         .run_sync();
+            }
+            uint64_t val_ret = 0;
+            if (rc == 0) std::memcpy(&val_ret, got, sizeof(val_ret));
+            if (rc != 0 || val_ret != valu) {
+                fprintf(stderr, "get failed: i=%lu rc=%d\n",
+                        static_cast<unsigned long>(i), rc);
+                return -1;
+            }
+        }
+        return now_secs() - t0;
+    };
+    struct Phase {
+        std::vector<double> copy, zc, ratio;
+    };
+    auto phase = [&](auto run_batch, Phase* ph) {
+        uint64_t next = 0;
+        for (int r = 0; r < cfg.compare_rounds; ++r) {
+            double mops[2] = {0, 0};  // [copy, zero copy]
+            for (int m = 0; m < 2; ++m) {
+                const bool zero = (m == 0) == (r % 2 == 1);  // alternate
+                const double secs = run_batch(next, zero);
+                if (secs < 0) return false;
+                next += batch;
+                mops[zero] = batch / (secs * 1e6);
+            }
+            ph->copy.push_back(mops[0]);
+            ph->zc.push_back(mops[1]);
+            ph->ratio.push_back(mops[1] / mops[0]);
+        }
+        return true;
+    };
+    Phase put, get;
+    if (!phase(put_batch, &put) || !phase(get_batch, &get)) return 1;
+    for (auto [name, ph] : {std::pair{"PUT", &put}, std::pair{"GET", &get}})
+        printf("CMP %s copy=%lf zero_copy=%lf delta=%+.2lf\n", name,
+               median(ph->copy), median(ph->zc),
+               (median(ph->ratio) - 1) * 100);
+#ifdef UDEPOT_BUILD_SPDK
+    if constexpr (std::is_same_v<IO, udepot::SpdkIO>)
+        printf("BOUNCED %lu\n", static_cast<unsigned long>(
+                                    udepot::SpdkIO::thread_bounce_count()));
+#endif
+    return 0;
+}
+
 template <typename IO>
 static int run_bench(const BenchConfig& cfg) {
     StoreConfig sc;
@@ -202,6 +314,12 @@ static int run_bench(const BenchConfig& cfg) {
     if (rc != 0) {
         fprintf(stderr, "open failed: %d\n", rc);
         return 1;
+    }
+
+    if (cfg.compare_rounds > 0) {
+        rc = run_compare(store, cfg);
+        store.close();
+        return rc;
     }
 
     uint64_t total_ops = cfg.ops * static_cast<uint64_t>(cfg.threads);
@@ -274,7 +392,9 @@ static void usage() {
         "  --threads <n>  Number of concurrent threads (default: 1)\n"
         "  --backend <b>  posix, aio, uring or spdk (default: posix); spdk\n"
         "                 uses the namespace UDEPOT_NVMEF names, whole\n"
-        "  --zero-copy    Use the zero-copy put/get interface\n");
+        "  --zero-copy    Use the zero-copy put/get interface\n"
+        "  --compare <r>  Copy vs zero copy in one store: r rounds of a\n"
+        "                 batch of -w ops each way, order alternating\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -300,6 +420,8 @@ int main(int argc, char* argv[]) {
             cfg.backend = argv[++i];
         } else if (arg == "--zero-copy") {
             cfg.zero_copy = true;
+        } else if (arg == "--compare" && i + 1 < argc) {
+            cfg.compare_rounds = std::stoi(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
             usage();
             return 0;

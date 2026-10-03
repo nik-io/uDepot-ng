@@ -148,16 +148,14 @@ for t in "${TESTS[@]}"; do
 done
 
 # ── zero-copy gate over SPDK ────────────────────────────────────────────────
-# scripts/perf-zerocopy.sh: a zero-copy run hands the device the store's
-# own DMA buffers, so no I/O of it bounces through a copy (exact). Copy vs
-# zero-copy throughput is reported, not gated: it is I/O bound here (see
-# that script). 5000 ops of 32 KiB fit the 513 MiB namespace with room for
-# GC; each run starts a fresh store.
+# scripts/perf-zerocopy.sh spdk: zero copy must not be slower than copy on
+# PUT or GET (compared batch by batch inside each run, against the target),
+# and must bounce no I/O through a DMA copy. Each run starts a fresh store.
 log "zero-copy gate over SPDK"
 env "${INIT_ENV[@]}" UDEPOT_NVMEF="$TADDR:$TPORT:$NQN" \
     LD_LIBRARY_PATH="$DPDK_LIB" timeout "${PERF_TIMEOUT:-900}" \
     "${PIN[@]}" "$HERE/scripts/perf-zerocopy.sh" spdk "$HERE/$BUILD_DIR" \
-    "${SPDK_PERF_OPS:-5000}" "${SPDK_PERF_ITERS:-9}"
+    0 "${SPDK_PERF_ITERS:-5}"
 rc=$?
 [ $rc -eq 0 ] || fail "SPDK zero-copy gate failed (rc=$rc)"
 

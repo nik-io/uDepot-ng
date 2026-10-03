@@ -19,14 +19,9 @@
 # SPDK (backend spdk) runs against the namespace UDEPOT_NVMEF names, as
 # scripts/spdk-nvmef-test.sh sets up (it runs this gate), not /dev/shm.
 # Zero copy there means the device transfers straight to and from the
-# store's own DMA buffers, which SPDK counts: the gate is that a zero-copy
-# run copies no I/O through a bounce buffer. That check is exact. The
-# throughput comparison is reported but not gated on SPDK: over the NVMe-oF
-# loopback target the ops are I/O bound and share the host's CPUs with the
-# target, and on unchanged code the GET delta measured -20% to +52% (PUT -5%
-# to +12%) across runs of 15 pairs, while a 32 KiB copy is ~5% of an op --
-# the same reason the other backends run on /dev/shm. SPDK_PERF_GATE_TIME=1
-# gates it anyway.
+# store's own DMA buffers, which SPDK counts: a zero-copy run must copy no
+# I/O through a bounce buffer (exact). The throughput gate is the same as
+# on the other backends, but measured inside one process (see run_compare).
 #
 # Usage: perf-zerocopy.sh <backend> [build_dir] [ops] [iters] [tolerance%]
 #   <backend>  aio, uring or spdk (posix also works)
@@ -75,8 +70,42 @@ run_one() {  # $1 = extra flags ("" for copy, "--zero-copy" for zero-copy)
 median() { printf '%s\n' "$@" | sort -n | \
     awk '{a[NR]=$1} END{n=NR; if(n==0){print 0} else if(n%2){print a[(n+1)/2]} else {printf "%.6f",(a[n/2]+a[n/2+1])/2}}'; }
 
+# SPDK: copy and zero copy are compared inside one process, batch by batch
+# (udepot_ng_bench --compare), not as separate runs: a separate process is
+# a new connection to the NVMe-oF target, and the drift between processes
+# was far larger than the copy measured (one ordering read as a 22-37%
+# zero-copy loss). Each of ITERS processes reports its medians.
+# The gate is on the per-run delta (median of its rounds' zero-copy/copy
+# ratios), never on throughputs from different runs: runs differ by up to
+# ~1.7x in absolute speed, so medians taken across them pair a fast run's
+# copy with a slow run's zero copy.
+run_compare() {  # echo "put_delta get_delta bounced"
+    local out
+    out=$("$BIN" --backend spdk -w "$SPDK_BATCH" --val-size "$VAL" \
+        --grain-size 512 --compare "$SPDK_ROUNDS" 2>/dev/null)
+    local dp dg b
+    dp=$(grep '^CMP PUT' <<<"$out" | grep -oE 'delta=[-+0-9.]+' | cut -d= -f2)
+    dg=$(grep '^CMP GET' <<<"$out" | grep -oE 'delta=[-+0-9.]+' | cut -d= -f2)
+    b=$(grep '^BOUNCED' <<<"$out" | awk '{print $2}')
+    echo "${dp#+} ${dg#+} $b"  # sort -n does not take a leading '+'
+}
+SPDK_BATCH="${SPDK_BATCH:-200}"    # ops per batch
+SPDK_ROUNDS="${SPDK_ROUNDS:-15}"   # 2 x 15 x 200 x 32 KiB, well inside the namespace
+
 copy_p=(); copy_g=(); zc_p=(); zc_g=(); zc_bounced=0
+spdk_dp=(); spdk_dg=()
+if [ "$BACKEND" = "spdk" ]; then
+    for it in $(seq 1 "$ITERS"); do
+        read -r dp dg zb <<<"$(run_compare)"
+        { [ -n "$dp" ] && [ -n "$dg" ] && [ -n "$zb" ]; } \
+            || { echo "a udepot_ng_bench --compare run produced no result" >&2; exit 2; }
+        echo "  run $it: PUT delta=${dp}% GET delta=${dg}%" >&2
+        spdk_dp+=("$dp"); spdk_dg+=("$dg")
+        zc_bounced=$((zc_bounced + zb))
+    done
+fi
 for it in $(seq 1 "$ITERS"); do
+    [ "$BACKEND" = "spdk" ] && break
     # Alternate which goes first, so a pair's position cancels out too.
     if [ $((it % 2)) -eq 1 ]; then
         read -r cp cg _ <<<"$(run_one "")"
@@ -91,34 +120,33 @@ for it in $(seq 1 "$ITERS"); do
     zc_bounced=$((zc_bounced + zb))
 done
 
-cpm=$(median "${copy_p[@]}"); zpm=$(median "${zc_p[@]}")
-cgm=$(median "${copy_g[@]}"); zgm=$(median "${zc_g[@]}")
-
-{
-  echo "${BACKEND} Mops/sec over ${ITERS} interleaved runs @ ${OPS} ops of ${VAL} B ${WHERE}:"
-  echo "  PUT copy median=${cpm}  zero-copy median=${zpm}"
-  echo "  GET copy median=${cgm}  zero-copy median=${zgm}"
-} >&2
-
 # Gate each phase: fail if zero-copy is more than TOL% slower than copy.
-TIME_LABEL="FAIL"
-if [ "$BACKEND" = "spdk" ] && [ "${SPDK_PERF_GATE_TIME:-0}" != "1" ]; then
-    TIME_LABEL="note (not gated on SPDK)"
-fi
-check() {  # copy_median zero_median phase-name
-    awk -v c="$1" -v z="$2" -v tol="$TOL" -v ph="$3" -v lbl="$TIME_LABEL" 'BEGIN{
-        d = (c>0)? (z-c)/c*100 : 0;
+check_delta() {  # delta% phase-name
+    awk -v d="$1" -v tol="$TOL" -v ph="$2" 'BEGIN{
         printf("  %s delta=%+.1f%% (fail if worse than -%.1f%%)\n", ph, d, tol) > "/dev/stderr";
-        if (d < -tol) { printf("%s: %s zero-copy is >%.1f%% slower than copy\n", lbl, ph, tol) > "/dev/stderr"; exit 1; }
+        if (d < -tol) { printf("FAIL: %s zero-copy is >%.1f%% slower than copy\n", ph, tol) > "/dev/stderr"; exit 1; }
         exit 0;
     }'
 }
+delta() {  # copy zero -> percent
+    awk -v c="$1" -v z="$2" 'BEGIN{ printf("%.4f", (c>0)? (z-c)/c*100 : 0) }'
+}
 
 rc=0
-check "$cpm" "$zpm" PUT || rc=1
-check "$cgm" "$zgm" GET || rc=1
-if [ "$BACKEND" = "spdk" ] && [ "${SPDK_PERF_GATE_TIME:-0}" != "1" ]; then
-    rc=0  # throughput is I/O bound here; see the header
+if [ "$BACKEND" = "spdk" ]; then
+    echo "spdk: median of ${ITERS} runs, each the median of ${SPDK_ROUNDS} paired batches of ${SPDK_BATCH} ops of ${VAL} B, ${WHERE}:" >&2
+    check_delta "$(median "${spdk_dp[@]}")" PUT || rc=1
+    check_delta "$(median "${spdk_dg[@]}")" GET || rc=1
+else
+    cpm=$(median "${copy_p[@]}"); zpm=$(median "${zc_p[@]}")
+    cgm=$(median "${copy_g[@]}"); zgm=$(median "${zc_g[@]}")
+    {
+      echo "${BACKEND} Mops/sec over ${ITERS} interleaved runs @ ${OPS} ops of ${VAL} B ${WHERE}:"
+      echo "  PUT copy median=${cpm}  zero-copy median=${zpm}"
+      echo "  GET copy median=${cgm}  zero-copy median=${zgm}"
+    } >&2
+    check_delta "$(delta "$cpm" "$zpm")" PUT || rc=1
+    check_delta "$(delta "$cgm" "$zgm")" GET || rc=1
 fi
 if [ "$BACKEND" = "spdk" ]; then
     echo "  zero-copy I/Os bounced through a DMA copy: ${zc_bounced} (fail if any)" >&2
@@ -128,10 +156,8 @@ if [ "$BACKEND" = "spdk" ]; then
     fi
 fi
 if [ "$rc" -eq 0 ]; then
-    if [ "$BACKEND" = "spdk" ]; then
+    echo "OK: zero-copy within tolerance of copy on PUT and GET" >&2
+    [ "$BACKEND" = "spdk" ] && \
         echo "OK: zero-copy put/get transferred straight from the store's DMA buffers" >&2
-    else
-        echo "OK: zero-copy within tolerance of copy on PUT and GET" >&2
-    fi
 fi
 exit "$rc"
