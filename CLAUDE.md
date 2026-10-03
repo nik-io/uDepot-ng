@@ -144,9 +144,12 @@ ctest --test-dir build
 
 As in uDepot: `scripts/perf-zerocopy.sh <posix|aio|uring>` (or
 `cmake --build build --target run_perf_test` for all of them) compares the
-copying and the zero-copy put/get on a `/dev/shm` store, and fails if zero
-copy is more than 5% slower than copy on PUT or GET. It compares one
-operation done two ways, so there is no stored baseline to drift.
+copying and the zero-copy put/get on a `/dev/shm` store, and fails unless
+zero copy is strictly faster than copy on PUT and GET: it runs less code
+and copies nothing, so "as fast" is already a regression. (uDepot allowed
+zero copy to be up to 5% slower; on the paired comparison below, zero copy
+was ahead in every run measured, by medians of +3% to +28%.) It compares
+one operation done two ways, so there is no stored baseline to drift.
 
 The comparison is paired, inside one process: `udepot_ng_bench --compare`
 runs rounds of a copy batch and a zero-copy batch back to back on one store

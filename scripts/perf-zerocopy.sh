@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# Zero-copy invariant, as uDepot's scripts/perf-zerocopy.sh: the zero-copy
-# put/get interface (PutBuffer/GetBuffer) must not be slower than the
-# copying one (spans), on PUT and GET.
+# Zero-copy invariant, after uDepot's scripts/perf-zerocopy.sh: the
+# zero-copy put/get interface (PutBuffer/GetBuffer) must be strictly faster
+# than the copying one (spans), on PUT and GET -- it runs less code and
+# copies nothing. (uDepot allowed zero copy to be up to 5% slower.)
 #
 # Why this shape:
 #   - Copy and zero copy are compared inside one process, against one store:
@@ -29,23 +30,25 @@
 # store's own DMA buffers, which SPDK counts: a zero-copy run must copy no
 # I/O through a bounce buffer (exact).
 #
-# Usage: perf-zerocopy.sh <backend> [build_dir] [batch] [runs] [tolerance%]
+# Usage: perf-zerocopy.sh <backend> [build_dir] [batch] [runs] [min_gain%]
 #   <backend>  posix, aio, uring or spdk
 #   [batch]    ops per batch (default 500; 200 on SPDK, whose namespace is
 #              513 MiB); a run is 2 x ROUNDS batches per phase
 set -uo pipefail
 
-BACKEND="${1:?usage: perf-zerocopy.sh <posix|aio|uring|spdk> [build_dir] [batch] [runs] [tol%]}"
+BACKEND="${1:?usage: perf-zerocopy.sh <posix|aio|uring|spdk> [build_dir] [batch] [runs] [min_gain%]}"
 BUILD_DIR="${2:-build}"
 DEFAULT_BATCH=500
 [ "$BACKEND" = "spdk" ] && DEFAULT_BATCH=200
 BATCH="${3:-$DEFAULT_BATCH}"
 RUNS="${4:-5}"
-TOL="${5:-5}"             # zero copy may be at most TOL% slower (noise band)
+# Zero copy must beat copy by more than this: it runs less code and copies
+# nothing, so it is strictly faster, never merely as fast.
+MIN_GAIN="${5:-0}"
 ROUNDS="${ROUNDS:-15}"    # 2 x 15 x 500 x 32 KiB fits the 1 GiB store
 # Large enough that a value copy is a visible share of an operation: at
 # 1 KiB a copy costs ~30 ns of a ~1.6 us put, and a zero-copy path that
-# copied twice stayed inside the tolerance.
+# copied twice stayed inside the old 5% tolerance.
 VAL="${VAL_SIZE:-32768}"
 SIZE=1077936129           # (1048576+4096)*1024+1, as uDepot's
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -95,11 +98,11 @@ done
 
 echo "${BACKEND}: median of ${RUNS} runs, each the median of ${ROUNDS} paired batches of ${BATCH} ops of ${VAL} B, ${WHERE}:" >&2
 
-# Gate each phase: fail if zero copy is more than TOL% slower than copy.
+# Gate each phase: fail unless zero copy is faster than copy by > MIN_GAIN%.
 check_delta() {  # delta% phase-name
-    awk -v d="$1" -v tol="$TOL" -v ph="$2" 'BEGIN{
-        printf("  %s delta=%+.1f%% (fail if worse than -%.1f%%)\n", ph, d, tol) > "/dev/stderr";
-        if (d < -tol) { printf("FAIL: %s zero-copy is >%.1f%% slower than copy\n", ph, tol) > "/dev/stderr"; exit 1; }
+    awk -v d="$1" -v min="$MIN_GAIN" -v ph="$2" 'BEGIN{
+        printf("  %s delta=%+.1f%% (fail unless above %+.1f%%)\n", ph, d, min) > "/dev/stderr";
+        if (d <= min) { printf("FAIL: %s zero-copy is not faster than copy\n", ph) > "/dev/stderr"; exit 1; }
         exit 0;
     }'
 }
@@ -115,7 +118,7 @@ if [ "$BACKEND" = "spdk" ]; then
     fi
 fi
 if [ "$rc" -eq 0 ]; then
-    echo "OK: zero-copy within tolerance of copy on PUT and GET" >&2
+    echo "OK: zero-copy faster than copy on PUT and GET" >&2
     [ "$BACKEND" = "spdk" ] && \
         echo "OK: zero-copy put/get transferred straight from the store's DMA buffers" >&2
 fi
