@@ -102,6 +102,7 @@ struct AioSubmitAwaitable {
         tsan_release_to_kernel(req);
         int rc = sys_io_submit(ctx, 1, cbs);
         if (rc != 1) {
+            // EAGAIN: the context is full.
             req->result = (rc < 0) ? -errno : -EIO;
             pending->fetch_sub(1, std::memory_order_relaxed);
             return false;
@@ -142,8 +143,10 @@ int AioIO::open(const char* path, size_t size) {
     size_ = size;
 
     ctx_ = 0;
-    if (sys_io_setup(1024, &ctx_) < 0) {
-        int err = errno;
+    if (sys_io_setup(queue_depth_, &ctx_) < 0) {
+        // EAGAIN here means a depth past the system's AIO limit (aio-max-nr),
+        // not a retryable condition: report it as a bad depth.
+        int err = errno == EAGAIN ? EINVAL : errno;
         ::close(fd_);
         fd_ = -1;
         return -err;

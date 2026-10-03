@@ -227,6 +227,24 @@ TEST(Rcu, ThreadChurnReleasesSlots) {
     synchronize_or_die(rcu, std::chrono::seconds(10));
 }
 
+// Regression: a long-lived thread kept an entry for every Rcu it had ever
+// used (one per store opened), and scanned them all on each new one.
+TEST(Rcu, ThreadForgetsDestroyedInstances) {
+    Rcu kept;
+    Rcu::ReadGuard{kept};
+    for (int i = 0; i < 1000; ++i) {
+        Rcu rcu;
+        Rcu::ReadGuard guard(rcu);
+    }
+    {
+        Rcu rcu;
+        Rcu::ReadGuard guard(rcu);
+        EXPECT_EQ(Rcu::this_thread_instances(), 2u);  // kept and this one
+    }
+    Rcu::ReadGuard again(kept);  // still known: no new slot claimed
+    EXPECT_EQ(kept.thread_count(), 1u);
+}
+
 // With more threads than slots, the rest share one atomically updated slot;
 // grace periods must still cover all of them.
 TEST(Rcu, MoreThreadsThanSlots) {

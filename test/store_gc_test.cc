@@ -20,6 +20,7 @@
 #include <fstream>
 #include <random>
 #include <map>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -759,6 +760,47 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
 // it cannot tell which is newer. The test widens the window; this workload
 // (puts and deletes under GC, so both streams stage segments) then gave
 // duplicates in every run.
+// Regression (PR #3 review, finding 13): a version was the record's pba,
+// which comes back once its segment is reused, so a conditional put or del
+// holding a version read earlier could act on a different value (ABA).
+// Overwrites one key until its records land on places they used before.
+TEST_F(StoreGcTest, VersionNeverRepeatsWhenItsPlaceIsReused) {
+    ASSERT_EQ(store_.open(config_), 0);
+    const std::string key = "versioned";
+    const uint64_t hash = store_.hash_key(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(key.data()), key.size()));
+    std::set<uint64_t> versions;
+    std::map<uint64_t, uint64_t> version_at;  // pba -> its latest version
+    int reused = 0;
+    uint64_t previous = udepot::kAnyVersion;
+    for (int round = 0; round < 40000 && reused < 50; ++round) {
+        ASSERT_EQ(store_.put(key, value_for(0, round, 3000)).run_sync(), 0);
+        uint8_t buf[4096];
+        size_t n = 0;
+        uint64_t version = 0;
+        ASSERT_EQ(store_.get(key, buf, sizeof(buf), &n, &version).run_sync(),
+                  0);
+        uint32_t idx = store_.rcu().read_lock();
+        const uint64_t pba = store_.directory().lookup(hash).pba();
+        store_.rcu().read_unlock(idx);
+
+        EXPECT_TRUE(versions.insert(version).second)
+            << "version " << version << " repeated at round " << round;
+        auto [it, fresh] = version_at.emplace(pba, version);
+        if (!fresh) {
+            ++reused;
+            it->second = version;
+        }
+        // The version read before this round's put no longer applies.
+        if (previous != udepot::kAnyVersion) {
+            EXPECT_EQ(store_.put(key, "stale", udepot::PutMode::kUpsert,
+                                 previous).run_sync(), -ESTALE);
+        }
+        previous = version;
+    }
+    ASSERT_GT(reused, 0) << "no record landed on a reused place; churn more";
+}
+
 TEST_F(StoreGcTest, SegmentTimestampsAreUnique) {
     static std::mutex mu;
     static std::vector<uint64_t> stamps;

@@ -16,13 +16,25 @@
 
 namespace udepot {
 
+// Kernel AIO backend. The context is sized for queue_depth() I/Os (the
+// kernel rounds it up). An I/O the kernel refuses because the context is
+// full fails with -EAGAIN, as in uDepot; nothing waits for room.
 class AioIO {
 public:
+    static constexpr unsigned kDefaultQueueDepth = 1024;
+
     AioIO() noexcept = default;
     ~AioIO();
 
     AioIO(const AioIO&) = delete;
     AioIO& operator=(const AioIO&) = delete;
+
+    // Before open(): the number of I/Os the caller expects to have in
+    // flight at once; 0 keeps the default.
+    void set_queue_depth(unsigned n) noexcept {
+        queue_depth_ = n > 0 ? n : kDefaultQueueDepth;
+    }
+    unsigned queue_depth() const noexcept { return queue_depth_; }
 
     int open(const char* path, size_t size);
     // Completes all I/O already submitted, then tears down. No new I/O may
@@ -42,6 +54,7 @@ public:
 private:
     int fd_ = -1;
     size_t size_ = 0;
+    unsigned queue_depth_ = kDefaultQueueDepth;
     aio_context_t ctx_ = 0;
     std::thread poller_;
     std::atomic<bool> running_{false};

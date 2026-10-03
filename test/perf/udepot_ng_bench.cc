@@ -7,7 +7,12 @@
 #ifdef UDEPOT_BUILD_URING
 #include "udepot/io/uring.h"
 #endif
+#ifdef UDEPOT_BUILD_SPDK
+#include "udepot/io/spdk.h"
+#endif
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -17,6 +22,7 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using udepot::AioIO;
@@ -35,11 +41,10 @@ struct BenchConfig {
     const char* file = "/dev/shm/udepot-ng-bench.store";
     int threads = 1;
     std::string backend = "posix";
-    // Values through the zero-copy interface (alloc_put_buffer + put, get
-    // into a GetBuffer) instead of the copying one. The workload is
-    // otherwise identical: the only difference is the value copies the
-    // zero-copy path avoids.
-    bool zero_copy = false;
+    // Compare copy and zero copy in one process instead (--compare R):
+    // R rounds, each a batch of `ops` copying operations and a batch of
+    // `ops` zero-copy ones, in alternating order, against the same store.
+    int compare_rounds = 0;
 };
 
 static double now_secs() {
@@ -74,19 +79,10 @@ static ThreadResult run_thread(UDepot<IO>& store,
 
         std::memcpy(keyb, &key, sizeof(key));
 
-        int rc;
-        if (cfg.zero_copy) {
-            // The value is produced straight into the record buffer.
-            auto pb = store.alloc_put_buffer(key_size, cfg.val_size);
-            std::memcpy(pb.value().data(), &valu, sizeof(valu));
-            rc = store.put(std::span<const uint8_t>(keyb, key_size), pb)
-                     .run_sync();
-        } else {
-            std::memcpy(val.data(), &valu, sizeof(valu));
-            rc = store.put(
-                std::span<const uint8_t>(keyb, key_size),
-                std::span<const uint8_t>(val.data(), cfg.val_size)).run_sync();
-        }
+        std::memcpy(val.data(), &valu, sizeof(valu));
+        int rc = store.put(
+            std::span<const uint8_t>(keyb, key_size),
+            std::span<const uint8_t>(val.data(), cfg.val_size)).run_sync();
         if (rc != 0) {
             fprintf(stderr, "put failed: thread=%d i=%lu rc=%d\n",
                     thread_id, static_cast<unsigned long>(i), rc);
@@ -98,7 +94,6 @@ static ThreadResult run_thread(UDepot<IO>& store,
 
     // GET
     std::vector<uint8_t> val_out(cfg.val_size);
-    udepot::GetBuffer gb;
     t0 = now_secs();
     for (uint64_t i = 0; i < cfg.ops; ++i) {
         uint64_t key = (thread_seed + i) * kPrime;
@@ -108,17 +103,9 @@ static ThreadResult run_thread(UDepot<IO>& store,
         std::memcpy(keyb, &key, sizeof(key));
 
         size_t val_size_read = 0;
-        const uint8_t* got = val_out.data();
-        int rc;
-        if (cfg.zero_copy) {
-            rc = store.get(std::span<const uint8_t>(keyb, key_size), &gb)
-                     .run_sync();
-            got = gb.value().data();
-        } else {
-            rc = store.get(
-                std::span<const uint8_t>(keyb, key_size),
-                val_out.data(), val_out.size(), &val_size_read).run_sync();
-        }
+        int rc = store.get(
+            std::span<const uint8_t>(keyb, key_size),
+            val_out.data(), val_out.size(), &val_size_read).run_sync();
         if (rc != 0) {
             fprintf(stderr, "get failed: thread=%d i=%lu rc=%d\n",
                     thread_id, static_cast<unsigned long>(i), rc);
@@ -128,7 +115,7 @@ static ThreadResult run_thread(UDepot<IO>& store,
 
         if (cfg.val_size >= sizeof(uint64_t)) {
             uint64_t val_ret;
-            std::memcpy(&val_ret, got, sizeof(val_ret));
+            std::memcpy(&val_ret, val_out.data(), sizeof(val_ret));
             if (val_ret != valu) {
                 fprintf(stderr, "value mismatch: thread=%d i=%lu\n",
                         thread_id, static_cast<unsigned long>(i));
@@ -181,6 +168,147 @@ static ThreadResult run_thread(UDepot<IO>& store,
     return result;
 }
 
+static double median(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    if (n == 0) return 0;
+    return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
+}
+
+// Copy against zero copy, batch by batch within one store. Separate runs
+// of each compare two processes, and the drift between processes (up to
+// ~1.7x, far more on SPDK's NVMe-oF target) swamps what is measured;
+// adjacent batches share it. Prints, per phase, each mode's median batch
+// throughput and the median of the per-round ratios zero copy / copy.
+//
+// Zero copy is a property of uDepot, not of the caller: given a buffer it
+// handed out (alloc_put_buffer(), alloc_get_buffer()), put() and get() do
+// their I/O on that buffer directly; given any other memory, they copy
+// through a record buffer of their own. So both modes are set up the way a
+// caller would: every buffer is allocated and every value written before
+// anything is timed, plain memory for the copying API and uDepot's buffers
+// for the zero-copy one, and slot j of a batch holds the same key size and
+// value in both. The timed loops issue the operations and nothing else.
+// On a get the value lands in the caller's slot either way; it is checked
+// after the batch, outside the timing.
+template <typename IO>
+static int run_compare(UDepot<IO>& store, const BenchConfig& cfg) {
+    const uint64_t batch = cfg.ops;
+    const size_t vsz = cfg.val_size;
+    // Each phase runs 2 batches per round on fresh keys.
+    const uint64_t nkeys = 2 * batch * cfg.compare_rounds;
+    auto key_size = [](uint64_t slot) -> size_t { return 8 + slot % 24; };
+
+    std::vector<std::array<uint8_t, 32>> keys(nkeys);
+    for (uint64_t i = 0; i < nkeys; ++i) {
+        keys[i].fill(0);
+        const uint64_t id = (cfg.seed + i) * kPrime;
+        std::memcpy(keys[i].data(), &id, sizeof(id));
+    }
+    auto key = [&](uint64_t i) {
+        return std::span<const uint8_t>(keys[i].data(), key_size(i % batch));
+    };
+
+    std::vector<std::vector<uint8_t>> put_copy(batch), get_copy(batch);
+    std::vector<udepot::PutBuffer> put_zc(batch);
+    std::vector<udepot::GetBuffer> get_zc(batch);
+    std::vector<size_t> got_size(batch);
+    for (uint64_t j = 0; j < batch; ++j) {
+        put_copy[j].resize(vsz);
+        for (size_t k = 0; k < vsz; ++k)
+            put_copy[j][k] = static_cast<uint8_t>((cfg.seed + j) * 131 + k * 7);
+        get_copy[j].resize(vsz);
+        put_zc[j] = store.alloc_put_buffer(key_size(j), vsz);
+        get_zc[j] = store.alloc_get_buffer(key_size(j), vsz);
+        if (!put_zc[j].valid() || !get_zc[j].valid()) {
+            fprintf(stderr, "buffer allocation failed: slot=%lu\n",
+                    static_cast<unsigned long>(j));
+            return 1;
+        }
+        std::memcpy(put_zc[j].value().data(), put_copy[j].data(), vsz);
+    }
+
+    auto put_batch = [&](uint64_t first, bool zc) -> double {
+        const double t0 = now_secs();
+        for (uint64_t j = 0; j < batch; ++j) {
+            const int rc =
+                zc ? store.put(key(first + j), put_zc[j]).run_sync()
+                   : store.put(key(first + j),
+                               std::span<const uint8_t>(put_copy[j]))
+                         .run_sync();
+            if (rc != 0) {
+                fprintf(stderr, "put failed: i=%lu rc=%d\n",
+                        static_cast<unsigned long>(first + j), rc);
+                return -1;
+            }
+        }
+        return now_secs() - t0;
+    };
+    auto get_batch = [&](uint64_t first, bool zc) -> double {
+        const double t0 = now_secs();
+        for (uint64_t j = 0; j < batch; ++j) {
+            const int rc =
+                zc ? store.get(key(first + j), &get_zc[j]).run_sync()
+                   : store.get(key(first + j), get_copy[j].data(), vsz,
+                               &got_size[j])
+                         .run_sync();
+            if (rc != 0) {
+                fprintf(stderr, "get failed: i=%lu rc=%d\n",
+                        static_cast<unsigned long>(first + j), rc);
+                return -1;
+            }
+        }
+        const double secs = now_secs() - t0;
+        for (uint64_t j = 0; j < batch; ++j) {
+            std::span<const uint8_t> got =
+                zc ? get_zc[j].value()
+                   : std::span<const uint8_t>(get_copy[j].data(),
+                                              got_size[j]);
+            if (got.size() != vsz ||
+                std::memcmp(got.data(), put_copy[j].data(), vsz) != 0) {
+                fprintf(stderr, "get returned the wrong value: i=%lu\n",
+                        static_cast<unsigned long>(first + j));
+                return -1;
+            }
+        }
+        return secs;
+    };
+    struct Phase {
+        std::vector<double> copy, zc, ratio;
+    };
+    // The get phase reads back the put phase's keys in the same order, so
+    // each batch's key i holds slot i % batch's value.
+    auto phase = [&](auto run_batch, Phase* ph) {
+        uint64_t next = 0;
+        for (int r = 0; r < cfg.compare_rounds; ++r) {
+            double mops[2] = {0, 0};  // [copy, zero copy]
+            for (int m = 0; m < 2; ++m) {
+                const bool zero = (m == 0) == (r % 2 == 1);  // alternate
+                const double secs = run_batch(next, zero);
+                if (secs < 0) return false;
+                next += batch;
+                mops[zero] = batch / (secs * 1e6);
+            }
+            ph->copy.push_back(mops[0]);
+            ph->zc.push_back(mops[1]);
+            ph->ratio.push_back(mops[1] / mops[0]);
+        }
+        return true;
+    };
+    Phase put, get;
+    if (!phase(put_batch, &put) || !phase(get_batch, &get)) return 1;
+    for (auto [name, ph] : {std::pair{"PUT", &put}, std::pair{"GET", &get}})
+        printf("CMP %s copy=%lf zero_copy=%lf delta=%+.2lf\n", name,
+               median(ph->copy), median(ph->zc),
+               (median(ph->ratio) - 1) * 100);
+#ifdef UDEPOT_BUILD_SPDK
+    if constexpr (std::is_same_v<IO, udepot::SpdkIO>)
+        printf("BOUNCED %lu\n", static_cast<unsigned long>(
+                                    udepot::SpdkIO::thread_bounce_count()));
+#endif
+    return 0;
+}
+
 template <typename IO>
 static int run_bench(const BenchConfig& cfg) {
     StoreConfig sc;
@@ -189,12 +317,21 @@ static int run_bench(const BenchConfig& cfg) {
     sc.grain_size = cfg.grain_size;
     sc.initial_tables = 4;
     sc.index_bits = 14;
+    // Every run starts empty: a file is removed between runs, but an SPDK
+    // namespace keeps the previous run's store.
+    sc.force_destroy = true;
 
     UDepot<IO> store;
     int rc = store.open(sc);
     if (rc != 0) {
         fprintf(stderr, "open failed: %d\n", rc);
         return 1;
+    }
+
+    if (cfg.compare_rounds > 0) {
+        rc = run_compare(store, cfg);
+        store.close();
+        return rc;
     }
 
     uint64_t total_ops = cfg.ops * static_cast<uint64_t>(cfg.threads);
@@ -211,6 +348,13 @@ static int run_bench(const BenchConfig& cfg) {
                r.exists_secs, cfg.ops / (r.exists_secs * 1e6));
         printf("DELs Aggregate time=%lfs Mops/sec=%lf\n",
                r.del_secs, cfg.ops / (r.del_secs * 1e6));
+#ifdef UDEPOT_BUILD_SPDK
+        // I/Os SPDK copied through a bounce buffer because their buffer was
+        // not DMA memory: zero copy hands the device the store's own.
+        if constexpr (std::is_same_v<IO, udepot::SpdkIO>)
+            printf("BOUNCED %lu\n", static_cast<unsigned long>(
+                                        udepot::SpdkIO::thread_bounce_count()));
+#endif
     } else {
         std::vector<ThreadResult> results(cfg.threads);
         std::vector<std::thread> threads;
@@ -258,8 +402,10 @@ static void usage() {
         "  --val-size <bytes>   Value size (default: 1024)\n"
         "  --seed <n>     RNG seed (default: 42)\n"
         "  --threads <n>  Number of concurrent threads (default: 1)\n"
-        "  --backend <b>  posix, aio or uring (default: posix)\n"
-        "  --zero-copy    Use the zero-copy put/get interface\n");
+        "  --backend <b>  posix, aio, uring or spdk (default: posix); spdk\n"
+        "                 uses the namespace UDEPOT_NVMEF names, whole\n"
+        "  --compare <r>  Copy vs zero copy in one store: r rounds of a\n"
+        "                 batch of -w ops each way, order alternating\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -283,8 +429,8 @@ int main(int argc, char* argv[]) {
             cfg.threads = std::stoi(argv[++i]);
         } else if (arg == "--backend" && i + 1 < argc) {
             cfg.backend = argv[++i];
-        } else if (arg == "--zero-copy") {
-            cfg.zero_copy = true;
+        } else if (arg == "--compare" && i + 1 < argc) {
+            cfg.compare_rounds = std::stoi(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
             usage();
             return 0;
@@ -304,6 +450,19 @@ int main(int argc, char* argv[]) {
 #ifdef UDEPOT_BUILD_URING
     } else if (cfg.backend == "uring") {
         rc = run_bench<udepot::UringIO>(cfg);
+#endif
+#ifdef UDEPOT_BUILD_SPDK
+    } else if (cfg.backend == "spdk") {
+        if (udepot::SpdkIO::global_init() != 0) {
+            fprintf(stderr, "SpdkIO::global_init failed\n");
+            return 1;
+        }
+        BenchConfig spdk_cfg = cfg;
+        spdk_cfg.file = "SPDK";
+        spdk_cfg.store_size = 0;  // the whole namespace
+        rc = run_bench<udepot::SpdkIO>(spdk_cfg);
+        udepot::SpdkIO::global_shutdown();
+        return rc;
 #endif
     } else {
         fprintf(stderr, "Unknown backend: %s\n", cfg.backend.c_str());

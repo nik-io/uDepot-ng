@@ -90,10 +90,12 @@ private:
     int probe_nvmef_target(const NvmefTarget& target);
 };
 
+struct SpdkRequest;
+
 struct SpdkQpair {
     SpdkNamespace* ns = nullptr;
     struct spdk_nvme_qpair* qpair = nullptr;
-    size_t npending = 0;
+    size_t npending = 0;  // submitted to the device, not yet completed
     // Coroutines whose I/O completed, resumed by the owning thread's poll
     // after spdk_nvme_qpair_process_completions returns (not from inside
     // it, which is not re-entrant).
@@ -104,7 +106,10 @@ struct SpdkQpair {
     uint64_t bounced = 0;
 
     SpdkQpair() = default;
-    SpdkQpair(SpdkNamespace* namespace_ptr, SpdkGlobalState* owner);
+    // queue_depth enlarges the request pool past SPDK's default; 0 (or a
+    // smaller depth) keeps SPDK's defaults.
+    SpdkQpair(SpdkNamespace* namespace_ptr, SpdkGlobalState* owner,
+              unsigned queue_depth = 0);
     ~SpdkQpair();
 
     SpdkQpair(const SpdkQpair&) = delete;
@@ -115,10 +120,9 @@ struct SpdkQpair {
     uint32_t get_sector_size() const { return ns->get_sector_size(); }
     uint64_t get_size() const { return ns->get_size(); }
 
-    int submit_read(void* buf, uint64_t lba, uint32_t lba_cnt,
-                    spdk_nvme_cmd_cb cb_fn, void* cb_arg);
-    int submit_write(void* buf, uint64_t lba, uint32_t lba_cnt,
-                     spdk_nvme_cmd_cb cb_fn, void* cb_arg);
+    // Returns 0, or the error that failed req: -EAGAIN when every request
+    // of the queue pair is taken.
+    int submit(SpdkRequest* req);
 
     int32_t execute_completions(uint32_t max_completions = 0);
 
@@ -178,13 +182,26 @@ public:
     // I/Os on the calling thread's queue pair that bounced. For tests.
     static uint64_t thread_bounce_count();
 
+    // Before open(): the number of I/Os the caller expects to have in
+    // flight at once on a thread. It enlarges the request pool of queue
+    // pairs created from then on, if it is beyond SPDK's default (which
+    // stays the minimum); an I/O that finds every request taken fails with
+    // -EAGAIN. Queue pairs are per thread and shared by every SpdkIO, so
+    // one a thread already has keeps its size, and the depth set by the
+    // last open() applies to every queue pair created after it.
+    void set_queue_depth(unsigned n) noexcept { queue_depth_ = n; }
+    unsigned queue_depth() const noexcept { return queue_depth_; }
+
 private:
     size_t size_ = 0;
+    unsigned queue_depth_ = 0;
     std::thread poller_;
     std::atomic<bool> running_{false};
 
     static SpdkGlobalState global_state_;
     static std::string namespace_name_;
+    // Request pool size for queue pairs created from now on.
+    static std::atomic<unsigned> new_qpair_depth_;
 
     static SpdkQpair* get_thread_qpair();
     static bool poll_thread_qpair();

@@ -265,9 +265,21 @@ void SpdkGlobalState::process_all_admin_completions() {
 // Ported from uDepot's trt/src/trt_util/spdk.hh
 // ─────────────────────────────────────────────────────────────────────────────
 
-SpdkQpair::SpdkQpair(SpdkNamespace* namespace_ptr, SpdkGlobalState* owner)
+SpdkQpair::SpdkQpair(SpdkNamespace* namespace_ptr, SpdkGlobalState* owner,
+                     unsigned queue_depth)
     : ns(namespace_ptr), gs(owner) {
-    qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns->ctlr, nullptr, 0);
+    struct spdk_nvme_io_qpair_opts opts;
+    spdk_nvme_ctrlr_get_default_io_qpair_opts(ns->ctlr, &opts, sizeof(opts));
+    // A depth beyond SPDK's default gets a bigger request pool, never a
+    // smaller one: an I/O larger than the transfer limit is split into
+    // child requests from the same pool, so a pool sized to the caller's
+    // depth alone could never take a large value, or the store's own 4 MiB
+    // reads, and they would be refused forever (PR #4 review). Requests
+    // beyond the device queue are queued by SPDK itself, so the device
+    // queue keeps SPDK's size (which must be at least 2).
+    if (queue_depth > opts.io_queue_requests)
+        opts.io_queue_requests = queue_depth;
+    qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns->ctlr, &opts, sizeof(opts));
     if (!qpair) {
         fprintf(stderr, "spdk: queue pair allocation failed\n");
         abort();
@@ -290,35 +302,13 @@ SpdkQpair::SpdkQpair(SpdkQpair&& o) noexcept
     : ns(std::exchange(o.ns, nullptr)),
       qpair(std::exchange(o.qpair, nullptr)),
       npending(std::exchange(o.npending, 0)),
-      gs(std::exchange(o.gs, nullptr)) {
+      ready(std::move(o.ready)),
+      gs(std::exchange(o.gs, nullptr)),
+      bounced(std::exchange(o.bounced, 0)) {
     if (gs) {
         gs->unregister_qpair(&o);
         gs->register_qpair(this);
     }
-}
-
-int SpdkQpair::submit_read(void* buf, uint64_t lba, uint32_t lba_cnt,
-                            spdk_nvme_cmd_cb cb_fn, void* cb_arg) {
-    int err = spdk_nvme_ns_cmd_read(ns->ns, qpair, buf, lba, lba_cnt,
-                                    cb_fn, cb_arg, 0);
-    if (err) {
-        fprintf(stderr, "spdk: submitting read request failed err=%d\n", err);
-        return err;
-    }
-    ++npending;
-    return 0;
-}
-
-int SpdkQpair::submit_write(void* buf, uint64_t lba, uint32_t lba_cnt,
-                             spdk_nvme_cmd_cb cb_fn, void* cb_arg) {
-    int err = spdk_nvme_ns_cmd_write(ns->ns, qpair, buf, lba, lba_cnt,
-                                     cb_fn, cb_arg, 0);
-    if (err) {
-        fprintf(stderr, "spdk: submitting write request failed err=%d\n", err);
-        return err;
-    }
-    ++npending;
-    return 0;
 }
 
 int32_t SpdkQpair::execute_completions(uint32_t max_completions) {
@@ -355,6 +345,10 @@ struct SpdkRequest {
     ssize_t result;
     std::coroutine_handle<> handle;  // async: resume when complete
     bool* done;                      // sync: set when complete
+    void* buf;                       // DMA memory
+    uint64_t lba;
+    uint32_t lba_cnt;
+    bool write;
 };
 
 static void spdk_io_cb(void* ctx, const struct spdk_nvme_cpl* cpl) {
@@ -368,30 +362,35 @@ static void spdk_io_cb(void* ctx, const struct spdk_nvme_cpl* cpl) {
         *req->done = true;
 }
 
+int SpdkQpair::submit(SpdkRequest* req) {
+    req->qp = this;
+    int err = req->write
+        ? spdk_nvme_ns_cmd_write(ns->ns, qpair, req->buf, req->lba,
+                                 req->lba_cnt, spdk_io_cb, req, 0)
+        : spdk_nvme_ns_cmd_read(ns->ns, qpair, req->buf, req->lba,
+                                req->lba_cnt, spdk_io_cb, req, 0);
+    if (err == 0) {
+        ++npending;
+        return 0;
+    }
+    if (err == -ENOMEM) return -EAGAIN;  // every request taken
+    fprintf(stderr, "spdk: submitting %s request failed err=%d\n",
+            req->write ? "write" : "read", err);
+    return err;
+}
+
 // Submit an NVMe command on the calling thread's queue pair and suspend;
 // the thread's poll resumes the coroutine when the command completes.
 struct SpdkSubmitAwaitable {
-    enum class Op { kRead, kWrite };
-
     SpdkRequest* req;
-    SpdkQpair* qp;
-    void* dma_buf;
-    uint64_t lba;
-    uint32_t lba_cnt;
-    Op op;
 
     bool await_ready() noexcept { return false; }
 
     bool await_suspend(std::coroutine_handle<> h) noexcept {
-        req->qp = qp;
         req->handle = h;
-        int rc;
-        if (op == Op::kRead)
-            rc = qp->submit_read(dma_buf, lba, lba_cnt, spdk_io_cb, req);
-        else
-            rc = qp->submit_write(dma_buf, lba, lba_cnt, spdk_io_cb, req);
+        int rc = req->qp->submit(req);
         if (rc != 0) {
-            req->result = -EIO;
+            req->result = rc < 0 ? rc : -EIO;
             return false;
         }
         return true;
@@ -406,6 +405,7 @@ struct SpdkSubmitAwaitable {
 
 SpdkGlobalState SpdkIO::global_state_;
 std::string SpdkIO::namespace_name_;
+std::atomic<unsigned> SpdkIO::new_qpair_depth_{0};
 
 // Per-thread queue pair — lazily initialized on first use.
 static thread_local std::unique_ptr<SpdkQpair> thread_qpair_;
@@ -497,6 +497,8 @@ int SpdkIO::open(const char* path, size_t size) {
         fprintf(stderr, "SpdkIO: using namespace: %s\n", namespace_name_.c_str());
     }
 
+    new_qpair_depth_.store(queue_depth_, std::memory_order_relaxed);
+
     // Use the device size from the namespace, ignoring the file-based size.
     // The caller passes size 0 for block devices (standard uDepot convention).
     SpdkQpair* qp = get_thread_qpair();
@@ -540,7 +542,9 @@ SpdkQpair* SpdkIO::get_thread_qpair() {
         return nullptr;
     }
 
-    thread_qpair_ = std::make_unique<SpdkQpair>(target, &global_state_);
+    thread_qpair_ = std::make_unique<SpdkQpair>(
+        target, &global_state_,
+        new_qpair_depth_.load(std::memory_order_relaxed));
     set_thread_poll(&SpdkIO::poll_thread_qpair);
     return thread_qpair_.get();
 }
@@ -602,9 +606,14 @@ ssize_t SpdkIO::pwrite_sync(const void* buf, size_t count, off_t offset) {
     }
 
     bool done = false;
-    SpdkRequest req{qp, 0, {}, &done};
-    int rc = qp->submit_write(dma_buf, lba_start, static_cast<uint32_t>(nlbas),
-                              spdk_io_cb, &req);
+    SpdkRequest req{qp, 0, {}, &done, dma_buf, lba_start,
+                    static_cast<uint32_t>(nlbas), true};
+    // uDepot's own metadata write: a queue pair full of this thread's I/O
+    // frees a request as soon as one completes, so poll and retry rather
+    // than fail the write.
+    int rc;
+    while ((rc = qp->submit(&req)) == -EAGAIN && qp->npending > 0)
+        qp->execute_completions(0);
     if (rc == 0) {
         // Completions of this thread's suspended coroutines that arrive
         // meanwhile are queued for its next poll, not resumed here.
@@ -625,11 +634,9 @@ CoroTask<ssize_t> SpdkIO::pread(void* buf, size_t count, off_t offset) {
     uint64_t nlbas = lba_end - lba_start;
 
     if (direct_io_ok(buf, count, offset, bsize)) {
-        SpdkRequest req{};
-        ssize_t result = co_await SpdkSubmitAwaitable{
-            &req, qp, buf, lba_start, static_cast<uint32_t>(nlbas),
-            SpdkSubmitAwaitable::Op::kRead
-        };
+        SpdkRequest req{qp, 0, {}, nullptr, buf, lba_start,
+                        static_cast<uint32_t>(nlbas), false};
+        ssize_t result = co_await SpdkSubmitAwaitable{&req};
         if (result < 0) co_return result;
         co_return static_cast<ssize_t>(count);
     }
@@ -638,11 +645,9 @@ CoroTask<ssize_t> SpdkIO::pread(void* buf, size_t count, off_t offset) {
     if (!dma_buf) co_return -ENOMEM;
     ++qp->bounced;
 
-    SpdkRequest req{};
-    ssize_t result = co_await SpdkSubmitAwaitable{
-        &req, qp, dma_buf, lba_start, static_cast<uint32_t>(nlbas),
-        SpdkSubmitAwaitable::Op::kRead
-    };
+    SpdkRequest req{qp, 0, {}, nullptr, dma_buf, lba_start,
+                    static_cast<uint32_t>(nlbas), false};
+    ssize_t result = co_await SpdkSubmitAwaitable{&req};
 
     if (result < 0) {
         qp->free_dma_buffer(dma_buf);
@@ -675,11 +680,9 @@ CoroTask<ssize_t> SpdkIO::pwrite(const void* buf, size_t count, off_t offset) {
         std::memcpy(static_cast<char*>(dma_buf) + copy_off, buf, count);
     }
 
-    SpdkRequest req{};
-    ssize_t result = co_await SpdkSubmitAwaitable{
-        &req, qp, dma_buf, lba_start, static_cast<uint32_t>(nlbas),
-        SpdkSubmitAwaitable::Op::kWrite
-    };
+    SpdkRequest req{qp, 0, {}, nullptr, dma_buf, lba_start,
+                    static_cast<uint32_t>(nlbas), true};
+    ssize_t result = co_await SpdkSubmitAwaitable{&req};
 
     if (dma_buf != buf) qp->free_dma_buffer(dma_buf);
     if (result < 0) co_return result;

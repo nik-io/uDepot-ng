@@ -90,6 +90,9 @@ public:
     // Whether readers use a full fence because membarrier is unavailable.
     static bool reader_fence() noexcept;
 
+    // Rcu instances the calling thread holds a slot in. For tests.
+    static size_t this_thread_instances() noexcept;
+
 private:
     struct alignas(64) Slot {
         std::atomic<uint64_t> lock[2] = {};

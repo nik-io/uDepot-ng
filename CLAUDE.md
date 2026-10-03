@@ -135,27 +135,55 @@ ctest --test-dir build
 - **ThreadSanitizer**, the same tests minus the bindings, failing on any
   report. Debug with `-O1`, so asserts stay on. It has the same "every test
   built" check (`scripts/ci-check-tests-built.sh`).
-- **SPDK backend**, `scripts/spdk-nvmef-test.sh` against a loopback NVMe-oF
-  software target, as uDepot's CI does. SPDK is built with
-  `--target-arch=x86-64-v2` and its tree cached per submodule revision.
-- **zero-copy perf invariant**, below.
+- **SPDK backend**, `scripts/spdk-nvmef-test.sh build tests` against a
+  loopback NVMe-oF software target, as uDepot's CI does, on a Debug build.
+  SPDK is built with `--target-arch=x86-64-v2` and its tree cached per
+  submodule revision.
+- **zero-copy perf invariant**, below: one check for posix, AIO and
+  io_uring, and **zero-copy perf invariant (SPDK)**, a second entry of the
+  SPDK job (`spdk-nvmef-test.sh build perf`) on a Release build.
 
 ### Zero-copy perf invariant
 
 As in uDepot: `scripts/perf-zerocopy.sh <posix|aio|uring>` (or
-`cmake --build build --target run_perf_test` for all of them) runs
-`udepot_ng_bench` with the copying and the zero-copy put/get, interleaved,
-on a `/dev/shm` store. It fails if zero copy's median is more than 5%
-slower than copy's on PUT or GET. The two runs differ only in the value
-copies zero copy avoids. It compares one operation done two ways, inside
-one run, so there is no stored baseline to drift.
+`cmake --build build --target run_perf_test` for all of them) compares the
+copying and the zero-copy put/get on a `/dev/shm` store, and fails unless
+zero copy is strictly faster than copy on PUT and GET: it runs less code
+and copies nothing, so "as fast" is already a regression. (uDepot allowed
+zero copy to be up to 5% slower; on the paired comparison below, zero copy
+was ahead in every run measured, by medians of +3% to +28%.) It compares
+one operation done two ways, so there is no stored baseline to drift.
 
-Values are 32 KiB: at 1 KiB a copy is ~2% of a put, and a zero-copy path
-that copied twice still passed. Even at 32 KiB, one stray extra copy is
-about 5% of a put, at the edge of the tolerance: in a mutation test it
-failed the gate on io_uring and passed it on posix and AIO. The gate
-catches a zero-copy path that does clearly more work than the copying one,
-not every lost copy.
+The comparison is paired, inside one process: `udepot_ng_bench --compare`
+runs rounds of a copy batch and a zero-copy batch back to back on one store
+(which goes first alternates), and reports the median of the rounds'
+zero-copy/copy ratios; the gate is the median of 5 such runs. Zero copy is
+uDepot's property, not the caller's: given a buffer it handed out
+(`alloc_put_buffer()`, `alloc_get_buffer()`), put and get do their I/O on
+it directly, and given other memory they copy through one of their own. So
+the bench sets both modes up as a caller would, outside the timing: every
+buffer allocated and every value written up front, plain memory for the
+copying API and uDepot's buffers for the zero-copy one, the same values in
+both. The timed loops only issue operations; gets are checked afterwards.
+An earlier version allocated a `PutBuffer` per put inside the timed loop. The two
+batches of a round share whatever drifts (the runner, GC, a network
+target), so the ratio isolates the copies zero copy avoids. It used to
+compare separate runs of each, by median: absolute throughput differs by up
+to ~1.7x between processes, and that read as AIO's zero-copy GET 13.7%
+slower in CI, and on SPDK as anything from 37% slower to 52% faster, on
+code where every paired comparison has zero copy ahead. Never set
+throughputs from different runs against each other.
+
+**SPDK** is gated the same way, as its own CI check, "zero-copy perf
+invariant (SPDK)": `scripts/spdk-nvmef-test.sh <build> perf` starts the
+NVMe-oF target and runs `perf-zerocopy.sh spdk` against it, on a Release
+build like the other backends. (It used to run inside the SPDK backend
+test job, on its Debug build, where its result was easy to miss.) Plus an exact
+check: a zero-copy run must bounce no I/O through a DMA copy (SPDK counts
+them), since the device should transfer straight to and from the store's
+buffers. A mutation handing out non-DMA buffers failed it with 75126
+bounces. Paired, zero copy was faster in all 25 SPDK runs measured (PUT
++0.5 to +7%, GET +1 to +11%).
 
 ### Performance regression gate
 

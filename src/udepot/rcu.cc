@@ -94,6 +94,15 @@ struct ThreadSlots {
 
 static thread_local ThreadSlots tl_slots;
 
+// Drops from a thread's list the instances destroyed since it used them.
+static void forget_destroyed(std::vector<ThreadSlots::Owned>& owned) {
+    if (owned.empty()) return;
+    std::lock_guard<std::mutex> lock(live_mu());
+    std::erase_if(owned, [](const ThreadSlots::Owned& o) {
+        return live().count(o.rcu_id) == 0;
+    });
+}
+
 uint64_t Rcu::next_id() noexcept {
     static std::atomic<uint64_t> counter{1};
     return counter.fetch_add(1, std::memory_order_relaxed);
@@ -170,6 +179,9 @@ uint32_t Rcu::claim_slot() noexcept {
     return kShared;
 }
 
+
+size_t Rcu::this_thread_instances() noexcept { return tl_slots.owned.size(); }
+
 void Rcu::release_slot_if_alive(uint64_t id, uint32_t s) noexcept {
     std::lock_guard<std::mutex> lock(live_mu());
     auto it = live().find(id);
@@ -191,7 +203,15 @@ uint32_t Rcu::this_thread_slot() noexcept {
     uint32_t s = claim_slot();
     // The shared slot is not recorded as owned, so a later lookup that
     // misses the cache tries again to claim a slot of its own.
-    if (s != kShared) t.owned.push_back({id_, s});
+    if (s != kShared) {
+        // A slot of this thread's own, once per instance: forget the
+        // instances destroyed since (their slots went with them), so a
+        // thread that outlives many stores keeps, and scans, only the live
+        // ones. Never on the shared slot's path, which comes back here on
+        // every switch between instances.
+        forget_destroyed(t.owned);
+        t.owned.push_back({id_, s});
+    }
     t.last = {id_, s};
     return s;
 }

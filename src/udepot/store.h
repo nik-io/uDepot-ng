@@ -79,6 +79,13 @@ struct StoreConfig {
     uint32_t overprovision = 200;
     // Destroy any existing data on the device and start fresh.
     bool force_destroy = false;
+    // I/Os the caller expects to have in flight at once (per thread on
+    // SPDK). It sizes the backend's queue (AIO context, io_uring ring,
+    // SPDK request pool); uDepot allocates no data buffers for it, see
+    // alloc_put_buffer() and alloc_get_buffer(). An operation whose I/O
+    // the backend refuses because its queue is full fails with -EAGAIN.
+    // 0 = the backend's default.
+    unsigned queue_depth = 0;
 };
 
 // Condition a put() must satisfy, checked atomically with the write.
@@ -89,8 +96,11 @@ enum class PutMode {
 };
 
 // A version identifies one stored value of a key; every successful put
-// yields a new one. get() reports it, and put()/del() accept it to act only
-// if the key still holds that value (-ESTALE otherwise).
+// yields a new one, and none ever repeats. get() reports it, and put()/del()
+// accept it to act only if the key still holds that value (-ESTALE
+// otherwise). GC moving a value also changes its version: a conditional
+// put/del after that fails with -ESTALE though the value is the same, a
+// failure the caller handles by reading again, as for a real change.
 inline constexpr uint64_t kAnyVersion = UINT64_MAX;
 
 // Zero-copy values (uDepot's Mbuff interface). A PutBuffer, from
@@ -154,6 +164,10 @@ public:
     // As in uDepot, the caller orders open() and close() against
     // operations: none may start before open() returns, run concurrently
     // with close(), or follow it.
+    //
+    // Any operation fails with -EAGAIN if the backend cannot take another
+    // I/O (its queue is full of the caller's operations); it may be retried
+    // once some of those complete. See StoreConfig::queue_depth.
     int open(const StoreConfig& config);
     void close();
 
@@ -187,8 +201,19 @@ public:
                       PutMode mode = PutMode::kUpsert,
                       uint64_t if_version = kAnyVersion);
 
+    // Zero copy, for gets: a buffer that holds a record of a key of
+    // key_size bytes and a value of up to val_size bytes. Invalid
+    // (!valid()) if the sizes cannot be stored or allocation fails. Use it
+    // with the store that allocated it: on SPDK that is DMA memory, and
+    // another buffer still works but is copied through one.
+    GetBuffer alloc_get_buffer(size_t key_size, size_t val_size);
+
     // Zero copy: on success, *val_out holds the buffer the record was read
-    // into, and val_out->value() the value. On error it is left empty.
+    // into, and val_out->value() the value. The record is read into
+    // val_out's own buffer when it is large enough (from alloc_get_buffer()
+    // or an earlier get), so a caller can reuse its buffers; otherwise
+    // into a new one, which replaces it. On error value() is empty and the
+    // buffer is kept. The buffer must stay alive until the get completes.
     CoroTask<int> get(std::span<const uint8_t> key, GetBuffer* val_out,
                       uint64_t* version_out = nullptr);
 
@@ -365,6 +390,19 @@ private:
     // Reads and validates the metadata of the segment starting at seg_base.
     bool read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md);
 
+    // uDepot's own synchronous I/O (recovery, index persistence, GC). It
+    // shares the backend's queue with the caller's operations, so a
+    // submission refused for a full queue (-EAGAIN) is retried once some
+    // complete: only the caller's own operations report -EAGAIN.
+    template <typename Start>
+    static auto run_internal(Start&& start);
+    ssize_t pread_internal(void* buf, size_t count, off_t offset) {
+        return run_internal([&] { return io_.pread(buf, count, offset); });
+    }
+    ssize_t pwrite_internal(const void* buf, size_t count, off_t offset) {
+        return run_internal([&] { return io_.pwrite(buf, count, offset); });
+    }
+
     // ── Index segments (paper §4.4) ─────────────────────────────────────
     // close() flushes the hash tables to index segments, and an open after
     // a clean shutdown restores them instead of scanning the log; the log
@@ -513,6 +551,8 @@ private:
     // Whether data at new_pba is newer than data at old_pba in the order
     // crash recovery uses (segment timestamp, then grain).
     bool newer_than(uint64_t new_pba, uint64_t old_pba) const;
+    // The version of the record at pba (see kAnyVersion).
+    uint64_t version_of(uint64_t pba) const;
 
     // Allocate, waiting for space if needed (see SpaceWait). While
     // waiting, `guard` is released and `probe` is cleared: an unprotected

@@ -293,6 +293,44 @@ concept IoBackend = requires(T io, void* buf, size_t n, off_t off) {
 };
 ```
 
+**Queue depth.** The intended use: preallocate zero-copy buffers for the
+depth you choose (`alloc_put_buffer`, `alloc_get_buffer`), issue that many
+operations, wait for them, reuse the buffers. uDepot allocates no data
+buffers for depth. `StoreConfig::queue_depth` sizes each backend's queue for
+it: the AIO context (`io_setup`), the io_uring ring, and the SPDK request
+pool of queue pairs created afterwards (per thread). SPDK's own pool size
+stays the minimum: a large I/O takes several requests (one per transfer-size
+piece), so a pool sized to a small depth could never take it. Nothing in
+uDepot caps the depth below what the backend takes. A depth the backend
+cannot set up at all makes `open()` fail with `-EINVAL`.
+
+When the backend cannot take another I/O, the operation fails with
+`-EAGAIN`, on every backend, as uDepot failed it: AIO's `io_submit`
+refuses (EAGAIN), SPDK has no free request (ENOMEM), or io_uring has no
+free submission entry (only while the kernel refuses submissions; it
+otherwise takes I/O past the ring's size, keeping the extra completions on
+its overflow list). The caller can retry it once some of its outstanding
+operations complete. A put or del refused after it wrote its record ends
+like any failure after the write (paper section 4.5, "PUT writes before it
+checks"): the directory is unchanged, so a clean restart, which restores
+the index, never sees the record; but it stays in the log, and after a
+crash the log scan restores it if it is the key's newest. Nothing waits or
+spins for room: on EBUSY/EAGAIN from `io_uring_submit` the SQEs, already
+published, are left for the poller to push after it reaps, since the
+submitter may be the poller itself.
+
+Only the caller's operations report `-EAGAIN`. uDepot's own synchronous
+I/O (recovery, index persistence, GC) shares the queue, so it retries a
+refused submission once some complete (`run_internal`), and SPDK's
+`pwrite_sync` polls its queue pair and retries.
+
+`QueueDepthTest` (`test/queue_depth_tests.h`, run per backend) sizes the
+backend for 4, puts thousands of puts, gets and exists in flight while
+nothing is reaped, requires each to succeed with its data or fail with
+exactly `-EAGAIN` (AIO and SPDK must refuse some), and retries until all
+are done. `LargeValuesAtTheSmallestQueueDepth` puts and gets values larger
+than one transfer with a queue depth of 1.
+
 ### 7. Simplified Buffer (Replacing Mbuff)
 
 The original Mbuff was a linked list of buffer nodes with prepend/append,
@@ -317,8 +355,11 @@ contiguous buffer instead of a chain of nodes:
   shaped like the on-disk record. The caller writes the value into
   `value()`, and `put(key, PutBuffer&)` fills in the header, key and checksum
   around it and writes the buffer as is. On SPDK the buffer is DMA memory.
-- **get**: `get(key, GetBuffer*)` hands over the buffer the record was read
-  into; `value()` views the value inside it.
+- **get**: `get(key, GetBuffer*)` reads the record into the `GetBuffer`'s
+  own buffer when it is large enough (`alloc_get_buffer(key_size,
+  val_size)` preallocates one), and otherwise into a new one that replaces
+  it; `value()` views the value inside it. A caller reusing its buffers
+  does no allocation per get. (uDepot's Mbuff was likewise the caller's.)
 - The span-based `put`/`get` copy the value into, or out of, such a record
   buffer. Both interfaces run the same coroutine (`put_record` and
   `get_record`), so they differ only in that copy. `scripts/perf-zerocopy.sh`
@@ -487,19 +528,27 @@ The intent is uDepot's format (segment layout, directory table layout, salsa
 metadata; see `docs/udepot-paper.md`, §4.4), so a uDepot-ng store and a uDepot
 store can read each other. **Known divergences:**
 
-- The KV record header carries an 8-byte timestamp (`KvHeader`). uDepot's
-  header is 6 bytes (key size, value size); it orders a record by its
-  segment's timestamp, which the record's checksum is bound to.
 - Index segment headers and footers extend uDepot's `dirmap_hdr` /
   `dirmap_ftr` (below) with the table's size and its part number. uDepot
   sized every table to fill its segment, so it needed neither.
 
 ### Record identity
 
-As uDepot's `checksum16(timestamp, md)`, a record's 2-byte checksum is a
-CRC32 seeded with its segment's timestamp, over the header, then over the
-device seed, truncated to 16 bits. Recovery and GC accept a record only if
-its header carries its segment's timestamp and the checksum matches. A store
+A record is uDepot's (`uDepotSalsaStore`): a 14-byte header (key size,
+value size, and the timestamp of the segment it was written into), the key,
+the value and a 2-byte checksum. The paper describes a 6-byte header; uDepot's
+code has always carried the timestamp, and uDepot-ng follows the code. As
+uDepot's `checksum16(timestamp, md)`, the checksum is a CRC32 seeded with the
+segment's timestamp, over the header, then over the device seed, truncated to
+16 bits.
+
+Recovery and GC accept a record only if its header carries its segment's
+timestamp *and* the checksum matches; uDepot checks the checksum alone. The
+timestamp check is what rejects records left from a segment's previous use:
+CRC32 is linear, so for a given pair of old and new segment timestamps the
+16-bit checksum of every stale record either passes or fails alike (about one
+segment reuse in 65536 would let a whole stale tail through), while the
+64-bit timestamp of a previous use never equals the current one. A store
 created over an earlier one (`force_destroy`) restarts its timestamps from
 the same values on the same segments; without the seed in the checksum, a
 crash brought back the earlier store's records left past what the new one
@@ -507,6 +556,13 @@ had written. Each new store therefore needs its own seed: uDepot took the
 monotonic clock's seconds, which repeat for two stores created within a
 second or across reboots, so uDepot-ng draws it from `std::random_device`
 mixed with the real-time clock.
+
+A record's version (what `get` reports and conditional `put`/`del` take) is
+its segment's timestamp and its grain within the segment, not its address:
+an address comes back once the segment is reused, so a stale conditional
+write could have acted on a different value (ABA). GC moving a record gives
+it a new version, so a conditional write after that fails with `-ESTALE`
+though the value is unchanged; that is safe, and costs no bytes on disk.
 
 Each segment's timestamp is the allocation count salsa gave that segment,
 passed to the metadata callback, so two streams staging segments at once
@@ -556,8 +612,23 @@ decides, as the paper says: *"the persistent source of truth is the log"*.
   anything is written, restored or not, as uDepot's `invalidate_ftr()`:
   otherwise a crash later in the session could restore an index older than
   the log.
-- Not yet: the paper also flushes periodically, to shorten recovery after a
-  crash.
+- **No periodic flush, deliberately.** The paper also flushes *"periodically
+  to speed recovery"*. uDepot gets that only from the kernel writing back
+  its mmap'd tables, and its footers are valid only after a clean shutdown,
+  so after a crash it scans the log whatever was written back. A periodic
+  flush shortens recovery only with a recovery path that restores the last
+  flushed index and then replays the log written since (dropping entries
+  that point into segments reused after the flush), which neither has. That
+  path is a design of its own, deferred until there is a need for it.
+- **Not yet: index space charged up front.** uDepot keeps its tables on
+  index segments for the whole session, so their space is taken as the
+  directory grows, and a full store can still keep its index. uDepot-ng
+  allocates the segments at `close()`, so a store full of live data falls
+  back to the log scan on its next open. Holding a segment per table only
+  costs the index's size when a table fills its segment, as uDepot sizes
+  them; uDepot-ng sizes tables by `index_bits` instead, so a small table
+  would hold a whole segment. This waits for the resize work, which
+  revisits table geometry.
 
 ## Implementation Order
 

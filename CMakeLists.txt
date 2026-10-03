@@ -210,6 +210,9 @@ if(UDEPOT_BUILD_TESTS)
         udepot_add_test(uring_test test/io/uring_test.cc)
         udepot_add_test(uring_store_test test/uring_store_test.cc)
         udepot_add_test(concurrent_uring_store_test test/concurrent_uring_store_test.cc)
+        udepot_add_test(uring_queue_depth_test test/uring_queue_depth_test.cc)
+        set_tests_properties(uring_queue_depth_test PROPERTIES TIMEOUT 180
+                             RUN_SERIAL TRUE)
     endif()
 
     if(UDEPOT_BUILD_PYTHON)
@@ -272,11 +275,27 @@ if(UDEPOT_BUILD_TESTS)
         udepot_add_test(spdk_store_test test/spdk_store_test.cc)
         set_tests_properties(spdk_test PROPERTIES TIMEOUT 120)
         set_tests_properties(spdk_store_test PROPERTIES TIMEOUT 120)
+        udepot_add_test(spdk_queue_depth_test test/spdk_queue_depth_test.cc)
+        set_tests_properties(spdk_queue_depth_test PROPERTIES TIMEOUT 300)
+
+        # Every SPDK test, in one place: CI builds `spdk_tests`, and
+        # scripts/spdk-nvmef-test.sh runs what spdk_tests.txt names. A new
+        # SPDK test added here is built and run by both; listing it in either
+        # by hand let them drift (a test the script required was never built).
+        set(UDEPOT_SPDK_TESTS spdk_test spdk_store_test spdk_queue_depth_test)
+        add_custom_target(spdk_tests DEPENDS ${UDEPOT_SPDK_TESTS})
+        list(JOIN UDEPOT_SPDK_TESTS "\n" _spdk_tests_list)
+        file(WRITE ${CMAKE_BINARY_DIR}/spdk_tests.txt "${_spdk_tests_list}\n")
     endif()
 
     # Perf benchmark binary (not a gtest — standalone executable).
     add_executable(udepot_ng_bench test/perf/udepot_ng_bench.cc)
     target_link_libraries(udepot_ng_bench PRIVATE udepot)
+    if(UDEPOT_BUILD_SPDK)
+        # scripts/spdk-nvmef-test.sh runs the zero-copy gate over SPDK with
+        # it, so the SPDK job builds it with the tests.
+        add_dependencies(spdk_tests udepot_ng_bench)
+    endif()
 
     # Zero-copy invariant (scripts/perf-zerocopy.sh), as uDepot's
     # `make run_perf_test`: on every backend, zero-copy put/get must not be

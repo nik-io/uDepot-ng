@@ -682,13 +682,52 @@ TEST_F(StoreTest, ZeroCopyErrors) {
     udepot::PutBuffer empty;
     EXPECT_EQ(store_.put(bytes("k"), empty).run_sync(), -EINVAL);
 
-    // A missing key leaves the GetBuffer empty, even if it held a value.
+    // A missing key leaves the GetBuffer's value empty, even if it held
+    // one; the buffer itself is kept for reuse.
     ASSERT_EQ(store_.put("have", "it").run_sync(), 0);
     udepot::GetBuffer gb;
     ASSERT_EQ(store_.get(bytes("have"), &gb).run_sync(), 0);
     EXPECT_EQ(store_.get(bytes("missing"), &gb).run_sync(), -ENOENT);
-    EXPECT_FALSE(gb.valid());
+    EXPECT_TRUE(gb.valid());
+    EXPECT_TRUE(gb.value().empty());
     EXPECT_EQ(store_.get(std::span<const uint8_t>{}, &gb).run_sync(), -EINVAL);
+    EXPECT_TRUE(gb.value().empty());
+
+    // Sizes the store cannot hold give no get buffer either.
+    EXPECT_FALSE(store_.alloc_get_buffer(0, 10).valid());
+    EXPECT_FALSE(store_.alloc_get_buffer(10, 2u << 20).valid());
+}
+
+// A GetBuffer is the caller's to reuse: a get reads into it when it is big
+// enough, so a caller that preallocates its buffers (alloc_get_buffer) does
+// no allocation per get.
+TEST_F(StoreTest, ZeroCopyGetReusesTheCallersBuffer) {
+    ASSERT_EQ(store_.put("small1", "aaaa").run_sync(), 0);
+    ASSERT_EQ(store_.put("small2", "bbbbbbbb").run_sync(), 0);
+    const std::string big(5000, 'c');
+    ASSERT_EQ(store_.put("big", big).run_sync(), 0);
+
+    udepot::GetBuffer gb = store_.alloc_get_buffer(6, 100);
+    ASSERT_TRUE(gb.valid());
+    EXPECT_TRUE(gb.value().empty());
+    const uint8_t* lo = gb.value().data();
+    ASSERT_EQ(store_.get(bytes("small1"), &gb).run_sync(), 0);
+    EXPECT_EQ(text(gb.value()), "aaaa");
+    const uint8_t* at = gb.value().data();
+    ASSERT_EQ(store_.get(bytes("small2"), &gb).run_sync(), 0);
+    EXPECT_EQ(text(gb.value()), "bbbbbbbb");
+    EXPECT_EQ(gb.value().data(), at) << "the get did not reuse the buffer";
+    EXPECT_GE(at, lo);
+
+    // Too small for the record: the get replaces it with a bigger one,
+    // which later gets reuse in turn.
+    ASSERT_EQ(store_.get(bytes("big"), &gb).run_sync(), 0);
+    EXPECT_EQ(text(gb.value()), big);
+    const uint8_t* big_at = gb.value().data();
+    ASSERT_EQ(store_.get(bytes("small1"), &gb).run_sync(), 0);
+    EXPECT_EQ(text(gb.value()), "aaaa");
+    ASSERT_EQ(store_.get(bytes("big"), &gb).run_sync(), 0);
+    EXPECT_EQ(gb.value().data(), big_at);
 }
 
 // Recovery reads zero-copy records like any other.
