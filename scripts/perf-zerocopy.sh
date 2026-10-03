@@ -78,18 +78,43 @@ if [ "$BACKEND" = "spdk" ]; then
     WHERE="on SPDK (${UDEPOT_NVMEF%%:*})"
 fi
 
-# One run; echo "put_delta get_delta bounced" (bounced: SPDK only, else 0).
+# The machine, so a result can be read against the hardware it ran on: CI
+# runners differ, and the copy zero copy avoids costs what the caches and
+# memory make it cost.
+{
+    echo "machine: $(uname -r), $(nproc) cpus"
+    if command -v lscpu >/dev/null; then
+        lscpu | grep -E '^(Model name|L1d cache|L2 cache|L3 cache):' | sed 's/^/  /'
+    fi
+    if [ "$BACKEND" != "spdk" ]; then
+        # AIO and io_uring open the store O_DIRECT, falling back to buffered
+        # I/O where the filesystem refuses it.
+        if dd if=/dev/zero of="$FILE" bs=4096 count=1 oflag=direct status=none 2>/dev/null
+        then echo "  O_DIRECT on /dev/shm: yes"
+        else echo "  O_DIRECT on /dev/shm: no (the backend falls back to buffered I/O)"
+        fi
+        rm -f "$FILE"
+    fi
+} >&2
+
+# One run; echo "put_delta get_delta bounced put_copy put_zc get_copy get_zc"
+# (bounced: SPDK only, else 0; throughputs in Mops/s as the bench prints
+# them, the medians of the run's batches).
 run_compare() {
     rm -f "$FILE"
     local out
     out=$("$BIN" --backend "$BACKEND" -f "$FILE" --size "$SIZE" -w "$BATCH" \
         --val-size "$VAL" --grain-size 512 --compare "$ROUNDS" 2>/dev/null)
-    local dp dg b
+    local dp dg b pc pz gc gz
     dp=$(grep '^CMP PUT' <<<"$out" | grep -oE 'delta=[-+0-9.]+' | cut -d= -f2)
     dg=$(grep '^CMP GET' <<<"$out" | grep -oE 'delta=[-+0-9.]+' | cut -d= -f2)
     b=$(grep '^BOUNCED' <<<"$out" | awk '{print $2}')
     [ "$BACKEND" = "spdk" ] || b="${b:-0}"
-    echo "${dp#+} ${dg#+} $b"  # sort -n does not take a leading +
+    pc=$(grep '^CMP PUT' <<<"$out" | grep -oE ' copy=[0-9.]+' | cut -d= -f2)
+    pz=$(grep '^CMP PUT' <<<"$out" | grep -oE 'zero_copy=[0-9.]+' | cut -d= -f2)
+    gc=$(grep '^CMP GET' <<<"$out" | grep -oE ' copy=[0-9.]+' | cut -d= -f2)
+    gz=$(grep '^CMP GET' <<<"$out" | grep -oE 'zero_copy=[0-9.]+' | cut -d= -f2)
+    echo "${dp#+} ${dg#+} $b $pc $pz $gc $gz"  # sort -n does not take a leading +
 }
 
 median() { printf '%s\n' "$@" | sort -n | \
@@ -97,10 +122,14 @@ median() { printf '%s\n' "$@" | sort -n | \
 
 dps=(); dgs=(); bounced=0
 for it in $(seq 1 "$RUNS"); do
-    read -r dp dg b <<<"$(run_compare)"
-    { [ -n "$dp" ] && [ -n "$dg" ] && [ -n "$b" ]; } \
+    read -r dp dg b pc pz gc gz <<<"$(run_compare)"
+    { [ -n "$dp" ] && [ -n "$dg" ] && [ -n "$b" ] && [ -n "$gz" ]; } \
         || { echo "a udepot_ng_bench --compare run produced no result" >&2; exit 2; }
-    echo "  run $it: PUT delta=${dp}% GET delta=${dg}%" >&2
+    awk -v it="$it" -v dp="$dp" -v dg="$dg" -v pc="$pc" -v pz="$pz" \
+        -v gc="$gc" -v gz="$gz" 'BEGIN{
+        printf("  run %s: PUT delta=%s%% (copy %.1f, zero copy %.1f kops/s)" \
+               "  GET delta=%s%% (copy %.1f, zero copy %.1f kops/s)\n",
+               it, dp, pc * 1000, pz * 1000, dg, gc * 1000, gz * 1000) > "/dev/stderr" }'
     dps+=("$dp"); dgs+=("$dg")
     bounced=$((bounced + b))
 done

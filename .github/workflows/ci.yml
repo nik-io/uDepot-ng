@@ -234,6 +234,9 @@ jobs:
       - name: Zero-copy invariant (aio)
         timeout-minutes: 15
         run: scripts/perf-zerocopy.sh aio build
+      # Runs even when AIO failed: both backends' numbers on the same
+      # runner tell a backend problem from a machine one.
       - name: Zero-copy invariant (io_uring)
+        if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: scripts/perf-zerocopy.sh uring build
