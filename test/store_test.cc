@@ -18,6 +18,8 @@
 
 #include <gtest/gtest.h>
 
+#include "record_checksum.h"
+
 using udepot::PosixIO;
 using udepot::StoreConfig;
 using udepot::UDepot;
@@ -254,20 +256,14 @@ TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
 
     off_t offset = static_cast<off_t>(entry.pba()) * store_.grain_size();
 
-    // Corrupt the on-disk header metadata so the CRC (which covers only
-    // the header, matching uDepot) won't match.
+    // Corrupt the record's checksum (it covers only the header, matching
+    // uDepot), keeping the header intact so lookup still finds the entry.
     uint8_t grain[512];
     ssize_t nread = store_.io().pread(grain, sizeof(grain), offset)
                         .run_sync();
     ASSERT_EQ(nread, 512);
-
-    // Flip the timestamp field in the header (bytes 6..13) while keeping
-    // key_size and val_size intact so lookup still finds the entry.
-    udepot::KvHeader hdr;
-    std::memcpy(&hdr, grain, sizeof(hdr));
-    hdr.timestamp ^= 0xDEADBEEF;
-    std::memcpy(grain, &hdr, sizeof(hdr));
-
+    const size_t crc_at = sizeof(udepot::KvHeader) + 7 + 7;  // key, value
+    grain[crc_at] ^= 0x5A;
     ssize_t written = store_.io().pwrite(grain, sizeof(grain), offset)
                           .run_sync();
     ASSERT_EQ(written, 512);
@@ -367,17 +363,6 @@ TEST_F(StoreTest, ExistsWithTagCollisionFindsCorrectKey) {
 }
 
 // --- CRC table-based vs bit-by-bit equivalence ---
-
-// zlib's crc32(crc, buf, len), bit by bit, independent of the store's table.
-static uint32_t crc32_bitwise(uint32_t crc, const uint8_t* data, size_t len) {
-    crc = ~crc;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; ++j)
-            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
-    }
-    return ~crc;
-}
 
 // --- Upsert (overwrite) ---
 
@@ -484,9 +469,7 @@ TEST_F(StoreTest, PutOverwriteExistsReportsNewSize) {
 TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
     // Put a key/value pair; read it back via raw I/O and verify the
     // on-disk CRC matches the reference bitwise implementation.
-    // As uDepot's checksum16(timestamp, md): a CRC32 seeded with the
-    // segment timestamp, over the header, then over the device seed,
-    // truncated to 16 bits.
+    // As uDepot's checksum16(timestamp, md): see record_checksum.h.
     std::string key = "crc_check_key";
     std::vector<uint8_t> val(256);
     for (size_t i = 0; i < val.size(); ++i)
@@ -518,14 +501,22 @@ TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
                         .run_sync();
     ASSERT_EQ(nread, static_cast<ssize_t>(read_size));
 
-    udepot::KvHeader hdr;
-    std::memcpy(&hdr, buf.data(), sizeof(hdr));
-    const uint64_t seed = store_.seed();
-    uint32_t crc = crc32_bitwise(static_cast<uint32_t>(hdr.timestamp),
-                                 buf.data(), sizeof(udepot::KvHeader));
-    crc = crc32_bitwise(crc, reinterpret_cast<const uint8_t*>(&seed),
-                        sizeof(seed));
-    uint16_t ref_crc = static_cast<uint16_t>(crc);
+    // The record's segment's timestamp, from the segment metadata in the
+    // segment's last grain: salsa_seg_md starts with the segment size, the
+    // grain size and the timestamp.
+    const uint64_t seg_grains = store_.segment_grains();
+    const off_t md_off = static_cast<off_t>(
+        ((entry.pba() / seg_grains + 1) * seg_grains - 1) * config_.grain_size);
+    std::vector<uint8_t> md(config_.grain_size);
+    ASSERT_EQ(store_.io().pread(md.data(), md.size(), md_off).run_sync(),
+              static_cast<ssize_t>(md.size()));
+    uint64_t md_seg_grains = 0, seg_ts = 0;
+    std::memcpy(&md_seg_grains, md.data(), 8);
+    std::memcpy(&seg_ts, md.data() + 16, 8);
+    ASSERT_EQ(md_seg_grains, seg_grains);
+    ASSERT_NE(seg_ts, 0u);
+    const uint16_t ref_crc =
+        record_checksum(buf.data(), seg_ts, store_.seed());
 
     // Read the stored CRC from the suffix.
     size_t suffix_offset = sizeof(udepot::KvHeader) + key.size() + val.size();

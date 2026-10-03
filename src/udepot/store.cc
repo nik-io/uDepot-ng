@@ -56,13 +56,24 @@ static constexpr uint32_t kGlobalSeed = 0xDEADBEEF;
 // own identity. A record left on the device by an earlier store, whose
 // timestamps restart from the same values, then fails it.
 template <typename IO>
-uint16_t UDepot<IO>::compute_crc16(const KvHeader& hdr) const {
-    uint32_t crc = crc32_update(static_cast<uint32_t>(hdr.timestamp),
+uint16_t UDepot<IO>::compute_crc16(const KvHeader& hdr,
+                                   uint64_t seg_ts) const {
+    uint32_t crc = crc32_update(static_cast<uint32_t>(seg_ts),
                                 reinterpret_cast<const uint8_t*>(&hdr),
                                 sizeof(hdr));
     crc = crc32_update(crc, reinterpret_cast<const uint8_t*>(&seed_),
                        sizeof(seed_));
     return static_cast<uint16_t>(crc);
+}
+
+template <typename IO>
+bool UDepot<IO>::crc_matches(const KvHeader& hdr, const uint8_t* rec,
+                             uint64_t seg_ts) const {
+    KvSuffix suffix;
+    std::memcpy(&suffix,
+                rec + sizeof(KvHeader) + hdr.key_size + record_val_bytes(hdr),
+                sizeof(suffix));
+    return suffix.crc16 == compute_crc16(hdr, seg_ts);
 }
 
 template <typename IO>
@@ -327,7 +338,7 @@ int UDepot<IO>::crash_recovery() {
             const uint8_t* ep = seg + (grain - seg_base) * grain_size_;
             KvHeader hdr;
             std::memcpy(&hdr, ep, sizeof(hdr));
-            if (hdr.key_size == 0 || hdr.timestamp != ts) {
+            if (hdr.key_size == 0) {
                 skip(1);
                 continue;
             }
@@ -340,11 +351,9 @@ int UDepot<IO>::crash_recovery() {
                 continue;
             }
 
-            KvSuffix suffix;
-            std::memcpy(&suffix,
-                        ep + sizeof(KvHeader) + hdr.key_size + val_bytes,
-                        sizeof(suffix));
-            if (suffix.crc16 != compute_crc16(hdr)) {
+            // A record of this segment's life: its checksum is bound to the
+            // segment's timestamp and the device seed.
+            if (!crc_matches(hdr, ep, ts)) {
                 skip(1);
                 continue;
             }
@@ -581,9 +590,19 @@ CoroTask<int> UDepot<IO>::tombstone_grains(uint64_t pba, uint64_t seg_ts,
     if (r != static_cast<ssize_t>(grain_size_)) co_return -EIO;
     KvHeader hdr;
     std::memcpy(&hdr, buf.data, sizeof(hdr));
-    if (hdr.key_size == 0 || !is_tombstone(hdr) || hdr.timestamp != seg_ts)
+    if (hdr.key_size == 0 || !is_tombstone(hdr)) co_return -EINVAL;
+    const uint64_t n = kv_total_grains(hdr.key_size, 0);
+    if (n > 1) {  // a long key: the checksum is past the first grain
+        const size_t bytes = static_cast<size_t>(n) * grain_size_;
+        buf = io_.alloc_buffer(bytes);
+        if (!buf.data) co_return -ENOMEM;
+        r = co_await io_.pread(buf.data, bytes, grain_to_offset(pba));
+        if (r < 0) co_return static_cast<int>(r);
+        if (r != static_cast<ssize_t>(bytes)) co_return -EIO;
+    }
+    if (!crc_matches(hdr, static_cast<const uint8_t*>(buf.data), seg_ts))
         co_return -EINVAL;
-    *grains = kv_total_grains(hdr.key_size, 0);
+    *grains = n;
     co_return 0;
 }
 
@@ -1191,7 +1210,8 @@ void UDepot<IO>::release_grains(uint64_t grain, uint64_t count, bool reloc) {
 
 template <typename IO>
 int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
-                          const uint8_t* rec, bool drop_tombstones) {
+                          const uint8_t* rec, uint64_t victim_ts,
+                          bool drop_tombstones) {
     KvHeader hdr;
     std::memcpy(&hdr, rec, sizeof(hdr));
     std::span<const uint8_t> key(rec + sizeof(KvHeader), hdr.key_size);
@@ -1217,7 +1237,7 @@ int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
             // otherwise come back after a crash.
             if (auto hook = gc_tombstone_drop_test_hook.load(
                     std::memory_order_relaxed))
-                hook(key, hdr.timestamp);
+                hook(key, victim_ts);
             table.remove_locked(hash, grain);
             invalidate_grains(grain, entry_grains, true);
             return 0;
@@ -1242,7 +1262,7 @@ int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
                                                        true);
             if (rc != 0) return rc;
             if (seg_timestamps_[scm_->grain_to_seg_idx(dst)].load(
-                    std::memory_order_acquire) > hdr.timestamp)
+                    std::memory_order_acquire) > victim_ts)
                 break;
             drop_dst();
             // A freshly staged segment is the newest; failing twice means
@@ -1264,12 +1284,12 @@ int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
             return ENOMEM;
         }
         std::memcpy(buf.data, rec, bytes);
-        KvHeader moved_hdr = hdr;
-        moved_hdr.timestamp = seg_timestamps_[scm_->grain_to_seg_idx(dst)].load(
-            std::memory_order_acquire);
-        std::memcpy(buf.data, &moved_hdr, sizeof(moved_hdr));
+        // The copy's checksum binds it to its new segment.
+        const uint64_t dst_ts =
+            seg_timestamps_[scm_->grain_to_seg_idx(dst)].load(
+                std::memory_order_acquire);
         KvSuffix suffix;
-        suffix.crc16 = compute_crc16(moved_hdr);
+        suffix.crc16 = compute_crc16(hdr, dst_ts);
         std::memcpy(static_cast<uint8_t*>(buf.data) + sizeof(KvHeader) +
                         hdr.key_size + record_val_bytes(hdr),
                     &suffix, sizeof(suffix));
@@ -1284,7 +1304,7 @@ int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
             hook(key);
         if (auto hook =
                 gc_relocation_order_test_hook.load(std::memory_order_relaxed))
-            hook(key, hdr.timestamp, moved_hdr.timestamp);
+            hook(key, victim_ts, dst_ts);
         bool moved = table.update_locked(hash, grain, entry.kv_size(), dst);
         assert(moved);  // the stripes have been held since entry_at
         (void)moved;
@@ -1328,23 +1348,14 @@ int UDepot<IO>::gc_callback(u64 grain_start, u64 grain_nr) {
         uint64_t entry_grains = kv_total_grains(hdr.key_size, val_bytes);
         // Grains not holding a record of this segment's life (never
         // written, or left over from its previous use) are skipped.
-        if (hdr.key_size == 0 || hdr.timestamp != victim_ts ||
-            entry_grains > HashEntry::kKvSizeMask ||
-            grain + entry_grains > end_grain) {
+        if (hdr.key_size == 0 || entry_grains > HashEntry::kKvSizeMask ||
+            grain + entry_grains > end_grain ||
+            !crc_matches(hdr, rec, victim_ts)) {
             ++grain;
             continue;
         }
 
-        KvSuffix suffix;
-        std::memcpy(&suffix,
-                    rec + sizeof(KvHeader) + hdr.key_size + val_bytes,
-                    sizeof(suffix));
-        if (suffix.crc16 != compute_crc16(hdr)) {
-            ++grain;
-            continue;
-        }
-
-        rc = gc_record(grain, entry_grains, rec, drop_tombstones);
+        rc = gc_record(grain, entry_grains, rec, victim_ts, drop_tombstones);
         grain += entry_grains;
     }
     if (rc != 0) return rc;
@@ -1400,6 +1411,22 @@ bool UDepot<IO>::newer_than(uint64_t new_pba, uint64_t old_pba) const {
         return seg_timestamps_[old_seg].load(std::memory_order_acquire) <
                seg_timestamps_[new_seg].load(std::memory_order_acquire);
     return old_pba < new_pba;
+}
+
+// The record's segment's timestamp, then its grain in the segment. A
+// segment takes a new timestamp every time it is allocated, so the pair
+// never repeats, unlike the pba itself, which comes back once the segment
+// is reused (PR #3 review, finding 13). The record is live (the directory
+// points at it), so its segment is not reused meanwhile.
+template <typename IO>
+uint64_t UDepot<IO>::version_of(uint64_t pba) const {
+    const uint64_t seg_size = get_seg_size();
+    const uint64_t ts =
+        seg_timestamps_[scm_->grain_to_seg_idx(pba)].load(
+            std::memory_order_acquire);
+    const int off_bits = std::bit_width(seg_size);
+    assert(ts < (uint64_t{1} << (64 - off_bits)) - 1);  // never kAnyVersion
+    return (ts << off_bits) | (pba % seg_size);
 }
 
 template <typename IO>
@@ -1465,7 +1492,7 @@ int UDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
             return -ENOENT;
     } else {
         if (mode == PutMode::kCreate) return -EEXIST;
-        if (if_version != kAnyVersion && match.pba() != if_version)
+        if (if_version != kAnyVersion && version_of(match.pba()) != if_version)
             return -ESTALE;
     }
 
@@ -1578,11 +1605,11 @@ CoroTask<int> UDepot<IO>::put_record(std::span<const uint8_t> key_in,
                                             &probe);
         if (arc != 0) co_return arc;
 
-        hdr.timestamp = seg_timestamps_[scm_->grain_to_seg_idx(grain)].load(
-            std::memory_order_acquire);
         std::memcpy(p, &hdr, sizeof(hdr));
         KvSuffix suffix;
-        suffix.crc16 = compute_crc16(hdr);
+        suffix.crc16 = compute_crc16(
+            hdr, seg_timestamps_[scm_->grain_to_seg_idx(grain)].load(
+                     std::memory_order_acquire));
         std::memcpy(p + sizeof(hdr) + key.size() + val_size,
                     &suffix, sizeof(suffix));
 
@@ -1742,17 +1769,14 @@ CoroTask<int> UDepot<IO>::get_record(std::span<const uint8_t> key,
 
 #ifndef NDEBUG
         // Debug-only CRC verification (matches uDepot's _UDEPOT_DATA_DEBUG_VERIFY).
-        {
-            KvSuffix suffix;
-            std::memcpy(&suffix, p + sizeof(hdr) + hdr.key_size + hdr.val_size,
-                        sizeof(suffix));
-            uint16_t expected = compute_crc16(hdr);
-            if (suffix.crc16 != expected) co_return -EIO;
-        }
+        if (!crc_matches(hdr, p,
+                         seg_timestamps_[scm_->grain_to_seg_idx(pba)].load(
+                             std::memory_order_acquire)))
+            co_return -EIO;
 #endif
 
         if (val_size_out) *val_size_out = hdr.val_size;
-        if (version_out) *version_out = pba;
+        if (version_out) *version_out = version_of(pba);
         if (zc) {
             // Zero copy: the caller gets the buffer the record was read into.
             zc->val_off_ = sizeof(hdr) + hdr.key_size;
@@ -1791,13 +1815,12 @@ CoroTask<int> UDepot<IO>::write_tombstone(
     KvHeader tomb_hdr;
     tomb_hdr.key_size = static_cast<uint16_t>(key.size());
     tomb_hdr.val_size = kTombstoneValSize;  // holds no value bytes
-    tomb_hdr.timestamp =
-        seg_timestamps_[scm_->grain_to_seg_idx(tomb_grain)].load(
-            std::memory_order_acquire);
     std::memcpy(tp, &tomb_hdr, sizeof(tomb_hdr));
     std::memcpy(tp + sizeof(tomb_hdr), key.data(), key.size());
     KvSuffix suffix;
-    suffix.crc16 = compute_crc16(tomb_hdr);
+    suffix.crc16 = compute_crc16(
+        tomb_hdr, seg_timestamps_[scm_->grain_to_seg_idx(tomb_grain)].load(
+                      std::memory_order_acquire));
     std::memcpy(tp + sizeof(tomb_hdr) + key.size(), &suffix, sizeof(suffix));
     size_t used = kv_total_bytes(key.size(), 0);
     if (tomb_total > used)
@@ -1829,7 +1852,7 @@ int UDepot<IO>::commit_del(uint64_t hash, const KeyProbe& probe,
     HashEntry match;
     if (!probe_settled(table, hash, probe, &match)) return kRetryProbe;
     if (match.empty() || match.deleted()) return -ENOENT;
-    if (if_version != kAnyVersion && match.pba() != if_version)
+    if (if_version != kAnyVersion && version_of(match.pba()) != if_version)
         return -ESTALE;
     *removed = match;
     if (tomb_pba == UINT64_MAX) return kNeedTomb;

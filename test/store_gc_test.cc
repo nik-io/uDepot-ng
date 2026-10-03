@@ -20,11 +20,14 @@
 #include <fstream>
 #include <random>
 #include <map>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
+
+#include "record_checksum.h"
 
 using udepot::AioIO;
 using udepot::PosixIO;
@@ -675,11 +678,12 @@ TEST_F(StoreGcTest, RelocationNeverMovesIntoAnOlderSegment) {
 }
 
 // Whether the store file holds, in a segment older than ts, a record of key
-// that crash recovery would replay: the segment's metadata still carries
-// that timestamp, and so does the record. Reads the file directly, so it
+// that crash recovery would replay: one whose checksum binds it to its
+// segment's timestamp and the device seed. Reads the file directly, so it
 // does not trust the store's own bookkeeping.
 static bool older_copy_on_disk(const std::filesystem::path& path,
-                               std::span<const uint8_t> key, uint64_t ts) {
+                               std::span<const uint8_t> key, uint64_t ts,
+                               uint64_t seed) {
     constexpr size_t kGrain = 512;
     constexpr size_t kSegGrains = 2048;  // gc_config's segment_size
     constexpr size_t kSegBytes = kGrain * kSegGrains;
@@ -698,9 +702,15 @@ static bool older_copy_on_disk(const std::filesystem::path& path,
             const char* rec = seg.data() + g * kGrain;
             udepot::KvHeader hdr;
             std::memcpy(&hdr, rec, sizeof(hdr));
-            if (hdr.timestamp == seg_ts && hdr.key_size == key.size() &&
-                !udepot::is_tombstone(hdr) &&
-                std::memcmp(rec + sizeof(hdr), key.data(), key.size()) == 0)
+            if (hdr.key_size != key.size() || udepot::is_tombstone(hdr) ||
+                std::memcmp(rec + sizeof(hdr), key.data(), key.size()) != 0)
+                continue;
+            const size_t crc_at = sizeof(hdr) + hdr.key_size + hdr.val_size;
+            if (g * kGrain + crc_at + 2 > kSegBytes - kGrain) continue;
+            uint16_t crc;
+            std::memcpy(&crc, rec + crc_at, sizeof(crc));
+            if (crc == record_checksum(reinterpret_cast<const uint8_t*>(rec),
+                                       seg_ts, seed))
                 return true;
         }
     }
@@ -717,13 +727,15 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
     static std::filesystem::path path;
     static std::atomic<int> drops{0};
     static std::atomic<int> unsafe{0};
+    static std::atomic<uint64_t> seed{0};
     path = path_;
     drops = 0;
     unsafe = 0;
     UDepot<PosixIO>::gc_tombstone_drop_test_hook =
         [](std::span<const uint8_t> key, uint64_t victim_ts) {
             drops.fetch_add(1);
-            if (older_copy_on_disk(path, key, victim_ts)) unsafe.fetch_add(1);
+            if (older_copy_on_disk(path, key, victim_ts, seed.load()))
+                unsafe.fetch_add(1);
         };
     struct ResetHook {
         ~ResetHook() {
@@ -732,6 +744,7 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
     } reset_hook;
 
     ASSERT_EQ(store_.open(config_), 0);
+    seed = store_.seed();
     std::mt19937 rng(1);
     const std::string val(2500, 'v');
     constexpr int kKeys = 6000;
@@ -759,6 +772,47 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
 // it cannot tell which is newer. The test widens the window; this workload
 // (puts and deletes under GC, so both streams stage segments) then gave
 // duplicates in every run.
+// Regression (PR #3 review, finding 13): a version was the record's pba,
+// which comes back once its segment is reused, so a conditional put or del
+// holding a version read earlier could act on a different value (ABA).
+// Overwrites one key until its records land on places they used before.
+TEST_F(StoreGcTest, VersionNeverRepeatsWhenItsPlaceIsReused) {
+    ASSERT_EQ(store_.open(config_), 0);
+    const std::string key = "versioned";
+    const uint64_t hash = store_.hash_key(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(key.data()), key.size()));
+    std::set<uint64_t> versions;
+    std::map<uint64_t, uint64_t> version_at;  // pba -> its latest version
+    int reused = 0;
+    uint64_t previous = udepot::kAnyVersion;
+    for (int round = 0; round < 40000 && reused < 50; ++round) {
+        ASSERT_EQ(store_.put(key, value_for(0, round, 3000)).run_sync(), 0);
+        uint8_t buf[4096];
+        size_t n = 0;
+        uint64_t version = 0;
+        ASSERT_EQ(store_.get(key, buf, sizeof(buf), &n, &version).run_sync(),
+                  0);
+        uint32_t idx = store_.rcu().read_lock();
+        const uint64_t pba = store_.directory().lookup(hash).pba();
+        store_.rcu().read_unlock(idx);
+
+        EXPECT_TRUE(versions.insert(version).second)
+            << "version " << version << " repeated at round " << round;
+        auto [it, fresh] = version_at.emplace(pba, version);
+        if (!fresh) {
+            ++reused;
+            it->second = version;
+        }
+        // The version read before this round's put no longer applies.
+        if (previous != udepot::kAnyVersion) {
+            EXPECT_EQ(store_.put(key, "stale", udepot::PutMode::kUpsert,
+                                 previous).run_sync(), -ESTALE);
+        }
+        previous = version;
+    }
+    ASSERT_GT(reused, 0) << "no record landed on a reused place; churn more";
+}
+
 TEST_F(StoreGcTest, SegmentTimestampsAreUnique) {
     static std::mutex mu;
     static std::vector<uint64_t> stamps;

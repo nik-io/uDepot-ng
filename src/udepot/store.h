@@ -33,20 +33,21 @@
 
 namespace udepot {
 
-// On-disk KV entry layout (unchanged from uDepot):
-//   [u16 key_size][u32 val_size][u64 timestamp][key][value][u16 crc16]
-// Total: 16 + key_size + val_size bytes.
+// On-disk KV entry layout, as uDepot's (paper, section 4.4):
+//   [u16 key_size][u32 val_size][key][value][u16 crc16]
+// Total: 8 + key_size + val_size bytes. A record carries no timestamp of
+// its own: its order is its segment's, and the checksum binds it to that
+// segment's timestamp (compute_crc16).
 struct __attribute__((packed)) KvHeader {
     uint16_t key_size;
     uint32_t val_size;
-    uint64_t timestamp;
 };
 
 struct __attribute__((packed)) KvSuffix {
     uint16_t crc16;
 };
 
-static_assert(sizeof(KvHeader) == 14);
+static_assert(sizeof(KvHeader) == 6);
 static_assert(sizeof(KvSuffix) == 2);
 
 inline constexpr size_t kKvOverhead = sizeof(KvHeader) + sizeof(KvSuffix);
@@ -96,8 +97,11 @@ enum class PutMode {
 };
 
 // A version identifies one stored value of a key; every successful put
-// yields a new one. get() reports it, and put()/del() accept it to act only
-// if the key still holds that value (-ESTALE otherwise).
+// yields a new one, and none ever repeats. get() reports it, and put()/del()
+// accept it to act only if the key still holds that value (-ESTALE
+// otherwise). GC moving a value also changes its version: a conditional
+// put/del after that fails with -ESTALE though the value is the same, a
+// failure the caller handles by reading again, as for a real change.
 inline constexpr uint64_t kAnyVersion = UINT64_MAX;
 
 // Zero-copy values (uDepot's Mbuff interface). A PutBuffer, from
@@ -298,6 +302,8 @@ public:
     Rcu& rcu() { return rcu_; }
     IO& io() { return io_; }
     uint32_t grain_size() const { return grain_size_; }
+    // Grains per segment, its metadata included. For tests.
+    uint64_t segment_grains() const { return get_seg_size(); }
     // The device seed: binds segment metadata and records to this store.
     uint64_t seed() const noexcept { return seed_; }
 
@@ -367,7 +373,12 @@ private:
     // candidate, only when all of its grains are released.
     void release_grains(uint64_t grain, uint64_t count, bool reloc = false);
 
-    uint16_t compute_crc16(const KvHeader& hdr) const;
+    // seg_ts: the timestamp of the segment the record is in.
+    uint16_t compute_crc16(const KvHeader& hdr, uint64_t seg_ts) const;
+    // Whether rec, a record of hdr's sizes, carries the checksum of a record
+    // written into a segment of timestamp seg_ts.
+    bool crc_matches(const KvHeader& hdr, const uint8_t* rec,
+                     uint64_t seg_ts) const;
     static uint32_t compute_crc32(uint32_t seed, const uint8_t* data,
                                   size_t len);
 
@@ -546,6 +557,8 @@ private:
     // Whether data at new_pba is newer than data at old_pba in the order
     // crash recovery uses (segment timestamp, then grain).
     bool newer_than(uint64_t new_pba, uint64_t old_pba) const;
+    // The version of the record at pba (see kAnyVersion).
+    uint64_t version_of(uint64_t pba) const;
 
     // Allocate, waiting for space if needed (see SpaceWait). While
     // waiting, `guard` is released and `probe` is cleared: an unprotected
@@ -562,7 +575,7 @@ private:
     // GC: move one record still referenced by the directory to a new
     // location, or drop it if it is a tombstone that can no longer matter.
     int gc_record(uint64_t grain, uint64_t entry_grains, const uint8_t* rec,
-                  bool drop_tombstones);
+                  uint64_t victim_ts, bool drop_tombstones);
 };
 
 }  // namespace udepot

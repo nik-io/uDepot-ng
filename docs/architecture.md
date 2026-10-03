@@ -519,19 +519,19 @@ The intent is uDepot's format (segment layout, directory table layout, salsa
 metadata; see `docs/udepot-paper.md`, §4.4), so a uDepot-ng store and a uDepot
 store can read each other. **Known divergences:**
 
-- The KV record header carries an 8-byte timestamp (`KvHeader`). uDepot's
-  header is 6 bytes (key size, value size); it orders a record by its
-  segment's timestamp, which the record's checksum is bound to.
 - Index segment headers and footers extend uDepot's `dirmap_hdr` /
   `dirmap_ftr` (below) with the table's size and its part number. uDepot
   sized every table to fill its segment, so it needed neither.
 
 ### Record identity
 
-As uDepot's `checksum16(timestamp, md)`, a record's 2-byte checksum is a
-CRC32 seeded with its segment's timestamp, over the header, then over the
-device seed, truncated to 16 bits. Recovery and GC accept a record only if
-its header carries its segment's timestamp and the checksum matches. A store
+A record is uDepot's: a 6-byte header (key size, value size), the key, the
+value and a 2-byte checksum. It carries no timestamp of its own; its order
+is its segment's. As uDepot's `checksum16(timestamp, md)`, the checksum is a
+CRC32 seeded with the segment's timestamp, over the header, then over the
+device seed, truncated to 16 bits, and recovery and GC accept a record only
+if it matches. (uDepot-ng's header once added an 8-byte copy of the segment
+timestamp; it is gone, so the format is uDepot's again.) A store
 created over an earlier one (`force_destroy`) restarts its timestamps from
 the same values on the same segments; without the seed in the checksum, a
 crash brought back the earlier store's records left past what the new one
@@ -539,6 +539,13 @@ had written. Each new store therefore needs its own seed: uDepot took the
 monotonic clock's seconds, which repeat for two stores created within a
 second or across reboots, so uDepot-ng draws it from `std::random_device`
 mixed with the real-time clock.
+
+A record's version (what `get` reports and conditional `put`/`del` take) is
+its segment's timestamp and its grain within the segment, not its address:
+an address comes back once the segment is reused, so a stale conditional
+write could have acted on a different value (ABA). GC moving a record gives
+it a new version, so a conditional write after that fails with `-ESTALE`
+though the value is unchanged; that is safe, and costs no bytes on disk.
 
 Each segment's timestamp is the allocation count salsa gave that segment,
 passed to the metadata callback, so two streams staging segments at once
@@ -588,8 +595,23 @@ decides, as the paper says: *"the persistent source of truth is the log"*.
   anything is written, restored or not, as uDepot's `invalidate_ftr()`:
   otherwise a crash later in the session could restore an index older than
   the log.
-- Not yet: the paper also flushes periodically, to shorten recovery after a
-  crash.
+- **No periodic flush, deliberately.** The paper also flushes *"periodically
+  to speed recovery"*. uDepot gets that only from the kernel writing back
+  its mmap'd tables, and its footers are valid only after a clean shutdown,
+  so after a crash it scans the log whatever was written back. A periodic
+  flush shortens recovery only with a recovery path that restores the last
+  flushed index and then replays the log written since (dropping entries
+  that point into segments reused after the flush), which neither has. That
+  path is a design of its own, deferred until there is a need for it.
+- **Not yet: index space charged up front.** uDepot keeps its tables on
+  index segments for the whole session, so their space is taken as the
+  directory grows, and a full store can still keep its index. uDepot-ng
+  allocates the segments at `close()`, so a store full of live data falls
+  back to the log scan on its next open. Holding a segment per table only
+  costs the index's size when a table fills its segment, as uDepot sizes
+  them; uDepot-ng sizes tables by `index_bits` instead, so a small table
+  would hold a whole segment. This waits for the resize work, which
+  revisits table geometry.
 
 ## Implementation Order
 

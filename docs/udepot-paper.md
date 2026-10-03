@@ -106,9 +106,8 @@ Quotes below are from the paper; section numbers are the paper's.
     size (2B) in bytes, and value size (4B) in bytes, and appends (to avoid the
     torn page problem) a 2B checksum matching the segment metadata (not computed
     over the data)."* The record carries no timestamp of its own: its order comes
-    from its segment's timestamp, which the checksum binds it to. **uDepot-ng's
-    record header adds an 8-byte timestamp. That is an on-disk divergence**,
-    still open.
+    from its segment's timestamp, which the checksum binds it to. uDepot-ng's
+    record is the same (it once added an 8-byte timestamp; removed).
 - **The index is flushed, but the log is the source of truth.** *"in-memory
   index tables are flushed to persistent storage, but they are not guaranteed
   to be up-to-date: the persistent source of truth is the log. Flushing to
@@ -128,7 +127,7 @@ Quotes below are from the paper; section numbers are the paper's.
   and footers invalidated right after a successful restore. uDepot-ng flushes
   with explicit writes at `close()` instead of mmap (SPDK has no mmap), in
   legacy's layout. Status: implemented (`docs/architecture.md`, "Index
-  segments"), except the periodic flush.
+  segments"), except the periodic flush, deferred: see there for why.
 
 ## KV operations (§4.5)
 
