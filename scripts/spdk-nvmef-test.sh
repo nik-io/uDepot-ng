@@ -74,6 +74,8 @@ while IFS= read -r name; do
     TESTS+=("$t")
 done < "$TEST_LIST"
 [ ${#TESTS[@]} -gt 0 ] || fail "$TEST_LIST lists no tests"
+BENCH="$HERE/$BUILD_DIR/udepot_ng_bench"
+[ -x "$BENCH" ] || fail "$BENCH not found -- build the spdk_tests target"
 [ -x "$TGT_BIN" ]    || fail "$TGT_BIN not found -- build SPDK first"
 
 # ── hugepages ────────────────────────────────────────────────────────────────
@@ -145,10 +147,24 @@ for t in "${TESTS[@]}"; do
     [ $rc -eq 0 ] || fail "$(basename "$t") failed (rc=$rc)"
 done
 
+# ── zero-copy gate over SPDK ────────────────────────────────────────────────
+# scripts/perf-zerocopy.sh: a zero-copy run hands the device the store's
+# own DMA buffers, so no I/O of it bounces through a copy (exact). Copy vs
+# zero-copy throughput is reported, not gated: it is I/O bound here (see
+# that script). 5000 ops of 32 KiB fit the 513 MiB namespace with room for
+# GC; each run starts a fresh store.
+log "zero-copy gate over SPDK"
+env "${INIT_ENV[@]}" UDEPOT_NVMEF="$TADDR:$TPORT:$NQN" \
+    LD_LIBRARY_PATH="$DPDK_LIB" timeout "${PERF_TIMEOUT:-900}" \
+    "${PIN[@]}" "$HERE/scripts/perf-zerocopy.sh" spdk "$HERE/$BUILD_DIR" \
+    "${SPDK_PERF_OPS:-5000}" "${SPDK_PERF_ITERS:-9}"
+rc=$?
+[ $rc -eq 0 ] || fail "SPDK zero-copy gate failed (rc=$rc)"
+
 # Keep-alive timeouts on the target mean the initiator stopped polling the
 # admin queue: the fabrics connection was dropped. A correct run has none.
 if grep -q "keep alive timeout" "$TGT_LOG"; then
     fail "target reported a keep-alive timeout (initiator stopped polling)"
 fi
 
-log "OK: SPDK backend PUT/GET/shutdown succeeded over the soft NVMe-oF target"
+log "OK: SPDK backend tests and zero-copy gate passed over the soft NVMe-oF target"

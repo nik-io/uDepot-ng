@@ -7,6 +7,9 @@
 #ifdef UDEPOT_BUILD_URING
 #include "udepot/io/uring.h"
 #endif
+#ifdef UDEPOT_BUILD_SPDK
+#include "udepot/io/spdk.h"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -17,6 +20,7 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using udepot::AioIO;
@@ -189,6 +193,9 @@ static int run_bench(const BenchConfig& cfg) {
     sc.grain_size = cfg.grain_size;
     sc.initial_tables = 4;
     sc.index_bits = 14;
+    // Every run starts empty: a file is removed between runs, but an SPDK
+    // namespace keeps the previous run's store.
+    sc.force_destroy = true;
 
     UDepot<IO> store;
     int rc = store.open(sc);
@@ -211,6 +218,13 @@ static int run_bench(const BenchConfig& cfg) {
                r.exists_secs, cfg.ops / (r.exists_secs * 1e6));
         printf("DELs Aggregate time=%lfs Mops/sec=%lf\n",
                r.del_secs, cfg.ops / (r.del_secs * 1e6));
+#ifdef UDEPOT_BUILD_SPDK
+        // I/Os SPDK copied through a bounce buffer because their buffer was
+        // not DMA memory: zero copy hands the device the store's own.
+        if constexpr (std::is_same_v<IO, udepot::SpdkIO>)
+            printf("BOUNCED %lu\n", static_cast<unsigned long>(
+                                        udepot::SpdkIO::thread_bounce_count()));
+#endif
     } else {
         std::vector<ThreadResult> results(cfg.threads);
         std::vector<std::thread> threads;
@@ -258,7 +272,8 @@ static void usage() {
         "  --val-size <bytes>   Value size (default: 1024)\n"
         "  --seed <n>     RNG seed (default: 42)\n"
         "  --threads <n>  Number of concurrent threads (default: 1)\n"
-        "  --backend <b>  posix, aio or uring (default: posix)\n"
+        "  --backend <b>  posix, aio, uring or spdk (default: posix); spdk\n"
+        "                 uses the namespace UDEPOT_NVMEF names, whole\n"
         "  --zero-copy    Use the zero-copy put/get interface\n");
 }
 
@@ -304,6 +319,19 @@ int main(int argc, char* argv[]) {
 #ifdef UDEPOT_BUILD_URING
     } else if (cfg.backend == "uring") {
         rc = run_bench<udepot::UringIO>(cfg);
+#endif
+#ifdef UDEPOT_BUILD_SPDK
+    } else if (cfg.backend == "spdk") {
+        if (udepot::SpdkIO::global_init() != 0) {
+            fprintf(stderr, "SpdkIO::global_init failed\n");
+            return 1;
+        }
+        BenchConfig spdk_cfg = cfg;
+        spdk_cfg.file = "SPDK";
+        spdk_cfg.store_size = 0;  // the whole namespace
+        rc = run_bench<udepot::SpdkIO>(spdk_cfg);
+        udepot::SpdkIO::global_shutdown();
+        return rc;
 #endif
     } else {
         fprintf(stderr, "Unknown backend: %s\n", cfg.backend.c_str());

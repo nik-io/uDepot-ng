@@ -291,6 +291,11 @@ if(UDEPOT_BUILD_TESTS)
     # Perf benchmark binary (not a gtest — standalone executable).
     add_executable(udepot_ng_bench test/perf/udepot_ng_bench.cc)
     target_link_libraries(udepot_ng_bench PRIVATE udepot)
+    if(UDEPOT_BUILD_SPDK)
+        # scripts/spdk-nvmef-test.sh runs the zero-copy gate over SPDK with
+        # it, so the SPDK job builds it with the tests.
+        add_dependencies(spdk_tests udepot_ng_bench)
+    endif()
 
     # Zero-copy invariant (scripts/perf-zerocopy.sh), as uDepot's
     # `make run_perf_test`: on every backend, zero-copy put/get must not be

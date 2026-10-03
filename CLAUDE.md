@@ -148,7 +148,19 @@ As in uDepot: `scripts/perf-zerocopy.sh <posix|aio|uring>` (or
 on a `/dev/shm` store. It fails if zero copy's median is more than 5%
 slower than copy's on PUT or GET. The two runs differ only in the value
 copies zero copy avoids. It compares one operation done two ways, inside
-one run, so there is no stored baseline to drift.
+one run, so there is no stored baseline to drift. Which of a pair runs
+first alternates: on SPDK the second run of every pair was consistently
+slower, which read as a 22-37% zero-copy loss until the order was swapped.
+
+**SPDK** has its own gate, run by `scripts/spdk-nvmef-test.sh` (CI's SPDK
+job) against the NVMe-oF target: `perf-zerocopy.sh spdk`. It is exact rather
+than timed: zero copy over SPDK means the device transfers straight to and
+from the store's DMA buffers, so a zero-copy run must bounce no I/O through
+a copy (SPDK counts them; a mutation handing out non-DMA buffers failed it
+with 75126 bounces). The throughput comparison is printed but not gated
+there: the ops are I/O bound over loopback TCP, and on unchanged code the
+GET delta ranged from -20% to +52% across runs, far wider than the ~5% a
+32 KiB copy costs.
 
 Values are 32 KiB: at 1 KiB a copy is ~2% of a put, and a zero-copy path
 that copied twice still passed. Even at 32 KiB, one stray extra copy is
