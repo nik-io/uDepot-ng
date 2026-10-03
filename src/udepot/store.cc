@@ -1047,6 +1047,9 @@ void UDepot<IO>::close() {
         index_ctlr_->shutdown();
         index_ctlr_.reset();
         salsa::SalsaCtlr::shutdown();
+        // Shutting the controllers down can free (so defer) segments too;
+        // their callbacks return them to scm_, so they must have run.
+        rcu_.barrier();
         delete scm_;
         scm_ = nullptr;
     }
