@@ -155,7 +155,7 @@ log "zero-copy gate over SPDK"
 env "${INIT_ENV[@]}" UDEPOT_NVMEF="$TADDR:$TPORT:$NQN" \
     LD_LIBRARY_PATH="$DPDK_LIB" timeout "${PERF_TIMEOUT:-900}" \
     "${PIN[@]}" "$HERE/scripts/perf-zerocopy.sh" spdk "$HERE/$BUILD_DIR" \
-    0 "${SPDK_PERF_ITERS:-5}"
+    "" "${SPDK_PERF_ITERS:-5}"
 rc=$?
 [ $rc -eq 0 ] || fail "SPDK zero-copy gate failed (rc=$rc)"
 

@@ -143,31 +143,30 @@ ctest --test-dir build
 ### Zero-copy perf invariant
 
 As in uDepot: `scripts/perf-zerocopy.sh <posix|aio|uring>` (or
-`cmake --build build --target run_perf_test` for all of them) runs
-`udepot_ng_bench` with the copying and the zero-copy put/get, interleaved,
-on a `/dev/shm` store. It fails if zero copy's median is more than 5%
-slower than copy's on PUT or GET. The two runs differ only in the value
-copies zero copy avoids. It compares one operation done two ways, inside
-one run, so there is no stored baseline to drift. Which of a pair runs
-first alternates: on SPDK the second run of every pair was consistently
-slower, which read as a 22-37% zero-copy loss until the order was swapped.
+`cmake --build build --target run_perf_test` for all of them) compares the
+copying and the zero-copy put/get on a `/dev/shm` store, and fails if zero
+copy is more than 5% slower than copy on PUT or GET. It compares one
+operation done two ways, so there is no stored baseline to drift.
 
-**SPDK** is gated too, by `scripts/spdk-nvmef-test.sh` (CI's SPDK job)
-against the NVMe-oF target: `perf-zerocopy.sh spdk`. Two checks:
+The comparison is paired, inside one process: `udepot_ng_bench --compare`
+runs rounds of a copy batch and a zero-copy batch back to back on one store
+(which goes first alternates), and reports the median of the rounds'
+zero-copy/copy ratios; the gate is the median of 5 such runs. The two
+batches of a round share whatever drifts (the runner, GC, a network
+target), so the ratio isolates the copies zero copy avoids. It used to
+compare separate runs of each, by median: absolute throughput differs by up
+to ~1.7x between processes, and that read as AIO's zero-copy GET 13.7%
+slower in CI, and on SPDK as anything from 37% slower to 52% faster, on
+code where every paired comparison has zero copy ahead. Never set
+throughputs from different runs against each other.
 
-- Zero copy must not be slower than copy, as on the other backends, but
-  measured inside one process: `udepot_ng_bench --compare` runs rounds of a
-  copy batch and a zero-copy batch back to back (order alternating) on one
-  store, and each run reports the median of its rounds' zero-copy/copy
-  ratios; the gate takes the median over runs. Separate processes cannot be
-  compared over a network target: each is a new connection, absolute
-  throughput differed up to ~1.7x between them, and comparing them showed
-  zero copy anywhere from 37% slower to 52% faster on unchanged code.
-  Paired, zero copy was faster in all 25 runs measured (PUT +0.5 to +7%,
-  GET +1 to +11%).
-- A zero-copy run must bounce no I/O through a DMA copy (SPDK counts them):
-  the device transfers straight to and from the store's buffers. A mutation
-  handing out non-DMA buffers failed it with 75126 bounces.
+**SPDK** is gated the same way by `scripts/spdk-nvmef-test.sh` (CI's SPDK
+job), against the NVMe-oF target (`perf-zerocopy.sh spdk`), plus an exact
+check: a zero-copy run must bounce no I/O through a DMA copy (SPDK counts
+them), since the device should transfer straight to and from the store's
+buffers. A mutation handing out non-DMA buffers failed it with 75126
+bounces. Paired, zero copy was faster in all 25 SPDK runs measured (PUT
++0.5 to +7%, GET +1 to +11%).
 
 ### Performance regression gate
 
