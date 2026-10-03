@@ -18,10 +18,18 @@
 # (UDEPOT_SPDK_NO_HUGE=1), e.g. in containers without hugetlbfs. CI runs it
 # under sudo.
 #
-# Usage: scripts/spdk-nvmef-test.sh [build_dir]
+# Usage: scripts/spdk-nvmef-test.sh [build_dir] [tests|perf|all]
+#   tests  the SPDK tests spdk_tests.txt lists (CI: Debug, asserts on)
+#   perf   the SPDK zero-copy perf invariant, scripts/perf-zerocopy.sh spdk
+#          (CI: its own job, on a Release build, as the other backends')
+#   all    both (default)
 set -uo pipefail
 
 BUILD_DIR="${1:-build}"
+MODE="${2:-all}"
+case "$MODE" in tests|perf|all) ;; *)
+    echo "usage: spdk-nvmef-test.sh [build_dir] [tests|perf|all]" >&2; exit 2 ;;
+esac
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SPDK_DIR="${SPDK_DIR:-$HERE/extern/spdk}"
 RPC="$SPDK_DIR/scripts/rpc.py"
@@ -65,17 +73,21 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-[ -f "$TEST_LIST" ] || fail "$TEST_LIST not found -- configure with -DUDEPOT_BUILD_SPDK=ON"
 TESTS=()
-while IFS= read -r name; do
-    [ -n "$name" ] || continue
-    t="$HERE/$BUILD_DIR/$name"
-    [ -x "$t" ] || fail "$t not found -- build the spdk_tests target"
-    TESTS+=("$t")
-done < "$TEST_LIST"
-[ ${#TESTS[@]} -gt 0 ] || fail "$TEST_LIST lists no tests"
-BENCH="$HERE/$BUILD_DIR/udepot_ng_bench"
-[ -x "$BENCH" ] || fail "$BENCH not found -- build the spdk_tests target"
+if [ "$MODE" != "perf" ]; then
+    [ -f "$TEST_LIST" ] || fail "$TEST_LIST not found -- configure with -DUDEPOT_BUILD_SPDK=ON"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        t="$HERE/$BUILD_DIR/$name"
+        [ -x "$t" ] || fail "$t not found -- build the spdk_tests target"
+        TESTS+=("$t")
+    done < "$TEST_LIST"
+    [ ${#TESTS[@]} -gt 0 ] || fail "$TEST_LIST lists no tests"
+fi
+if [ "$MODE" != "tests" ]; then
+    BENCH="$HERE/$BUILD_DIR/udepot_ng_bench"
+    [ -x "$BENCH" ] || fail "$BENCH not found -- build udepot_ng_bench"
+fi
 [ -x "$TGT_BIN" ]    || fail "$TGT_BIN not found -- build SPDK first"
 
 # ── hugepages ────────────────────────────────────────────────────────────────
@@ -147,17 +159,20 @@ for t in "${TESTS[@]}"; do
     [ $rc -eq 0 ] || fail "$(basename "$t") failed (rc=$rc)"
 done
 
-# ── zero-copy gate over SPDK ────────────────────────────────────────────────
-# scripts/perf-zerocopy.sh spdk: zero copy must not be slower than copy on
-# PUT or GET (compared batch by batch inside each run, against the target),
-# and must bounce no I/O through a DMA copy. Each run starts a fresh store.
-log "zero-copy gate over SPDK"
-env "${INIT_ENV[@]}" UDEPOT_NVMEF="$TADDR:$TPORT:$NQN" \
-    LD_LIBRARY_PATH="$DPDK_LIB" timeout "${PERF_TIMEOUT:-900}" \
-    "${PIN[@]}" "$HERE/scripts/perf-zerocopy.sh" spdk "$HERE/$BUILD_DIR" \
-    "" "${SPDK_PERF_ITERS:-5}"
-rc=$?
-[ $rc -eq 0 ] || fail "SPDK zero-copy gate failed (rc=$rc)"
+# ── zero-copy perf invariant over SPDK ──────────────────────────────────────
+# scripts/perf-zerocopy.sh spdk: zero copy must be strictly faster than copy
+# on PUT and GET (compared batch by batch inside each run, against the
+# target), and must bounce no I/O through a DMA copy. Each run starts a
+# fresh store.
+if [ "$MODE" != "tests" ]; then
+    log "zero-copy perf invariant over SPDK"
+    env "${INIT_ENV[@]}" UDEPOT_NVMEF="$TADDR:$TPORT:$NQN" \
+        LD_LIBRARY_PATH="$DPDK_LIB" timeout "${PERF_TIMEOUT:-900}" \
+        "${PIN[@]}" "$HERE/scripts/perf-zerocopy.sh" spdk "$HERE/$BUILD_DIR" \
+        "" "${SPDK_PERF_ITERS:-5}"
+    rc=$?
+    [ $rc -eq 0 ] || fail "SPDK zero-copy perf invariant failed (rc=$rc)"
+fi
 
 # Keep-alive timeouts on the target mean the initiator stopped polling the
 # admin queue: the fabrics connection was dropped. A correct run has none.
@@ -165,4 +180,8 @@ if grep -q "keep alive timeout" "$TGT_LOG"; then
     fail "target reported a keep-alive timeout (initiator stopped polling)"
 fi
 
-log "OK: SPDK backend tests and zero-copy gate passed over the soft NVMe-oF target"
+case "$MODE" in
+    tests) log "OK: SPDK backend tests passed over the soft NVMe-oF target" ;;
+    perf)  log "OK: SPDK zero-copy perf invariant passed over the soft NVMe-oF target" ;;
+    all)   log "OK: SPDK backend tests and zero-copy perf invariant passed over the soft NVMe-oF target" ;;
+esac

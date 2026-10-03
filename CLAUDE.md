@@ -135,10 +135,13 @@ ctest --test-dir build
 - **ThreadSanitizer**, the same tests minus the bindings, failing on any
   report. Debug with `-O1`, so asserts stay on. It has the same "every test
   built" check (`scripts/ci-check-tests-built.sh`).
-- **SPDK backend**, `scripts/spdk-nvmef-test.sh` against a loopback NVMe-oF
-  software target, as uDepot's CI does. SPDK is built with
-  `--target-arch=x86-64-v2` and its tree cached per submodule revision.
-- **zero-copy perf invariant**, below.
+- **SPDK backend**, `scripts/spdk-nvmef-test.sh build tests` against a
+  loopback NVMe-oF software target, as uDepot's CI does, on a Debug build.
+  SPDK is built with `--target-arch=x86-64-v2` and its tree cached per
+  submodule revision.
+- **zero-copy perf invariant**, below: one check for posix, AIO and
+  io_uring, and **zero-copy perf invariant (SPDK)**, a second entry of the
+  SPDK job (`spdk-nvmef-test.sh build perf`) on a Release build.
 
 ### Zero-copy perf invariant
 
@@ -171,8 +174,11 @@ slower in CI, and on SPDK as anything from 37% slower to 52% faster, on
 code where every paired comparison has zero copy ahead. Never set
 throughputs from different runs against each other.
 
-**SPDK** is gated the same way by `scripts/spdk-nvmef-test.sh` (CI's SPDK
-job), against the NVMe-oF target (`perf-zerocopy.sh spdk`), plus an exact
+**SPDK** is gated the same way, as its own CI check, "zero-copy perf
+invariant (SPDK)": `scripts/spdk-nvmef-test.sh <build> perf` starts the
+NVMe-oF target and runs `perf-zerocopy.sh spdk` against it, on a Release
+build like the other backends. (It used to run inside the SPDK backend
+test job, on its Debug build, where its result was easy to miss.) Plus an exact
 check: a zero-copy run must bounce no I/O through a DMA copy (SPDK counts
 them), since the device should transfer straight to and from the store's
 buffers. A mutation handing out non-DMA buffers failed it with 75126
