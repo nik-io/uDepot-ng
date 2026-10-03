@@ -29,6 +29,7 @@ TGT_BIN="$SPDK_DIR/build/bin/nvmf_tgt"
 DPDK_LIB="$SPDK_DIR/dpdk/build/lib"
 STORE_TEST="$HERE/$BUILD_DIR/spdk_store_test"
 IO_TEST="$HERE/$BUILD_DIR/spdk_test"
+QD_TEST="$HERE/$BUILD_DIR/spdk_queue_depth_test"
 
 NQN="nqn.2016-06.io.spdk:cnode1"
 TADDR="127.0.0.1"
@@ -67,6 +68,7 @@ trap cleanup EXIT INT TERM
 
 [ -x "$STORE_TEST" ] || fail "$STORE_TEST not found -- build with -DUDEPOT_BUILD_SPDK=ON"
 [ -x "$IO_TEST" ]    || fail "$IO_TEST not found -- build with -DUDEPOT_BUILD_SPDK=ON"
+[ -x "$QD_TEST" ]    || fail "$QD_TEST not found -- build with -DUDEPOT_BUILD_SPDK=ON"
 [ -x "$TGT_BIN" ]    || fail "$TGT_BIN not found -- build SPDK first"
 
 # ── hugepages ────────────────────────────────────────────────────────────────
@@ -126,7 +128,7 @@ PIN=()
 if [ "$NCPU" -ge 3 ]; then
     PIN=(taskset -c "1-$((NCPU-1))")
 fi
-for t in "$IO_TEST" "$STORE_TEST"; do
+for t in "$IO_TEST" "$STORE_TEST" "$QD_TEST"; do
     log "running $(basename "$t") on ${NCPU} cpus"
     # Bounded: a run normally takes well under a minute. A per-I/O stall
     # (the initiator's EAL once pinned it onto the target's core, costing

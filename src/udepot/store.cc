@@ -802,6 +802,8 @@ template <typename IO>
 int UDepot<IO>::open(const StoreConfig& config) {
     grain_size_ = config.grain_size;
 
+    if constexpr (requires { io_.set_queue_depth(config.queue_depth); })
+        io_.set_queue_depth(config.queue_depth);
     int rc = io_.open(config.path, config.size);
     if (rc != 0) return rc;
 
@@ -1492,6 +1494,15 @@ PutBuffer UDepot<IO>::alloc_put_buffer(size_t key_size, size_t val_size) {
     return pb;
 }
 
+template <typename IO>
+GetBuffer UDepot<IO>::alloc_get_buffer(size_t key_size, size_t val_size) {
+    GetBuffer gb;
+    if (check_sizes(key_size, val_size) != 0) return gb;
+    gb.buf_ = io_.alloc_buffer(kv_total_grains(key_size, val_size) *
+                               grain_size_);
+    return gb;
+}
+
 // Not coroutines: both hand over to put_record(), so the copying put
 // costs one coroutine frame, like the zero-copy one.
 template <typename IO>
@@ -1653,7 +1664,10 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
 template <typename IO>
 CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
                               GetBuffer* val_out, uint64_t* version_out) {
-    if (val_out) *val_out = GetBuffer{};
+    if (val_out) {
+        val_out->val_off_ = 0;
+        val_out->val_size_ = 0;
+    }
     return get_record(key, val_out, nullptr, 0, nullptr, version_out);
 }
 
@@ -1679,17 +1693,24 @@ CoroTask<int> UDepot<IO>::get_record(std::span<const uint8_t> key,
         uint16_t kv_grains = entry.kv_size();
 
         size_t read_bytes = static_cast<size_t>(kv_grains) * grain_size_;
-        IoBuffer buf = io_.alloc_buffer(read_bytes);
-        if (!buf.data) co_return -ENOMEM;
+        // Zero copy reads into the caller's buffer when it is big enough.
+        IoBuffer buf;
+        IoBuffer* into = &buf;
+        if (zc && zc->buf_.capacity >= read_bytes) {
+            into = &zc->buf_;
+        } else {
+            buf = io_.alloc_buffer(read_bytes);
+            if (!buf.data) co_return -ENOMEM;
+        }
 
         if (auto hook = get_read_test_hook.load(std::memory_order_relaxed))
             hook(key);
-        ssize_t nread = co_await io_.pread(buf.data, read_bytes,
+        ssize_t nread = co_await io_.pread(into->data, read_bytes,
                                            grain_to_offset(pba));
         if (nread < static_cast<ssize_t>(sizeof(KvHeader)))
             continue;
 
-        auto* p = static_cast<const uint8_t*>(buf.data);
+        auto* p = static_cast<const uint8_t*>(into->data);
         KvHeader hdr;
         std::memcpy(&hdr, p, sizeof(hdr));
 
@@ -1718,7 +1739,7 @@ CoroTask<int> UDepot<IO>::get_record(std::span<const uint8_t> key,
             // Zero copy: the caller gets the buffer the record was read into.
             zc->val_off_ = sizeof(hdr) + hdr.key_size;
             zc->val_size_ = hdr.val_size;
-            zc->buf_ = std::move(buf);
+            if (into == &buf) zc->buf_ = std::move(buf);
         } else if (val_out && val_buf_size > 0) {
             size_t to_copy = std::min(val_buf_size,
                                       static_cast<size_t>(hdr.val_size));

@@ -90,10 +90,20 @@ private:
     int probe_nvmef_target(const NvmefTarget& target);
 };
 
+struct SpdkRequest;
+
 struct SpdkQpair {
     SpdkNamespace* ns = nullptr;
     struct spdk_nvme_qpair* qpair = nullptr;
-    size_t npending = 0;
+    size_t npending = 0;  // submitted to the device, not yet completed
+    // I/Os that found every request of the queue pair taken, in submission
+    // order, linked through the requests themselves (they live in the
+    // suspended coroutines' frames, so waiting allocates nothing).
+    // execute_completions submits them as completions free requests.
+    // (uDepot failed such an I/O.)
+    SpdkRequest* wait_head = nullptr;
+    SpdkRequest* wait_tail = nullptr;
+    uint64_t waited = 0;  // ever waited; for tests
     // Coroutines whose I/O completed, resumed by the owning thread's poll
     // after spdk_nvme_qpair_process_completions returns (not from inside
     // it, which is not re-entrant).
@@ -104,7 +114,10 @@ struct SpdkQpair {
     uint64_t bounced = 0;
 
     SpdkQpair() = default;
-    SpdkQpair(SpdkNamespace* namespace_ptr, SpdkGlobalState* owner);
+    // queue_depth sizes the request pool (and caps the device queue at
+    // it); 0 keeps SPDK's defaults.
+    SpdkQpair(SpdkNamespace* namespace_ptr, SpdkGlobalState* owner,
+              unsigned queue_depth = 0);
     ~SpdkQpair();
 
     SpdkQpair(const SpdkQpair&) = delete;
@@ -115,17 +128,23 @@ struct SpdkQpair {
     uint32_t get_sector_size() const { return ns->get_sector_size(); }
     uint64_t get_size() const { return ns->get_size(); }
 
-    int submit_read(void* buf, uint64_t lba, uint32_t lba_cnt,
-                    spdk_nvme_cmd_cb cb_fn, void* cb_arg);
-    int submit_write(void* buf, uint64_t lba, uint32_t lba_cnt,
-                     spdk_nvme_cmd_cb cb_fn, void* cb_arg);
+    // Submits req, or queues it to wait when every request is taken and a
+    // completion will free one. Returns 0, or the error that failed req.
+    int submit(SpdkRequest* req);
 
+    // Harvests completions, then submits waiting I/Os that now fit.
     int32_t execute_completions(uint32_t max_completions = 0);
+
+    bool idle() const { return npending == 0 && !wait_head; }
 
     void process_admin_completions();
 
     void* alloc_dma_buffer(size_t size);
     void free_dma_buffer(void* ptr);
+
+private:
+    int submit_now(SpdkRequest* req);
+    void submit_waiting();
 };
 
 // SPDK NVMe I/O backend for uDepot-ng.
@@ -178,13 +197,28 @@ public:
     // I/Os on the calling thread's queue pair that bounced. For tests.
     static uint64_t thread_bounce_count();
 
+    // Before open(): the number of I/Os the caller expects to have in
+    // flight at once on a thread; 0 keeps SPDK's defaults. It sizes the
+    // request pool of queue pairs created from then on. Not a limit: an
+    // I/O that finds every request taken waits for a completion to free
+    // one. Queue pairs are per thread and shared by every SpdkIO, so one a
+    // thread already has keeps its size.
+    void set_queue_depth(unsigned n) noexcept { queue_depth_ = n; }
+    unsigned queue_depth() const noexcept { return queue_depth_; }
+
+    // I/Os on the calling thread's queue pair that had to wait. For tests.
+    static uint64_t thread_waited_count();
+
 private:
     size_t size_ = 0;
+    unsigned queue_depth_ = 0;
     std::thread poller_;
     std::atomic<bool> running_{false};
 
     static SpdkGlobalState global_state_;
     static std::string namespace_name_;
+    // Request pool size for queue pairs created from now on.
+    static std::atomic<unsigned> new_qpair_depth_;
 
     static SpdkQpair* get_thread_qpair();
     static bool poll_thread_qpair();

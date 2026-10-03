@@ -293,6 +293,31 @@ concept IoBackend = requires(T io, void* buf, size_t n, off_t off) {
 };
 ```
 
+**Queue depth.** A caller may have any number of I/Os outstanding; no
+backend caps it. The intended use: preallocate zero-copy buffers for the
+depth you choose (`alloc_put_buffer`, `alloc_get_buffer`), issue that many
+operations, wait for them, reuse the buffers. uDepot allocates no data
+buffers for depth. `StoreConfig::queue_depth` only sizes each backend's
+tracking state for it: the AIO context (`io_setup`), the io_uring ring, and
+the SPDK request pool of queue pairs created afterwards (per thread). It is
+not a limit:
+
+- io_uring takes submissions past the ring's size; the kernel keeps the
+  extra completions on its overflow list.
+- An I/O that AIO or SPDK refuses because its context or request pool is
+  full (EAGAIN, ENOMEM) waits for room, in submission order, and is
+  submitted as completions free it: by the poller (AIO), or by the owning
+  thread's poll (SPDK). io_uring does the same if the kernel refuses
+  submissions (EBUSY/EAGAIN) until the submission queue fills. Waiting
+  allocates nothing: the requests are linked through themselves, in the
+  suspended coroutines' frames. Nothing spins, and a coroutine resumed on
+  the poller can submit without waiting on itself.
+
+This diverges from uDepot, which failed an I/O whose submission found the
+queue full. `QueueDepthTest` (`test/queue_depth_tests.h`, run per backend)
+holds completions back and puts 4096 operations in flight against a backend
+sized for 4.
+
 ### 7. Simplified Buffer (Replacing Mbuff)
 
 The original Mbuff was a linked list of buffer nodes with prepend/append,
@@ -317,8 +342,11 @@ contiguous buffer instead of a chain of nodes:
   shaped like the on-disk record. The caller writes the value into
   `value()`, and `put(key, PutBuffer&)` fills in the header, key and checksum
   around it and writes the buffer as is. On SPDK the buffer is DMA memory.
-- **get**: `get(key, GetBuffer*)` hands over the buffer the record was read
-  into; `value()` views the value inside it.
+- **get**: `get(key, GetBuffer*)` reads the record into the `GetBuffer`'s
+  own buffer when it is large enough (`alloc_get_buffer(key_size,
+  val_size)` preallocates one), and otherwise into a new one that replaces
+  it; `value()` views the value inside it. A caller reusing its buffers
+  does no allocation per get. (uDepot's Mbuff was likewise the caller's.)
 - The span-based `put`/`get` copy the value into, or out of, such a record
   buffer. Both interfaces run the same coroutine (`put_record` and
   `get_record`), so they differ only in that copy. `scripts/perf-zerocopy.sh`

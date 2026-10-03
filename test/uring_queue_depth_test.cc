@@ -1,7 +1,7 @@
 // Copyright (c) 2024-2026 Nikolas Ioannou
 // SPDX-License-Identifier: BSD-3-Clause
 
-#include "udepot/io/aio.h"
+#include "udepot/io/uring.h"
 
 #include <filesystem>
 #include <string>
@@ -12,18 +12,19 @@
 
 namespace {
 
-struct AioTraits {
-    using IO = udepot::AioIO;
+struct UringTraits {
+    using IO = udepot::UringIO;
     static constexpr bool kPollerThread = true;
-    // The kernel refuses io_submit (EAGAIN) once the context is full.
-    static constexpr bool kFullQueueWaits = true;
+    // The kernel takes submissions past the ring's size (completions go to
+    // its overflow list), so nothing waits.
+    static constexpr bool kFullQueueWaits = false;
     static uint64_t waited(IO& io) { return io.waited_count(); }
     static void suite_setup() {}
     static void suite_teardown() {}
     static std::string& path() {
         static std::string p =
             (std::filesystem::temp_directory_path() /
-             ("udepot_aio_qdepth_test_" + std::to_string(getpid())))
+             ("udepot_uring_qdepth_test_" + std::to_string(getpid())))
                 .string();
         return p;
     }
@@ -38,4 +39,4 @@ struct AioTraits {
 
 }  // namespace
 
-INSTANTIATE_TYPED_TEST_SUITE_P(Aio, QueueDepthTest, AioTraits);
+INSTANTIATE_TYPED_TEST_SUITE_P(Uring, QueueDepthTest, UringTraits);

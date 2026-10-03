@@ -79,6 +79,12 @@ struct StoreConfig {
     uint32_t overprovision = 200;
     // Destroy any existing data on the device and start fresh.
     bool force_destroy = false;
+    // I/Os the caller expects to have in flight at once (per thread on
+    // SPDK). It sizes the backend's tracking state (AIO context, io_uring
+    // ring, SPDK request pool) and is not a limit: deeper submissions are
+    // still served. 0 = the backend's default. Buffers are the caller's:
+    // see alloc_put_buffer() and alloc_get_buffer().
+    unsigned queue_depth = 0;
 };
 
 // Condition a put() must satisfy, checked atomically with the write.
@@ -187,8 +193,17 @@ public:
                       PutMode mode = PutMode::kUpsert,
                       uint64_t if_version = kAnyVersion);
 
+    // Zero copy, for gets: a buffer that holds a record of a key of
+    // key_size bytes and a value of up to val_size bytes. Invalid
+    // (!valid()) if the sizes cannot be stored or allocation fails.
+    GetBuffer alloc_get_buffer(size_t key_size, size_t val_size);
+
     // Zero copy: on success, *val_out holds the buffer the record was read
-    // into, and val_out->value() the value. On error it is left empty.
+    // into, and val_out->value() the value. The record is read into
+    // val_out's own buffer when it is large enough (from alloc_get_buffer()
+    // or an earlier get), so a caller can reuse its buffers; otherwise
+    // into a new one, which replaces it. On error value() is empty and the
+    // buffer is kept. The buffer must stay alive until the get completes.
     CoroTask<int> get(std::span<const uint8_t> key, GetBuffer* val_out,
                       uint64_t* version_out = nullptr);
 

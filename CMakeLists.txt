@@ -210,6 +210,9 @@ if(UDEPOT_BUILD_TESTS)
         udepot_add_test(uring_test test/io/uring_test.cc)
         udepot_add_test(uring_store_test test/uring_store_test.cc)
         udepot_add_test(concurrent_uring_store_test test/concurrent_uring_store_test.cc)
+        udepot_add_test(uring_queue_depth_test test/uring_queue_depth_test.cc)
+        set_tests_properties(uring_queue_depth_test PROPERTIES TIMEOUT 180
+                             RUN_SERIAL TRUE)
     endif()
 
     if(UDEPOT_BUILD_PYTHON)
@@ -272,6 +275,8 @@ if(UDEPOT_BUILD_TESTS)
         udepot_add_test(spdk_store_test test/spdk_store_test.cc)
         set_tests_properties(spdk_test PROPERTIES TIMEOUT 120)
         set_tests_properties(spdk_store_test PROPERTIES TIMEOUT 120)
+        udepot_add_test(spdk_queue_depth_test test/spdk_queue_depth_test.cc)
+        set_tests_properties(spdk_queue_depth_test PROPERTIES TIMEOUT 300)
     endif()
 
     # Perf benchmark binary (not a gtest — standalone executable).
