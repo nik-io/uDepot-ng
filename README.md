@@ -15,11 +15,10 @@ allocation and GC is described in the [MASCOTS18 paper](https://ieeexplore.ieee.
 
 - **Userspace RCU** replaces per-bucket mutexes — lock-free reads, per-thread
   epoch with zero shared-line atomic RMW on the read path
-- **Eager-start C++23 coroutines** replace TRT — `initial_suspend = suspend_never`,
+- **Eager-start C++23 coroutines** — `initial_suspend = suspend_never`,
   so creating a CoroTask immediately submits I/O; batch N coroutines then
   harvest completions for queue-depth scaling
 - **CMake** replaces the Makefile build
-- **No TRT dependency** — standalone runtime, no separate scheduler
 - **SPDK backend** — NVMe direct access via SPDK queue pairs, NVMe-oF
   support via `UDEPOT_NVMEF` env var
 
@@ -64,7 +63,7 @@ $ cmake --build build -j$(nproc)
 #include "udepot/store.h"
 
 using udepot::PosixIO;
-using udepot::UDepot;
+using udepot::uDepot;
 using udepot::StoreConfig;
 
 int main() {
@@ -73,7 +72,7 @@ int main() {
     config.size = 64 * 1024 * 1024;
     config.grain_size = 512;
 
-    UDepot<PosixIO> store;
+    uDepot<PosixIO> store;
     int rc = store.open(config);
     assert(rc == 0);
 
@@ -98,7 +97,7 @@ int main() {
 #include "udepot/io/aio.h"
 
 using udepot::AioIO;
-using udepot::UDepot;
+using udepot::uDepot;
 using udepot::CoroTask;
 
 // Batch N operations for queue-depth scaling:
@@ -147,14 +146,6 @@ against buffered IO backend.
 
 - Best performance is expected when using the AIO backend with batched
   coroutines for queue-depth scaling.
-
-## Roadmap
-
-- **io_uring backend** — kernel-side I/O submission ring
-- **Network backends** — memcache protocol server (TCP/RDMA), NVMe over Fabrics
-- **Python API** — ctypes bindings to `libpyudepot.so`
-- **Java JNI API** — JNI bindings and YCSB benchmark integration
-- **Directory grow** — deferred reclaim of retired directories, gradual per-table growth
 
 ## License
 
