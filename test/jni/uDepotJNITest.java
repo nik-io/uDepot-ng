@@ -10,7 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 
-class UDepotJNITest {
+class uDepotJNITest {
     static {
         System.loadLibrary("uDepotJNI");
     }
@@ -28,7 +28,7 @@ class UDepotJNITest {
         }
     }
 
-    UDepotJNITest(String fname, long size) {
+    uDepotJNITest(String fname, long size) {
         KV = new uDepotJNI();
         int rc = KV.init(fname, size, true);
         if (rc != 0)
@@ -173,7 +173,7 @@ class UDepotJNITest {
                            " size=" + (size >> 20) + " MiB");
 
         int closed_failures = testClosedStoreRejectsOps();
-        UDepotJNITest test = new UDepotJNITest(fname, size);
+        uDepotJNITest test = new uDepotJNITest(fname, size);
         test.check(closed_failures == 0, "ops before init fail");
         try {
             test.testPutThenGet();

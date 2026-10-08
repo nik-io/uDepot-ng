@@ -253,7 +253,7 @@ uDepot-ng has one class, parameterized only on the I/O backend:
 
 ```cpp
 template <typename IO>
-class UDepot {
+class uDepot {
     Directory directory_;
     IO io_;
     SegmentAllocator segments_;
@@ -423,7 +423,7 @@ uDepot-ng/
 ├── docs/
 │   └── architecture.md          # this document
 ├── src/udepot/
-│   ├── store.h                  # UDepot<IO> — the single KV implementation
+│   ├── store.h                  # uDepot<IO> — the single KV implementation
 │   ├── store.cc
 │   ├── directory.h              # RCU-protected hash directory
 │   ├── directory.cc
@@ -452,7 +452,7 @@ uDepot-ng/
 ├── python/
 │   ├── wrapper/
 │   │   ├── pyudepot.h           # C ABI (7 functions)
-│   │   └── pyudepot.cc          # bridges C ABI to UDepot via run_sync()
+│   │   └── pyudepot.cc          # bridges C ABI to uDepot via run_sync()
 │   └── pyudepot/
 │       ├── __init__.py
 │       └── udepot.py            # ctypes bindings (sync API)
@@ -640,7 +640,7 @@ decides, as the paper says: *"the persistent source of truth is the log"*.
    reads and stripe-locked writes.
 6. **`directory.h`** — RCU-protected directory of hash tables.
 7. **`segment.h`** — segment geometry and salsa GC.
-8. **`store.h`** — `UDepot<PosixIO>`, the first working configuration.
+8. **`store.h`** — `uDepot<PosixIO>`, the first working configuration.
 9. **Tests** for each layer as it is built.
 10. **`io/uring.h`**, **`io/aio.h`** — async backends with pollers.
 11. **`io/spdk.h`** — SPDK backend.
@@ -648,7 +648,7 @@ decides, as the paper says: *"the persistent source of truth is the log"*.
 13. **`io/net.h`**, **`net/memcache.cc`** — network backend and protocol
     server.
 
-The first milestone is `UDepot<PosixIO>` passing the existing test suite —
+The first milestone is `uDepot<PosixIO>` passing the existing test suite —
 RCU directory, lock-free gets, hopscotch table, sync I/O. **v0 is not
 complete until the perf regression test passes**: uDepot-ng must be strictly
 equal to or faster than uDepot on every operation (put, get, exists, delete),

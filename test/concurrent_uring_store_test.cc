@@ -17,7 +17,7 @@
 #include <gtest/gtest.h>
 
 using udepot::StoreConfig;
-using udepot::UDepot;
+using udepot::uDepot;
 using udepot::UringIO;
 
 static constexpr size_t kStoreSize = 64 * 1024 * 1024;  // 64 MiB
@@ -44,7 +44,7 @@ protected:
 
     std::filesystem::path path_;
     StoreConfig config_;
-    UDepot<UringIO> store_;
+    uDepot<UringIO> store_;
 };
 
 static std::string make_key(int thread_id, int i) {

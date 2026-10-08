@@ -104,7 +104,7 @@ enum class PutMode {
 inline constexpr uint64_t kAnyVersion = UINT64_MAX;
 
 // Zero-copy values (uDepot's Mbuff interface). A PutBuffer, from
-// UDepot::alloc_put_buffer(), is laid out as the on-disk record with room
+// uDepot::alloc_put_buffer(), is laid out as the on-disk record with room
 // around the value: the caller writes the value in place and put() writes
 // the buffer to storage as is, filling in header, key and checksum. A
 // GetBuffer receives the buffer get() read the record into, and value()
@@ -124,7 +124,7 @@ public:
     size_t key_size() const noexcept { return key_size_; }
 
 private:
-    template <typename> friend class UDepot;
+    template <typename> friend class uDepot;
     IoBuffer buf_;
     uint16_t key_size_ = 0;
     uint32_t val_size_ = 0;
@@ -142,7 +142,7 @@ public:
     }
 
 private:
-    template <typename> friend class UDepot;
+    template <typename> friend class uDepot;
     IoBuffer buf_;
     size_t val_off_ = 0;
     uint32_t val_size_ = 0;
@@ -153,13 +153,13 @@ private:
 // Uses RCU-protected directory for lock-free reads, salsa for grain
 // allocation and GC, and the IoBackend for storage I/O.
 template <typename IO>
-class UDepot : private salsa::SalsaCtlr {
+class uDepot : private salsa::SalsaCtlr {
 public:
-    UDepot();
-    ~UDepot();
+    uDepot();
+    ~uDepot();
 
-    UDepot(const UDepot&) = delete;
-    UDepot& operator=(const UDepot&) = delete;
+    uDepot(const uDepot&) = delete;
+    uDepot& operator=(const uDepot&) = delete;
 
     // As in uDepot, the caller orders open() and close() against
     // operations: none may start before open() returns, run concurrently
@@ -338,7 +338,7 @@ private:
     // copy the tables). The waker thread runs requested grows and resumes
     // waiters to retry, as uDepot's tasks yielded to the TRT scheduler.
     struct SpaceWait {
-        UDepot* store;
+        uDepot* store;
         // A grow of this snapshot generation to run, if any.
         uint64_t grow = Directory::kAnyGeneration;
         bool await_ready() noexcept { return false; }
@@ -412,7 +412,7 @@ private:
     // metadata carry its type, so the log scan skips them.
     class IndexCtlr final : public salsa::SalsaCtlr {
     public:
-        explicit IndexCtlr(UDepot* store) : store_(store) {}
+        explicit IndexCtlr(uDepot* store) : store_(store) {}
 
     private:
         // Never holds anything GC could move (uDepot: "this should not
@@ -421,7 +421,7 @@ private:
         void seg_md_callback(u64 grain_start, u64, u64) override {
             store_->index_seg_md_callback(grain_start);
         }
-        UDepot* store_;
+        uDepot* store_;
     };
     std::unique_ptr<IndexCtlr> index_ctlr_;
     // Newest index timestamp seen on the device; the next flush is newer.

@@ -87,7 +87,9 @@ Follow the [Google C++ Style Guide](https://google.github.io/styleguide/cppguide
 
 - C++23 (`-std=c++23`), compiled with `-Wall -Wextra -Werror`
 - Member variables: `_` suffix (e.g., `directory_`, `epoch_`)
-- `snake_case` for functions and variables, `PascalCase` for types/classes
+- `snake_case` for functions and variables, `PascalCase` for types/classes,
+  except `uDepot` itself: always a lowercase u, the μ ("micro") in the name,
+  never `UDepot` (the store class is `udepot::uDepot<IO>`)
 - `#pragma once` for all headers
 - No exceptions on the I/O hot path
 
