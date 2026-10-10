@@ -98,7 +98,8 @@ Quotes below are from the paper; section numbers are the paper's.
   take the old stripes), on-demand completion by the space waker when a table
   fills mid-resize (then the next resize starts), and close/recovery
   finishing a pending resize. As in the paper, only writes migrate regions;
-  the waker does not sweep. Legacy never finished it (`uDepotDirMapOR`'s
+  the waker does not sweep. The earlier freeze-and-copy grow stays
+  selectable (`ResizeMode::kFreeze`) for comparison. Legacy never finished it (`uDepotDirMapOR`'s
   shadow directory is the started half).
 
 ## Metadata and persistence (§4.4)

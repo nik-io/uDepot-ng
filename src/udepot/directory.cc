@@ -50,9 +50,11 @@ private:
 
 }  // namespace
 
-Directory::Directory(Rcu& rcu, uint32_t initial_tables, uint32_t index_bits)
+Directory::Directory(Rcu& rcu, uint32_t initial_tables, uint32_t index_bits,
+                     ResizeMode mode)
     : rcu_(rcu),
       index_bits_(index_bits),
+      mode_(mode),
       current_(new DirSnapshot(table_bits_for(initial_tables), index_bits,
                                0)) {}
 
@@ -111,6 +113,10 @@ Directory::Locked Directory::lock_for(uint64_t hash) {
             snap->handover->active.load(std::memory_order_acquire))
             old_lock = snap->handover->old[t >> 1]->lock_stripes(first, last);
         HashTable::WriteLock lock = table.lock_stripes(first, last);
+        // kFreeze: a writer that sees false here is one the grow's grace
+        // period waits for, so its write is in the tables before the copy.
+        if (snap->frozen.load(std::memory_order_acquire))
+            return Locked{nullptr, snap, {}, {}};
         // A resize started on this snapshot: its migrations take these
         // stripes, so a writer that sees false here writes before the
         // stripe is copied, and one that sees true retries on the
@@ -190,7 +196,63 @@ void Directory::end_handover() {
     snap->handover->active.store(false, std::memory_order_release);
 }
 
+void Directory::wait_for_grow(uint64_t generation) {
+    std::unique_lock<std::mutex> lock(grown_mu_);
+    grown_cv_.wait(lock, [&] {
+        // A snapshot is freed once replaced; read it inside a section.
+        Rcu::ReadGuard guard(rcu_);
+        return current_.load(std::memory_order_acquire)->generation !=
+               generation;
+    });
+}
+
+int Directory::grow_frozen(uint64_t seen) {
+    std::lock_guard<std::mutex> lock(grow_mutex_);
+    // Only this replaces current_ in kFreeze, under grow_mutex_: the
+    // snapshot cannot be freed under us.
+    DirSnapshot* old_snap = current_.load(std::memory_order_acquire);
+    if (seen != kAnyGeneration && seen != old_snap->generation) return 0;
+    if (old_snap->table_bits >= DirSnapshot::kMaxTableBits) return -ENOSPC;
+
+    // Allocated before freezing: writers stall only for the copy.
+    auto* new_snap = new DirSnapshot(old_snap->table_bits + 1, index_bits_,
+                                     old_snap->generation + 1);
+
+    // As uDepot's rwpflock write_enter + write_wait_readers, for writers
+    // only: new writers see the flag and back off, and the grace period
+    // waits out every one that did not. Readers carry on.
+    old_snap->frozen.store(true, std::memory_order_seq_cst);
+    rcu_.synchronize();
+
+    // Nothing writes the old tables now; the new ones are unpublished.
+    for (auto& old_table : old_snap->tables) {
+        for (uint64_t s = 0; s < old_table->total_slots(); ++s) {
+            HashEntry entry = old_table->load_slot(s);
+            if (entry.empty()) continue;
+            // An entry holds its tag and home bucket: enough for both the
+            // new table index (tag bits) and the bucket.
+            uint64_t home_bucket = s - entry.bucket_offset();
+            uint64_t hash = (static_cast<uint64_t>(entry.key_tag()) << 56) |
+                            home_bucket;
+            // Splitting a table halves its load, so the copy always fits.
+            int rc = new_snap->table_for_hash(hash).insert_locked(
+                hash, entry.kv_size(), entry.pba());
+            assert(rc == 0);
+            (void)rc;
+        }
+    }
+
+    current_.store(new_snap, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> g(grown_mu_);
+    }
+    grown_cv_.notify_all();
+    rcu_.call([old_snap] { delete old_snap; });
+    return 0;
+}
+
 int Directory::resize(uint64_t seen) {
+    if (mode_ == ResizeMode::kFreeze) return grow_frozen(seen);
     std::lock_guard<std::mutex> lock(grow_mutex_);
     {
         // A resizing snapshot is freed once its final one is published,

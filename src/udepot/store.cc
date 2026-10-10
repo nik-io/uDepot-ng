@@ -230,6 +230,7 @@ int uDepot<IO>::recover_record(uint64_t hash, std::span<const uint8_t> key,
             // Recovery runs alone, before any other thread: no resize can
             // race it, and it holds no read section, so it may grow inline.
             auto locked = directory_->lock_for(hash);
+            assert(!locked.frozen());
             bool settled = probe_settled(*locked.table, hash, probe, &match);
             assert(settled);
             (void)settled;
@@ -687,7 +688,8 @@ int uDepot<IO>::restore_index(bool* restored) {
 
     // Load the tables.
     if (ok) {
-        dir = std::make_unique<Directory>(rcu_, dir_size, index_bits);
+        dir = std::make_unique<Directory>(rcu_, dir_size, index_bits,
+                                          resize_mode_);
         DirSnapshot& snap = dir->snapshot();
         constexpr size_t kChunk = size_t{4} << 20;
         IoBuffer buf;
@@ -859,7 +861,9 @@ int uDepot<IO>::open(const StoreConfig& config) {
     // Start with 1 table for recovery (will grow as entries are inserted),
     // config.initial_tables for fresh.
     uint32_t initial_tables = restored ? 1 : config.initial_tables;
-    directory_ = new Directory(rcu_, initial_tables, config.index_bits);
+    resize_mode_ = config.resize_mode;
+    directory_ = new Directory(rcu_, initial_tables, config.index_bits,
+                               resize_mode_);
 
     // Relocating GC with uDepot's non-memcache parameters
     // (uDepotSalsa::init: init_local(14, 2, 4)).
@@ -1113,14 +1117,14 @@ bool uDepot<IO>::SpaceWait::await_suspend(std::coroutine_handle<> h) {
 }
 
 template <typename IO>
-CoroTask<int> uDepot<IO>::wait_for_resize(uint64_t gen,
+CoroTask<int> uDepot<IO>::wait_for_resize(uint64_t gen, bool request,
                                           std::optional<Rcu::ReadGuard>& guard,
                                           KeyProbe* probe) {
     // Finishing a resize or ending a handover waits for read sections, so
     // leave ours first.
     guard.reset();
     if (probe) probe->n = 0;
-    co_await SpaceWait{this, gen};
+    co_await SpaceWait{this, request ? gen : Directory::kAnyGeneration};
     guard.emplace(rcu_);
     co_return 0;
 }
@@ -1470,6 +1474,10 @@ int uDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
                            uint16_t kv_grains, uint64_t pba,
                            HashEntry* replaced, uint64_t* gen) {
     auto locked = directory_->lock_for(hash);
+    if (locked.frozen()) {
+        *gen = locked.snapshot->generation;
+        return kFrozen;
+    }
     HashTable& table = *locked.table;
 
     HashEntry match;
@@ -1625,11 +1633,13 @@ CoroTask<int> uDepot<IO>::put_record(std::span<const uint8_t> key_in,
                             static_cast<uint16_t>(grains_needed), grain,
                             &replaced, &gen);
             if (rc == kRetryProbe) continue;
-            if (rc != kTableFull) break;
+            if (rc != kTableFull && rc != kFrozen) break;
             // As in uDepot: a full table grows the directory. The write
             // waits for the space waker to start the resize (or, mid-resize,
-            // to finish it and start the next) and retries.
-            rc = co_await wait_for_resize(gen, guard, &probe);
+            // to finish it and start the next), or in kFreeze for a grow it
+            // met to publish, and retries.
+            rc = co_await wait_for_resize(gen, rc == kTableFull, guard,
+                                          &probe);
             if (rc != 0) break;
         }
 
@@ -1840,8 +1850,12 @@ CoroTask<int> uDepot<IO>::write_tombstone(
 template <typename IO>
 int uDepot<IO>::commit_del(uint64_t hash, const KeyProbe& probe,
                            uint64_t if_version, uint64_t tomb_pba,
-                           HashEntry* removed) {
+                           HashEntry* removed, uint64_t* gen) {
     auto locked = directory_->lock_for(hash);
+    if (locked.frozen()) {
+        *gen = locked.snapshot->generation;
+        return kFrozen;
+    }
     HashTable& table = *locked.table;
 
     HashEntry match;
@@ -1874,10 +1888,16 @@ CoroTask<int> uDepot<IO>::del(std::span<const uint8_t> key,
     KeyProbe probe;
     for (;;) {
         HashEntry removed;
+        uint64_t gen = 0;
         int rc = co_await probe_key(hash, key, probe);
-        if (rc == 0) rc = commit_del(hash, probe, if_version, tomb, &removed);
+        if (rc == 0)
+            rc = commit_del(hash, probe, if_version, tomb, &removed, &gen);
 
         if (rc == kRetryProbe) continue;
+        if (rc == kFrozen) {
+            rc = co_await wait_for_resize(gen, false, guard, &probe);
+            if (rc == 0) continue;
+        }
         if (rc == 0) {
             invalidate_grains(removed.pba(), removed.kv_size());
             release_grains(tomb, tomb_grains);  // stays valid, referenced

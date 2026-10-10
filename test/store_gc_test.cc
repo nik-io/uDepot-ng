@@ -273,7 +273,12 @@ TEST(StoreGcAioTest, ReadsStayCorrectWhileGcRelocates) {
 
 // Regression: a full neighborhood failed the put with ENOSPC; uDepot grows
 // the directory instead. Writers racing the grow must not lose entries.
-TEST_F(StoreGcTest, DirectoryGrowsUnderConcurrentPuts) {
+class StoreGcResizeModeTest
+    : public StoreGcTest,
+      public ::testing::WithParamInterface<udepot::ResizeMode> {};
+
+TEST_P(StoreGcResizeModeTest, DirectoryGrowsUnderConcurrentPuts) {
+    config_.resize_mode = GetParam();
     config_.initial_tables = 1;
     config_.index_bits = 6;  // 64 buckets: full after a few hundred keys
     ASSERT_EQ(store_.open(config_), 0);
@@ -307,6 +312,15 @@ TEST_F(StoreGcTest, DirectoryGrowsUnderConcurrentPuts) {
     reopen();
     check();
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    Modes, StoreGcResizeModeTest,
+    ::testing::Values(udepot::ResizeMode::kIncremental,
+                      udepot::ResizeMode::kFreeze),
+    [](const auto& info) {
+        return info.param == udepot::ResizeMode::kFreeze ? "Freeze"
+                                                         : "Incremental";
+    });
 
 // The same with tables of several stripes, so a resize migrates stripe by
 // stripe as puts touch them while gets read through the resizing directory
@@ -402,10 +416,13 @@ TEST_F(StoreGcTest, IncrementalResizeUnderConcurrentPutsAndGets) {
 // its coroutine resumes after the data write) must not grow the directory
 // there: the grow waits for a grace period, which reads in flight on that
 // same poller hold. It suspends, the waker thread grows, and it retries.
-TEST(StoreGcAioTest, DirectoryGrowsFromPollerThread) {
+class StoreGcAioTest : public ::testing::TestWithParam<udepot::ResizeMode> {};
+
+TEST_P(StoreGcAioTest, DirectoryGrowsFromPollerThread) {
     auto path = std::filesystem::temp_directory_path() /
                 ("udepot_store_grow_aio_" + std::to_string(getpid()));
     StoreConfig config = gc_config(path);
+    config.resize_mode = GetParam();
     config.initial_tables = 1;
     config.index_bits = 6;
     uDepot<AioIO> store;
@@ -450,6 +467,15 @@ TEST(StoreGcAioTest, DirectoryGrowsFromPollerThread) {
     store.close();
     std::filesystem::remove(path);
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    Modes, StoreGcAioTest,
+    ::testing::Values(udepot::ResizeMode::kIncremental,
+                      udepot::ResizeMode::kFreeze),
+    [](const auto& info) {
+        return info.param == udepot::ResizeMode::kFreeze ? "Freeze"
+                                                         : "Incremental";
+    });
 
 // Regression: recovery looked at only the first tag-matching entry. With
 // another key of the same tag ahead of it in the neighborhood, a key's

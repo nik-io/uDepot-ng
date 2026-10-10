@@ -497,3 +497,95 @@ TEST_F(DirectoryTest, HandoverExcludesWritersStillOnTheResizingSnapshot) {
         << "a writer on the final snapshot got the region while one on the "
            "resizing snapshot still held it";
 }
+
+// ResizeMode::kFreeze, the earlier mechanism kept for comparison: writers
+// racing grows lose nothing. grow() waits out every writer that missed the
+// frozen flag before it copies, and a writer that sees the flag retries on
+// the new snapshot. No stripe lock is held by grow().
+TEST_F(DirectoryTest, FreezeModeConcurrentWritersAndGrowLoseNothing) {
+    constexpr uint32_t kBits = 14;
+    Directory dir(rcu_, 1, kBits, udepot::ResizeMode::kFreeze);
+    constexpr int kWriters = 4;
+    constexpr int kPerWriter = 2500;  // 10000 entries in 16384 buckets
+    std::atomic<int> started{0};
+    std::atomic<int> frozen_waits{0};
+
+    auto hash_of = [](int w, int i) {
+        uint64_t n = static_cast<uint64_t>(w) * kPerWriter + i;
+        return make_hash(n * 7919, static_cast<uint8_t>(n % 251 + 1), kBits);
+    };
+    auto pba_of = [](int w, int i) {
+        return static_cast<uint64_t>(w) * kPerWriter + i + 1;
+    };
+
+    std::vector<std::thread> writers;
+    for (int w = 0; w < kWriters; ++w) {
+        writers.emplace_back([&, w] {
+            started.fetch_add(1);
+            for (int i = 0; i < kPerWriter; ++i) {
+                for (;;) {
+                    uint64_t gen;
+                    {
+                        Rcu::ReadGuard guard(rcu_);
+                        auto locked = dir.lock_for(hash_of(w, i));
+                        if (!locked.frozen()) {
+                            // A writer can be descheduled between the flag
+                            // check and its insert; make that common, so a
+                            // grow that does not wait it out is caught.
+                            if (i % 8 == 0)
+                                std::this_thread::sleep_for(
+                                    std::chrono::microseconds(20));
+                            ASSERT_EQ(locked.table->insert_locked(
+                                          hash_of(w, i), 1, pba_of(w, i)),
+                                      0);
+                            break;
+                        }
+                        gen = locked.snapshot->generation;
+                    }
+                    frozen_waits.fetch_add(1);
+                    dir.wait_for_grow(gen);
+                }
+                if (i % 64 == 0) std::this_thread::yield();
+            }
+        });
+    }
+
+    while (started.load() < kWriters) std::this_thread::yield();
+    for (int g = 0; g < 4; ++g) {
+        EXPECT_EQ(dir.grow(), 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    for (auto& t : writers) t.join();
+    EXPECT_EQ(dir.num_tables(), 16u);
+
+    Rcu::ReadGuard guard(rcu_);
+    int lost = 0;
+    for (int w = 0; w < kWriters; ++w)
+        for (int i = 0; i < kPerWriter; ++i)
+            if (dir.entry_at(hash_of(w, i), pba_of(w, i)).empty()) ++lost;
+    EXPECT_EQ(lost, 0) << "frozen waits: " << frozen_waits.load();
+}
+
+// kFreeze never leaves a resize in progress: grow() returns with every
+// entry in the doubled tables.
+TEST_F(DirectoryTest, FreezeModeGrowPreservesEntries) {
+    Directory dir(rcu_, 2, 10, udepot::ResizeMode::kFreeze);
+    {
+        Rcu::ReadGuard guard(rcu_);
+        for (uint64_t i = 0; i < 200; ++i)
+            ASSERT_EQ(dir.insert(make_hash(i * 7, static_cast<uint8_t>(i + 1),
+                                           10),
+                                 1, i + 100),
+                      0);
+    }
+    ASSERT_EQ(dir.resize(), 0);
+    EXPECT_FALSE(dir.resizing());
+    EXPECT_EQ(dir.num_tables(), 4u);
+    EXPECT_EQ(dir.grow(), 0);
+    EXPECT_EQ(dir.num_tables(), 8u);
+    Rcu::ReadGuard guard(rcu_);
+    for (uint64_t i = 0; i < 200; ++i)
+        EXPECT_EQ(dir.lookup(make_hash(i * 7, static_cast<uint8_t>(i + 1), 10))
+                      .pba(),
+                  i + 100);
+}

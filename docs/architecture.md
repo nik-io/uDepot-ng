@@ -201,6 +201,14 @@ writers or readers while a resize runs.
 - **Close and recovery** finish a pending resize first: the index is
   persisted as one geometry, and recovery grows inline, alone.
 
+`StoreConfig::resize_mode = ResizeMode::kFreeze` keeps the earlier
+mechanism, to compare against (`udepot_ng_bench --resize-mode freeze`):
+the waker sets the snapshot's `frozen` flag, which writers check under their
+stripe locks and back off on, waits a grace period, copies every table into
+the doubled directory and publishes it. Readers carry on throughout; writers
+wait out the whole copy. It is uDepot's `rwpflock` exclusion, for writers
+only.
+
 ### 3. Eager-Start C++23 Coroutines
 
 All API operations return an eagerly-started coroutine. The coroutine body

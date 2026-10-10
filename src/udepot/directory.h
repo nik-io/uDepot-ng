@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -14,6 +15,15 @@
 #include "udepot/rcu.h"
 
 namespace udepot {
+
+// How a full table grows the directory.
+enum class ResizeMode {
+    // Incremental, per lock region (paper §4.3). The default.
+    kIncremental,
+    // Kept to compare against: freeze writers, wait a grace period, copy
+    // every table, publish. Readers carry on; writers wait out the copy.
+    kFreeze,
+};
 
 // A resize in progress (paper §4.3): the previous geometry, half as many
 // tables, being migrated into the snapshot's tables one lock region
@@ -67,6 +77,9 @@ struct DirSnapshot {
     // check it under their stripe locks, the ones the resize migrates
     // under, and retry on the new snapshot.
     std::atomic<bool> superseded{false};
+    // ResizeMode::kFreeze: set before the tables are copied. Writers check
+    // it under their stripe locks and back off until the copy is published.
+    std::atomic<bool> frozen{false};
 
     // Fresh, empty tables.
     DirSnapshot(uint32_t table_bits, uint32_t index_bits, uint64_t generation)
@@ -117,7 +130,8 @@ struct DirSnapshot {
 class Directory {
 public:
     // initial_tables is rounded up to a power of two.
-    Directory(Rcu& rcu, uint32_t initial_tables, uint32_t index_bits);
+    Directory(Rcu& rcu, uint32_t initial_tables, uint32_t index_bits,
+              ResizeMode mode = ResizeMode::kIncremental);
     ~Directory();
 
     Directory(const Directory&) = delete;
@@ -134,14 +148,23 @@ public:
     // The key's table in the current snapshot, with the stripes covering
     // the key's writes held: the old table's while a resize is in progress
     // (old_lock, after migrating them), and also the old table's during a
-    // handover. Never fails; caller must hold an RCU read lock.
+    // handover. Caller must hold an RCU read lock. Only in
+    // ResizeMode::kFreeze can it come back frozen() (no table, no lock):
+    // the caller leaves its read section, wait_for_grow(generation)s and
+    // retries.
     struct Locked {
         HashTable* table;
         const DirSnapshot* snapshot;
         HashTable::WriteLock old_lock;
         HashTable::WriteLock lock;
+
+        bool frozen() const noexcept { return table == nullptr; }
     };
     Locked lock_for(uint64_t hash);
+
+    // ResizeMode::kFreeze: block until the snapshot of `generation` is no
+    // longer current. Never inside a read-side section.
+    void wait_for_grow(uint64_t generation);
 
     // Single-step writes. Caller must hold an RCU read lock. insert()
     // returns -ENOSPC if the table is full; the caller resizes, outside its
@@ -159,6 +182,7 @@ public:
     // Returns 0, or -ENOSPC at the maximum size. Allocates the new tables
     // and may wait for a grace period (ending a handover), so it runs on
     // the space waker, never inside a read section or on an I/O poller.
+    // In ResizeMode::kFreeze: the whole copy, as described there.
     int resize(uint64_t seen = kAnyGeneration);
 
     // resize(), then finish it: the tables doubled when it returns.
@@ -170,6 +194,7 @@ public:
     void complete();
 
     bool resizing() const noexcept;
+    ResizeMode mode() const noexcept { return mode_; }
     uint32_t num_tables() const noexcept;
     uint32_t index_bits() const noexcept;
 
@@ -194,12 +219,16 @@ private:
     // With grow_mutex_ held, outside any read section: end the current
     // snapshot's handover, waiting a grace period if it is still active.
     void end_handover();
+    int grow_frozen(uint64_t seen);
 
     Rcu& rcu_;
     uint32_t index_bits_;
+    ResizeMode mode_;
     alignas(64) std::atomic<DirSnapshot*> current_;
     // One resize() or complete() at a time; writers never take it.
     alignas(64) std::mutex grow_mutex_;
+    std::mutex grown_mu_;               // kFreeze
+    std::condition_variable grown_cv_;  // a frozen grow published
 };
 
 }  // namespace udepot

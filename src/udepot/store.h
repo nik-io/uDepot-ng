@@ -86,6 +86,10 @@ struct StoreConfig {
     // the backend refuses because its queue is full fails with -EAGAIN.
     // 0 = the backend's default.
     unsigned queue_depth = 0;
+    // How a full table grows the directory: incrementally, per lock region
+    // (paper §4.3), or by freezing writers for a whole copy, the earlier
+    // mechanism kept for comparison.
+    ResizeMode resize_mode = ResizeMode::kIncremental;
 };
 
 // Condition a put() must satisfy, checked atomically with the write.
@@ -310,6 +314,7 @@ private:
     Rcu rcu_;
     IO io_;
     Directory* directory_ = nullptr;
+    ResizeMode resize_mode_ = ResizeMode::kIncremental;  // from open()
     uint32_t grain_size_ = 512;
     uint64_t total_grains_ = 0;
 
@@ -515,28 +520,37 @@ private:
                                            // the entry (reported out)
     static constexpr int kNeedTomb = 3;    // del: write the tombstone
     static constexpr int kTableFull = 4;   // put: resize the directory
+    static constexpr int kFrozen = 5;      // ResizeMode::kFreeze: copying
 
-    // On kTableFull, *gen is the snapshot's generation.
+    // On kTableFull or kFrozen, *gen is the snapshot's generation.
     int commit_put(uint64_t hash, const KeyProbe& probe, PutMode mode,
                    uint64_t if_version, uint16_t kv_grains, uint64_t pba,
                    HashEntry* replaced, uint64_t* gen);
     int commit_del(uint64_t hash, const KeyProbe& probe, uint64_t if_version,
-                   uint64_t tomb_pba, HashEntry* removed);
+                   uint64_t tomb_pba, HashEntry* removed, uint64_t* gen);
 
-    // Have the waker resize for the full snapshot of `gen` and wait for it,
-    // outside the read section. As in allocate_or_wait, `guard` is released
-    // and `probe` cleared meanwhile.
-    CoroTask<int> wait_for_resize(uint64_t gen,
+    // Wait, outside the read section, for the waker: to resize for the
+    // full snapshot of `gen` if `request`, else (kFreeze) for a grow in
+    // progress to publish. As in allocate_or_wait, `guard` is released and
+    // `probe` cleared meanwhile.
+    CoroTask<int> wait_for_resize(uint64_t gen, bool request,
                                   std::optional<Rcu::ReadGuard>& guard,
                                   KeyProbe* probe);
 
     // fn(table) on the key's table with its stripes held, inside a read
-    // section (GC). A resize never makes it wait.
+    // section (GC). Only a ResizeMode::kFreeze grow makes it wait.
     template <typename F>
     auto with_table(uint64_t hash, F&& fn) {
-        Rcu::ReadGuard guard(rcu_);
-        auto locked = directory_->lock_for(hash);
-        return fn(*locked.table);
+        for (;;) {
+            uint64_t frozen;
+            {
+                Rcu::ReadGuard guard(rcu_);
+                auto locked = directory_->lock_for(hash);
+                if (!locked.frozen()) return fn(*locked.table);
+                frozen = locked.snapshot->generation;
+            }
+            directory_->wait_for_grow(frozen);
+        }
     }
 
     // Whether data at new_pba is newer than data at old_pba in the order

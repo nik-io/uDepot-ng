@@ -44,6 +44,10 @@ struct BenchConfig {
     // R rounds, each a batch of `ops` copying operations and a batch of
     // `ops` zero-copy ones, in alternating order, against the same store.
     int compare_rounds = 0;
+    // How a full table grows the directory (--resize-mode).
+    udepot::ResizeMode resize_mode = udepot::ResizeMode::kIncremental;
+    uint32_t initial_tables = 4;
+    uint32_t index_bits = 14;
 };
 
 static double now_secs() {
@@ -286,8 +290,9 @@ static int run_bench(const BenchConfig& cfg) {
     sc.path = cfg.file;
     sc.size = cfg.store_size;
     sc.grain_size = cfg.grain_size;
-    sc.initial_tables = 4;
-    sc.index_bits = 14;
+    sc.initial_tables = cfg.initial_tables;
+    sc.index_bits = cfg.index_bits;
+    sc.resize_mode = cfg.resize_mode;
     // Every run starts empty: a file is removed between runs, but an SPDK
     // namespace keeps the previous run's store.
     sc.force_destroy = true;
@@ -376,7 +381,11 @@ static void usage() {
         "  --backend <b>  posix, aio, uring or spdk (default: posix); spdk\n"
         "                 uses the namespace UDEPOT_NVMEF names, whole\n"
         "  --compare <r>  Copy vs zero copy in one store: r rounds of a\n"
-        "                 batch of -w ops each way, order alternating\n");
+        "                 batch of -w ops each way, order alternating\n"
+        "  --resize-mode <m>  incremental (default) or freeze: how a full\n"
+        "                 table grows the directory\n"
+        "  --initial-tables <n> --index-bits <b>  Directory geometry\n"
+        "                 (default 4 and 14); small values force resizes\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -402,6 +411,21 @@ int main(int argc, char* argv[]) {
             cfg.backend = argv[++i];
         } else if (arg == "--compare" && i + 1 < argc) {
             cfg.compare_rounds = std::stoi(argv[++i]);
+        } else if (arg == "--resize-mode" && i + 1 < argc) {
+            std::string m = argv[++i];
+            if (m == "incremental") {
+                cfg.resize_mode = udepot::ResizeMode::kIncremental;
+            } else if (m == "freeze") {
+                cfg.resize_mode = udepot::ResizeMode::kFreeze;
+            } else {
+                fprintf(stderr, "Unknown resize mode: %s\n", m.c_str());
+                usage();
+                return 1;
+            }
+        } else if (arg == "--initial-tables" && i + 1 < argc) {
+            cfg.initial_tables = std::stoul(argv[++i]);
+        } else if (arg == "--index-bits" && i + 1 < argc) {
+            cfg.index_bits = std::stoul(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
             usage();
             return 0;
