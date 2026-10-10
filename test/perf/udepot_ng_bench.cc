@@ -174,30 +174,13 @@ static double median(std::vector<double> v) {
     return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
 }
 
-// Copy against zero copy, batch by batch within one store. Separate runs
-// of each compare two processes, and the drift between processes (up to
-// ~1.7x, far more on SPDK's NVMe-oF target) swamps what is measured;
-// adjacent batches share it. Prints, per phase, each mode's median batch
-// throughput and the median of the per-round ratios zero copy / copy.
+// Copy against zero copy, batch by batch within one store: adjacent batches
+// share the drift that separate processes do not. Prints, per phase, each
+// mode's median batch throughput and the median of the per-round ratios.
 //
-// Zero copy is a property of uDepot, not of the caller: given a buffer it
-// handed out (alloc_put_buffer(), alloc_get_buffer()), put() and get() do
-// their I/O on that buffer directly; given any other memory, they copy
-// through a record buffer of their own. Both modes are set up as a caller
-// would, and as uDepot's udepot-test does (one Mbuff, or one value buffer,
-// per task, reused for every operation): one buffer per operation in
-// flight -- here one, the loop being synchronous -- allocated before
-// anything is timed and reused, plain memory for the copying API and
-// uDepot's buffers for the zero-copy one. Each put writes its key's 8-byte
-// tag into the value and each get checks it, the same in both modes.
-//
-// A buffer per operation instead (an earlier version: 500 per batch, ~16
-// MiB per mode) made the caller's buffers cache-cold, which the copying
-// path hides -- it copies from the cold buffer into a record buffer of its
-// own, reused and hot, which the kernel then copies -- and zero copy
-// cannot: the kernel copied from the cold buffer itself. On tmpfs, where
-// the kernel copies either way, that read as zero copy 2-12% slower on
-// some CPUs (AMD EPYC 9V45) and 20-48% faster on others.
+// As legacy's udepot-test: one buffer per mode, allocated before timing and
+// reused for every op (plain memory for copy, uDepot's buffers for zero
+// copy). Each put writes its key's tag into the value; each get checks it.
 template <typename IO>
 static int run_compare(uDepot<IO>& store, const BenchConfig& cfg) {
     const uint64_t batch = cfg.ops;
@@ -206,41 +189,30 @@ static int run_compare(uDepot<IO>& store, const BenchConfig& cfg) {
         fprintf(stderr, "--compare needs --val-size of at least 8\n");
         return 1;
     }
-    constexpr size_t kKeySize = 16;  // one size: a PutBuffer is per key size
     auto tag_of = [&](uint64_t i) { return (cfg.seed + i) * kPrime; };
-    auto set_key = [&](uint64_t i, uint8_t* key) {
-        const uint64_t id = tag_of(i);
-        std::memcpy(key, &id, sizeof(id));
-        std::memset(key + sizeof(id), 0, kKeySize - sizeof(id));
-    };
+    uint64_t key[2] = {0, 0};  // one key size: a PutBuffer is per key size
+    const std::span<const uint8_t> key_span(
+        reinterpret_cast<const uint8_t*>(key), sizeof(key));
 
-    std::vector<uint8_t> put_copy(vsz), get_copy(vsz);
-    for (size_t k = 0; k < vsz; ++k)
-        put_copy[k] = static_cast<uint8_t>(cfg.seed * 131 + k * 7);
-    udepot::PutBuffer put_zc = store.alloc_put_buffer(kKeySize, vsz);
-    udepot::GetBuffer get_zc = store.alloc_get_buffer(kKeySize, vsz);
+    std::vector<uint8_t> put_copy(vsz, 0x5a), get_copy(vsz);
+    udepot::PutBuffer put_zc = store.alloc_put_buffer(sizeof(key), vsz);
+    udepot::GetBuffer get_zc = store.alloc_get_buffer(sizeof(key), vsz);
     if (!put_zc.valid() || !get_zc.valid()) {
         fprintf(stderr, "buffer allocation failed\n");
         return 1;
     }
-    std::memcpy(put_zc.value().data(), put_copy.data(), vsz);
-    uint8_t key[kKeySize];
-    const std::span<const uint8_t> key_span(key, kKeySize);
+    std::fill(put_zc.value().begin(), put_zc.value().end(), 0x5a);
 
     auto put_batch = [&](uint64_t first, bool zc) -> double {
         const double t0 = now_secs();
         for (uint64_t i = first; i < first + batch; ++i) {
-            set_key(i, key);
-            const uint64_t tag = tag_of(i);
-            int rc;
-            if (zc) {
-                std::memcpy(put_zc.value().data(), &tag, sizeof(tag));
-                rc = store.put(key_span, put_zc).run_sync();
-            } else {
-                std::memcpy(put_copy.data(), &tag, sizeof(tag));
-                rc = store.put(key_span, std::span<const uint8_t>(put_copy))
+            const uint64_t tag = key[0] = tag_of(i);
+            uint8_t* val = zc ? put_zc.value().data() : put_copy.data();
+            std::memcpy(val, &tag, sizeof(tag));
+            const int rc =
+                zc ? store.put(key_span, put_zc).run_sync()
+                   : store.put(key_span, std::span<const uint8_t>(put_copy))
                          .run_sync();
-            }
             if (rc != 0) {
                 fprintf(stderr, "put failed: i=%lu rc=%d\n",
                         static_cast<unsigned long>(i), rc);
@@ -252,21 +224,20 @@ static int run_compare(uDepot<IO>& store, const BenchConfig& cfg) {
     auto get_batch = [&](uint64_t first, bool zc) -> double {
         const double t0 = now_secs();
         for (uint64_t i = first; i < first + batch; ++i) {
-            set_key(i, key);
-            int rc;
+            key[0] = tag_of(i);
             size_t n = 0;
-            const uint8_t* got;
+            int rc;
             if (zc) {
                 rc = store.get(key_span, &get_zc).run_sync();
                 n = get_zc.value().size();
-                got = get_zc.value().data();
             } else {
                 rc = store.get(key_span, get_copy.data(), vsz, &n).run_sync();
-                got = get_copy.data();
             }
             uint64_t tag = 0;
-            if (rc == 0) std::memcpy(&tag, got, sizeof(tag));
-            if (rc != 0 || n != vsz || tag != tag_of(i)) {
+            if (rc == 0)
+                std::memcpy(&tag, zc ? get_zc.value().data() : get_copy.data(),
+                            sizeof(tag));
+            if (rc != 0 || n != vsz || tag != key[0]) {
                 fprintf(stderr, "get failed: i=%lu rc=%d\n",
                         static_cast<unsigned long>(i), rc);
                 return -1;
@@ -277,8 +248,7 @@ static int run_compare(uDepot<IO>& store, const BenchConfig& cfg) {
     struct Phase {
         std::vector<double> copy, zc, ratio;
     };
-    // The get phase reads back the put phase's keys in the same order, each
-    // checked for the tag its put wrote.
+    // The get phase reads back the put phase's keys in the same order.
     auto phase = [&](auto run_batch, Phase* ph) {
         uint64_t next = 0;
         for (int r = 0; r < cfg.compare_rounds; ++r) {
