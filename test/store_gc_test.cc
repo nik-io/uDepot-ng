@@ -273,12 +273,7 @@ TEST(StoreGcAioTest, ReadsStayCorrectWhileGcRelocates) {
 
 // Regression: a full neighborhood failed the put with ENOSPC; uDepot grows
 // the directory instead. Writers racing the grow must not lose entries.
-class StoreGcResizeModeTest
-    : public StoreGcTest,
-      public ::testing::WithParamInterface<udepot::ResizeMode> {};
-
-TEST_P(StoreGcResizeModeTest, DirectoryGrowsUnderConcurrentPuts) {
-    config_.resize_mode = GetParam();
+TEST_F(StoreGcTest, DirectoryGrowsUnderConcurrentPuts) {
     config_.initial_tables = 1;
     config_.index_bits = 6;  // 64 buckets: full after a few hundred keys
     ASSERT_EQ(store_.open(config_), 0);
@@ -313,116 +308,14 @@ TEST_P(StoreGcResizeModeTest, DirectoryGrowsUnderConcurrentPuts) {
     check();
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    Modes, StoreGcResizeModeTest,
-    ::testing::Values(udepot::ResizeMode::kIncremental,
-                      udepot::ResizeMode::kFreeze),
-    [](const auto& info) {
-        return info.param == udepot::ResizeMode::kFreeze ? "Freeze"
-                                                         : "Incremental";
-    });
-
-// The same with tables of several stripes, so a resize migrates stripe by
-// stripe as puts touch them while gets read through the resizing directory
-// (each slot from the old or the new table). Every key a put has returned
-// for is readable with its value at all times.
-TEST_F(StoreGcTest, IncrementalResizeUnderConcurrentPutsAndGets) {
-    config_.initial_tables = 1;
-    config_.index_bits = 14;  // 4 stripes per table
-    ASSERT_EQ(store_.open(config_), 0);
-    constexpr int kThreads = 4;
-    constexpr int kPerThread = 6000;
-    std::atomic<int> errors{0}, misses{0};
-    std::atomic<int> done[kThreads] = {};
-    std::atomic<bool> stop{false};
-    auto key = [](int t, int i) {
-        return "r" + std::to_string(t) + "_" + std::to_string(i);
-    };
-
-    std::vector<std::thread> threads;
-    for (int t = 0; t < kThreads; ++t) {
-        threads.emplace_back([&, t] {
-            for (int i = 0; i < kPerThread; ++i) {
-                if (store_.put(key(t, i), value_for(i, t, 100)).run_sync() != 0)
-                    errors.fetch_add(1);
-                done[t].store(i + 1, std::memory_order_release);
-            }
-        });
-    }
-    for (int r = 0; r < 2; ++r) {
-        threads.emplace_back([&, r] {
-            for (uint64_t n = r; !stop.load(std::memory_order_relaxed); ++n) {
-                const int t = static_cast<int>(n % kThreads);
-                const int upto = done[t].load(std::memory_order_acquire);
-                if (upto == 0) continue;
-                const int i = static_cast<int>((n * 7919) % upto);
-                if (get_or_empty(store_, key(t, i)) != value_for(i, t, 100))
-                    misses.fetch_add(1);
-            }
-        });
-    }
-    for (int t = 0; t < kThreads; ++t) threads[t].join();
-    stop.store(true);
-    for (size_t t = kThreads; t < threads.size(); ++t) threads[t].join();
-
-    ASSERT_EQ(errors.load(), 0);
-    EXPECT_EQ(misses.load(), 0);
-    EXPECT_GT(store_.directory().num_tables(), 1u);
-    int missing = 0;
-    for (int t = 0; t < kThreads; ++t)
-        for (int i = 0; i < kPerThread; ++i)
-            if (get_or_empty(store_, key(t, i)) != value_for(i, t, 100))
-                ++missing;
-    EXPECT_EQ(missing, 0);
-
-    // Random puts migrate every stripe within a few writes, so reads above
-    // rarely meet a resize in progress. Start one with nothing migrated and
-    // read everything while a slow writer migrates stripe by stripe.
-    ASSERT_EQ(store_.directory().resize(), 0);
-    ASSERT_TRUE(store_.directory().resizing());
-    std::atomic<bool> writing{true};
-    std::thread slow([&] {
-        for (int i = 0; i < 64; ++i) {
-            if (store_.put(key(9, i), value_for(i, 9, 100)).run_sync() != 0)
-                errors.fetch_add(1);
-            std::this_thread::sleep_for(std::chrono::microseconds(500));
-        }
-        writing.store(false);
-    });
-    int passes = 0;
-    while (writing.load() || passes == 0) {
-        for (int t = 0; t < kThreads; ++t)
-            for (int i = 0; i < kPerThread; i += 7)
-                if (get_or_empty(store_, key(t, i)) != value_for(i, t, 100))
-                    misses.fetch_add(1);
-        ++passes;
-    }
-    slow.join();
-    EXPECT_EQ(errors.load(), 0);
-    EXPECT_EQ(misses.load(), 0) << "passes: " << passes;
-
-    reopen();  // close finishes a resize still in progress
-    missing = 0;
-    for (int t = 0; t < kThreads; ++t)
-        for (int i = 0; i < kPerThread; ++i)
-            if (get_or_empty(store_, key(t, i)) != value_for(i, t, 100))
-                ++missing;
-    for (int i = 0; i < 64; ++i)
-        if (get_or_empty(store_, key(9, i)) != value_for(i, 9, 100)) ++missing;
-    EXPECT_EQ(missing, 0);
-}
-
 // A put that finds its table full while running on the AIO poller (where
 // its coroutine resumes after the data write) must not grow the directory
 // there: the grow waits for a grace period, which reads in flight on that
 // same poller hold. It suspends, the waker thread grows, and it retries.
-class StoreGcAioTest : public ::testing::TestWithParam<udepot::ResizeMode> {};
-
-TEST_P(StoreGcAioTest, DirectoryGrowsFromPollerThread) {
+TEST(StoreGcAioTest, DirectoryGrowsFromPollerThread) {
     auto path = std::filesystem::temp_directory_path() /
                 ("udepot_store_grow_aio_" + std::to_string(getpid()));
     StoreConfig config = gc_config(path);
-    config.resize_mode = GetParam();
     config.initial_tables = 1;
     config.index_bits = 6;
     uDepot<AioIO> store;
@@ -467,15 +360,6 @@ TEST_P(StoreGcAioTest, DirectoryGrowsFromPollerThread) {
     store.close();
     std::filesystem::remove(path);
 }
-
-INSTANTIATE_TEST_SUITE_P(
-    Modes, StoreGcAioTest,
-    ::testing::Values(udepot::ResizeMode::kIncremental,
-                      udepot::ResizeMode::kFreeze),
-    [](const auto& info) {
-        return info.param == udepot::ResizeMode::kFreeze ? "Freeze"
-                                                         : "Incremental";
-    });
 
 // Regression: recovery looked at only the first tag-matching entry. With
 // another key of the same tag ahead of it in the neighborhood, a key's

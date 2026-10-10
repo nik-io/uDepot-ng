@@ -240,12 +240,3 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: scripts/perf-zerocopy.sh uring build
-      # Put tail latency while the directory grows from 1 to 32 tables: the
-      # incremental resize's median p95 must be under a quarter of the
-      # freeze-and-copy grow's, open loop, 16 puts in flight per writer
-      # (scripts/perf-resize-latency.sh). About 30 s. Posix only until the
-      # aio completion poller stops serializing stripe migrations.
-      - name: Resize tail latency (posix)
-        if: ${{ !cancelled() }}
-        timeout-minutes: 5
-        run: scripts/perf-resize-latency.sh build

@@ -67,7 +67,7 @@ Quotes below are from the paper; section numbers are the paper's.
   *"the caller decides whether to update an entry in-place or continue the
   search for a free entry where they left off."*
 
-## Resize (§4.3): incremental, no IO
+## Resize (§4.3): incremental, no IO (not adopted)
 
 - The directory grows in powers of two. Only fingerprints are needed to place
   entries, so there is no IO.
@@ -92,15 +92,20 @@ Quotes below are from the paper; section numbers are the paper's.
   snapshot (see PR #3 review, finding 4).
 - Figure 4: lock region r of old table ht0 migrates to the same region r of the
   two new tables ht'00 and ht'10.
-- uDepot-ng status: implemented as above (`src/udepot/directory.{h,cc}`,
-  `docs/architecture.md`), with three agreed additions: a one-grace-period
-  lock handover after a resize finishes (writers on the final snapshot also
-  take the old stripes), on-demand completion by the space waker when a table
-  fills mid-resize (then the next resize starts), and close/recovery
-  finishing a pending resize. As in the paper, only writes migrate regions;
-  the waker does not sweep. The earlier freeze-and-copy grow stays
-  selectable (`ResizeMode::kFreeze`) for comparison. Legacy never finished it (`uDepotDirMapOR`'s
-  shadow directory is the started half).
+- uDepot-ng status: **not implemented, by decision.** uDepot-ng grows with
+  freeze-and-copy (`docs/architecture.md`, "Directory"), as legacy grows with
+  a stop-the-world `uDepotDirectoryMap::grow()`; legacy never finished the
+  incremental resize either (`uDepotDirMapOR`'s shadow directory is the
+  started half). PR #8 implemented it and measured put tail latency while the
+  directory grew 1 -> 32 tables, open loop: incremental won with two writers
+  on posix, but lost to the freeze with one writer (p99 83-89 ms against
+  2-8 ms) and on aio. Two causes: the new tables' first-touch page faults
+  (~216 us per stripe on a cloud VM, ten times the slot copy) land on the
+  writer's put path, where the freeze takes them on the waker before it
+  freezes; and on aio a put's commit, so its migrations, runs on the single
+  completion poller. Fixing both needed more machinery (next tables prepared
+  ahead, migration moved off the poller) for an uncertain benefit, so it was
+  dropped. Revisit only with a measured need.
 
 ## Metadata and persistence (§4.4)
 

@@ -45,12 +45,12 @@ struct BenchConfig {
     // R rounds, each a batch of `ops` copying operations and a batch of
     // `ops` zero-copy ones, in alternating order, against the same store.
     int compare_rounds = 0;
-    // How a full table grows the directory (--resize-mode).
-    udepot::ResizeMode resize_mode = udepot::ResizeMode::kIncremental;
+    // Directory geometry (--initial-tables, --index-bits): small values
+    // make the directory grow during the run.
     uint32_t initial_tables = 4;
     uint32_t index_bits = 14;
     // Record each put's latency and print percentiles (--latency): what a
-    // resize costs writers shows in the tail, not in the throughput.
+    // grow costs writers shows in the tail, not in the throughput.
     bool latency = false;
     // Open loop (--rate): each thread issues puts at this many per second
     // and a put's latency counts from when it was due, not when it was
@@ -58,7 +58,7 @@ struct BenchConfig {
     // slow put, and the puts it would have issued meanwhile are never
     // measured (coordinated omission). 0 = closed loop.
     double rate = 0;
-    // Puts each thread keeps in flight (--qd). A put waiting out a resize
+    // Puts each thread keeps in flight (--qd). A put waiting out a grow
     // then holds one slot, not the thread: the others keep going, and the
     // wait shows as that put's latency and as the puts that queue behind a
     // full window. 1 = one put at a time.
@@ -82,7 +82,7 @@ struct ThreadResult {
 };
 
 // Put latency percentiles over every thread's puts, and the number of puts
-// past 100 us and 1 ms: a resize that stalls writers shows up there.
+// past 100 us and 1 ms: a grow that stalls writers shows up there.
 static void print_put_latency(std::vector<uint32_t> ns) {
     if (ns.empty()) return;
     std::sort(ns.begin(), ns.end());
@@ -392,7 +392,6 @@ static int run_bench(const BenchConfig& cfg) {
     sc.grain_size = cfg.grain_size;
     sc.initial_tables = cfg.initial_tables;
     sc.index_bits = cfg.index_bits;
-    sc.resize_mode = cfg.resize_mode;
     // Every run starts empty: a file is removed between runs, but an SPDK
     // namespace keeps the previous run's store.
     sc.force_destroy = true;
@@ -492,10 +491,8 @@ static void usage() {
         "                 uses the namespace UDEPOT_NVMEF names, whole\n"
         "  --compare <r>  Copy vs zero copy in one store: r rounds of a\n"
         "                 batch of -w ops each way, order alternating\n"
-        "  --resize-mode <m>  incremental (default) or freeze: how a full\n"
-        "                 table grows the directory\n"
         "  --initial-tables <n> --index-bits <b>  Directory geometry\n"
-        "                 (default 4 and 14); small values force resizes\n"
+        "                 (default 4 and 14); small values force grows\n"
         "  --latency      Print put latency percentiles\n"
         "  --rate <n>     Open loop: n puts/s per thread, latency counted\n"
         "                 from each put's due time (with --latency)\n"
@@ -526,17 +523,6 @@ int main(int argc, char* argv[]) {
             cfg.backend = argv[++i];
         } else if (arg == "--compare" && i + 1 < argc) {
             cfg.compare_rounds = std::stoi(argv[++i]);
-        } else if (arg == "--resize-mode" && i + 1 < argc) {
-            std::string m = argv[++i];
-            if (m == "incremental") {
-                cfg.resize_mode = udepot::ResizeMode::kIncremental;
-            } else if (m == "freeze") {
-                cfg.resize_mode = udepot::ResizeMode::kFreeze;
-            } else {
-                fprintf(stderr, "Unknown resize mode: %s\n", m.c_str());
-                usage();
-                return 1;
-            }
         } else if (arg == "--latency") {
             cfg.latency = true;
         } else if (arg == "--put-only") {

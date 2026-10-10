@@ -47,8 +47,9 @@
     paper, or ask**; where both are silent, legacy is the reference. Notable
     consequences already decided: empty values are valid (tombstones need their
     own encoding); the index is flushed to index segments and restored on a
-    clean start, with the log scan only after a crash; resize is incremental
-    per lock region with a shadow directory; PUT writes before it checks, and
+    clean start, with the log scan only after a crash; the directory grows
+    by freeze-and-copy, not the paper's incremental resize (tried in PR #8,
+    dropped: see `docs/udepot-paper.md`, §4.3); PUT writes before it checks, and
     Memcache paths may carry weaker durability than the store.
 
 ## Project Overview
@@ -199,45 +200,6 @@ them), since the device should transfer straight to and from the store's
 buffers. A mutation handing out non-DMA buffers failed it with 75126
 bounces. Paired, zero copy was faster in all 25 SPDK runs measured (PUT
 +0.5 to +7%, GET +1 to +11%).
-
-### Resize tail latency
-
-`scripts/perf-resize-latency.sh` (or `cmake --build build --target
-run_resize_latency_test`) measures put latency while the directory grows
-from 1 to 32 tables, for the incremental resize and the freeze-and-copy grow
-(`ResizeMode::kFreeze`); `NOGROW=1` adds a no-grow baseline. The incremental
-resize exists for the write tail, and the script fails unless its median
-p95 is under a quarter of the freeze's. CI runs it in the perf job, about
-30 s: 3 runs per mode, the order alternating per run.
-
-It runs open loop (`udepot_ng_bench --rate`, latency from each put's due
-time) at 60% of a capacity it measures first, with 16 puts in flight per
-writer (`--qd`), so a put waiting out a resize holds a slot, not its writer.
-A closed loop hides a stall behind the puts a blocked writer never issues
-(coordinated omission): there every percentile below the max was alike in
-all modes. Below ~35% load the freeze's backlog stays under 5% of puts and
-p95 cannot see it either.
-
-Measured, 3 runs on the 4-CPU container: incremental p95 27-314 us, freeze
-478-3,514 us. The run-to-run spread is large, so keep the size: at fewer
-than 1M puts per writer the directory stops at 16 tables, the freeze's last
-copy is short, and the modes overlap. With both modes running the freeze
-(`resize()` always calling `grow_frozen`) the gate failed twice out of two;
-before the order alternated, that mutant came within 3.6x of passing.
-
-**Posix only.** On aio, a put's commit resumes on the store's single
-completion poller, so every stripe migration runs there, one at a time,
-while no writer's completion is delivered (988 of 992 migrations, 57 ms,
-on that thread in one run). The incremental resize's p95 then came out
-above the freeze's (721 us against 233 us). That is a real defect of the
-incremental resize on async backends, not a measurement artifact; it is not
-fixed yet.
-
-p95 does not catch every regression. With the new tables set up eagerly on
-the space waker again, incremental p95 stayed at 109 us here: at these sizes
-that stalls only the writers that meet a full table, under 1% of puts. It
-was the cause of a 223 ms worst put at 4 writers and 2^18-bucket tables;
-look at the maximum too when changing the resize.
 
 ### Performance regression gate
 

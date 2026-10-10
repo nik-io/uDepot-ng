@@ -73,7 +73,7 @@ caller's thread and finishes on an I/O backend's poller. Because only the
 sums matter, that is correct by construction, and each bump is a plain load
 and store on the bumping thread's own slot.
 
-**Writer path** (resize, GC, close):
+**Writer path** (grow, close):
 
 ```cpp
 void synchronize() {
@@ -108,9 +108,9 @@ a reader may still be reading (GC waits a grace period before handing a
 segment back). As in uDepot, the caller orders `close()` after every
 operation: none may race or follow it, so the store keeps no open flag on the
 operation path. The exceptions are waiting for free space (see *Space management*)
-and waiting for a directory resize to start (a full table): an operation
-leaves its section while it waits, so it can never hold up the grace period
-that GC or the resize needs to let it continue.
+and waiting for a directory grow: an operation leaves its section while it
+waits, so it can never hold up the grace period that GC or the grow needs to
+let it continue.
 
 `Rcu::call(fn)` (call_rcu) runs `fn` after a grace period on a reclaimer
 thread, batching callbacks behind one `synchronize()`; `Rcu::barrier()` waits
@@ -154,90 +154,34 @@ timestamp, then grain — otherwise it is rewritten, so recovery always
 reproduces the order writes were acknowledged in.
 
 **Directory.** As in uDepot's `hash_to_map`, a key's table is chosen by the
-top bits of its tag and its bucket by the low bits of its hash. A full table
-doubles the number of tables, incrementally, as the paper's §4.3 describes
-(legacy's `uDepotDirMapOR` prototype was its unfinished first half; legacy
-itself excluded every operation for a whole-directory copy). Nothing stalls
-writers or readers while a resize runs.
+top bits of its tag and its bucket by the low bits of its hash. `grow()`
+doubles the number of tables. Legacy excluded every operation for the grow
+(`rwpflock.write_enter()` + `write_wait_readers()`); uDepot-ng keeps that for
+writers only, using RCU:
 
-- **Geometry.** Old table t splits into new tables 2t and 2t + 1 by the next
-  tag bit, and an entry's bucket does not change, so stripe s of t migrates
-  into stripe s of both, each slot to the same slot of one of them (paper
-  Figure 4). A migration writes only empty slots and moves nothing.
-- **One snapshot.** The resizing snapshot carries the new tables, the old
-  ones, a migrated flag per (old table, stripe) and the paper's remaining
-  counter. Readers and writers load one pointer and see the pair and every
-  stripe's status together (PR #3 review, finding 4).
-- **Start.** A put that finds its table full suspends and asks the space
-  waker to `resize()`. The waker allocates the new tables (the paper's
-  "pre-allocated ... in a separate thread"), marks the old snapshot
-  superseded and publishes the resizing one. A writer still on the old
-  snapshot checks the flag under its stripe locks and retries at once.
-- **Writes.** While resizing, the old table's stripe locks guard both the
-  old and the new slots of their region (as in the paper and legacy). A
-  writer takes the key's one or two old stripes, migrates those not yet
-  migrated (copy, set the flag with release, decrement the counter) and
-  writes the new table. Only writes migrate: a region nothing writes stays
-  in the old table (paper; the waker does not sweep).
-- **Reads.** Lock-free. Each neighborhood slot is read from the new table if
-  its stripe has migrated, else from the old one; the flag is re-read
-  (acquire) when the scan enters the next stripe. A stripe migrates before
-  any write reaches its new slots, and entries still only move up, written
-  before cleared, so a scan never misses an entry. Outside a resize a read
-  costs one more branch.
-- **Finish.** The write that migrates the last stripe publishes the final
-  snapshot (new tables only) and hands the resizing snapshot to
-  `Rcu::call()`.
-- **Handover.** Writers still on the resizing snapshot hold the old stripe
-  locks, so for one grace period after the final snapshot is published its
-  writers take the old stripes too, before their own: two uncontended
-  mutexes per write, once per resize. A grace period later the old tables
-  are freed.
-- **A table full mid-resize.** The writer waits, and the waker finishes the
-  resize on demand (taking each remaining stripe's lock, like any writer)
-  and starts the next; a region nothing writes would otherwise keep the
-  writer waiting indefinitely. Ending a handover early waits for a grace
-  period, which is why this too runs on the waker, never on an I/O poller.
-- **New tables are set up lazily.** The waker only allocates them; each
-  stripe's slots are initialized when it migrates, under its lock, before
-  its flag is set (nothing reads or writes a stripe's new slots earlier).
-  Initializing them all up front took the waker 223 ms at 32 tables of
-  2^18 buckets, and every writer whose table was full waited for it: the
-  incremental resize's worst put was no better than the freeze's.
-- **Close and recovery** finish a pending resize first: the index is
-  persisted as one geometry, and recovery grows inline, alone.
+1. Set the snapshot's `frozen` flag. A writer checks it under its stripe
+   lock, inside its read section, and backs off if set.
+2. `synchronize()`: every writer that missed the flag has finished, so its
+   write is in the old tables, and none can start.
+3. Copy live and deleted entries into the new tables, holding no lock.
+4. Publish the new snapshot and wake the writers that backed off; they
+   retry on it.
+5. Free the old snapshot with `Rcu::call()` (call_rcu): once a grace period
+   has passed, on the RCU reclaimer thread, off the grow path.
 
-**Measured** (`scripts/perf-resize-latency.sh`): put latency with the
-directory growing 1 -> 32 tables of 2^17 buckets, 2 writers issuing puts
-open loop at 60% of measured capacity, latency counted from each put's due
-time. Medians of 5 runs: p95 655 us incremental, 23,163 us freeze, 131 us
-with no grow; p99 5.0, 51.2 and 1.7 ms. The freeze stalls writers for its
-whole copy (10 waits totalling 202 ms in one run); the incremental resize
-never makes a writer wait for the waker (5 waits, 1.6 ms in all, longest
-0.48 ms). What remains above the no-grow baseline is the migration work:
-~60 us per stripe (copy 4,097 slots, set up both new stripes), 992 per run,
-60 ms in all against the freeze's 202 ms of stalls, but bunched, because
-random keys touch every stripe within a few hundred puts of a resize
-starting. At ~35% load the incremental resize's p95 matched the baseline.
-A closed loop cannot show any of this below the maximum: a stalled writer
-records one slow put, and the puts it would have issued are never measured.
+Readers never block: they keep reading the frozen tables during the copy.
+Grow is rare, so ordinary writes pay only a flag load under their stripe lock.
+Because `grow()` waits for a grace period it never runs inside a read section
+or on an I/O poller thread (which in-flight reads may be waiting on): a
+writer that finds its table full leaves its section and suspends, and the
+store's waker thread runs the grow.
 
-On aio this does not hold yet. A put's commit, and so any stripe migration
-it does, resumes on the store's single completion poller: the migrations
-that two posix writers share run there one after another, and every
-writer's completions wait behind them. With 16 puts in flight per writer
-the incremental resize's p95 was 721 us against the freeze's 233 us, whose
-copy runs on the waker, off the completion path. The CI gate
-(`scripts/perf-resize-latency.sh`, 16 in flight per writer) runs on posix
-until that is fixed.
-
-`StoreConfig::resize_mode = ResizeMode::kFreeze` keeps the earlier
-mechanism, to compare against (`udepot_ng_bench --resize-mode freeze`):
-the waker sets the snapshot's `frozen` flag, which writers check under their
-stripe locks and back off on, waits a grace period, copies every table into
-the doubled directory and publishes it. Readers carry on throughout; writers
-wait out the whole copy. It is uDepot's `rwpflock` exclusion, for writers
-only.
+Writers stall for the whole copy, which grows with the index (tens of ms
+from 16 to 32 tables of 2^17 slots). The paper's incremental resize (§4.3)
+would spread it over the writes; it was implemented and measured, and
+dropped (`docs/udepot-paper.md`, §4.3). `udepot_ng_bench --latency --rate
+--qd` measures put latency through grows (`--initial-tables 1` and a small
+`--index-bits` force them).
 
 ### 3. Eager-Start C++23 Coroutines
 
@@ -690,8 +634,8 @@ decides, as the paper says: *"the persistent source of truth is the log"*.
   back to the log scan on its next open. Holding a segment per table only
   costs the index's size when a table fills its segment, as uDepot sizes
   them; uDepot-ng sizes tables by `index_bits` instead, so a small table
-  would hold a whole segment. The incremental resize kept the table
-  geometry, so this is still open.
+  would hold a whole segment. This waits for the resize work, which
+  revisits table geometry.
 
 ## Implementation Order
 

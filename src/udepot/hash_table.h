@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -11,7 +10,6 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
-#include <utility>
 #include <vector>
 
 #include "udepot/hash_entry.h"
@@ -41,16 +39,6 @@ public:
 
     // Construct a hash table with 2^index_bits buckets.
     explicit HashTable(uint32_t index_bits);
-
-    // As above, with the slots left uninitialized (untouched memory): a
-    // resize's new table, whose stripes nothing reads or writes until they
-    // migrate. init_stripe() sets a stripe's slots up, before its migration
-    // copies into it. Initializing a whole directory's new tables up front
-    // took the space waker 223 ms at 32 tables of 2^18 buckets, and every
-    // writer whose table was full waited for it.
-    struct Uninitialized {};
-    HashTable(uint32_t index_bits, Uninitialized);
-    void init_stripe(uint64_t stripe) noexcept;
     ~HashTable();
 
     HashTable(const HashTable&) = delete;
@@ -77,57 +65,7 @@ public:
         std::unique_lock<std::mutex> first_;
         std::unique_lock<std::mutex> second_;
     };
-    WriteLock lock_for(uint64_t hash) {
-        auto [first, last] = stripes_for(hash);
-        return lock_stripes(first, last);
-    }
-
-    // The stripes a write for `hash` locks: [first, last], last == first or
-    // first + 1. Tables with the same index_bits share stripe geometry, so
-    // a resize locks the same stripes in the old and the new tables.
-    std::pair<uint64_t, uint64_t> stripes_for(uint64_t hash) const noexcept;
-    WriteLock lock_stripes(uint64_t first, uint64_t last);
-
-    uint64_t stripe_of_slot(uint64_t idx) const noexcept {
-        return idx / slots_per_stripe_;
-    }
-    uint64_t stripe_begin(uint64_t stripe) const noexcept {
-        return stripe * slots_per_stripe_;
-    }
-    uint64_t stripe_end(uint64_t stripe) const noexcept {
-        return std::min((stripe + 1) * slots_per_stripe_, total_slots());
-    }
-    uint64_t bucket_of(uint64_t hash) const noexcept {
-        return hash_to_bucket(hash);
-    }
-
-    // The scans behind lookup() and entry_at(), with each neighborhood slot
-    // read through slot(idx) (acquire). A resizing directory reads each
-    // slot from the old or the new table, by its stripe's migration.
-    template <typename SlotFn>
-    static HashEntry scan(uint64_t bucket, uint8_t tag, uint32_t start_offset,
-                          bool include_deleted, SlotFn&& slot) {
-        for (uint32_t i = start_offset; i < HashEntry::kHopRange; ++i) {
-            HashEntry entry = slot(bucket + i);
-            if (entry.empty()) continue;
-            if (entry.bucket_offset() != i) continue;
-            if (entry.key_tag() != tag) continue;
-            if (entry.deleted() && !include_deleted) continue;
-            return entry;
-        }
-        return HashEntry{};
-    }
-    template <typename SlotFn>
-    static HashEntry scan_pba(uint64_t bucket, uint8_t tag, uint64_t pba,
-                              SlotFn&& slot) {
-        for (uint32_t i = 0; i < HashEntry::kHopRange; ++i) {
-            HashEntry entry = slot(bucket + i);
-            if (!entry.empty() && entry.bucket_offset() == i &&
-                entry.key_tag() == tag && entry.pba() == pba)
-                return entry;
-        }
-        return HashEntry{};
-    }
+    WriteLock lock_for(uint64_t hash);
 
     // Insert a live entry. Returns 0, or -1 if no free slot is within reach
     // (the directory needs to grow).
@@ -158,17 +96,13 @@ public:
     uint64_t num_buckets() const noexcept { return num_buckets_; }
     uint64_t num_stripes() const noexcept { return num_stripes_; }
 
-    // Direct slot access: persisting and restoring the index, and
-    // migrating a stripe during a resize.
-    HashEntry load_slot(uint64_t idx, std::memory_order order =
-                                          std::memory_order_relaxed) const
-        noexcept {
-        return HashEntry::load(slots_[idx], order);
+    // Direct slot access for directory rehash during grow.
+    HashEntry load_slot(uint64_t idx) const noexcept {
+        return HashEntry::load(slots_[idx], std::memory_order_relaxed);
     }
 
-    // Set a slot's raw entry: restoring a persisted table (nothing reads or
-    // writes it meanwhile), or migrating a stripe into it during a resize
-    // (published to readers by the stripe's migrated flag).
+    // Set a slot's raw entry, when restoring a persisted table. Nothing
+    // may read or write the table meanwhile.
     void restore_slot(uint64_t idx, uint64_t raw) noexcept {
         slots_[idx].store(raw, std::memory_order_relaxed);
     }
@@ -188,14 +122,7 @@ private:
     uint64_t num_stripes_;
     uint64_t slots_per_stripe_;
 
-    // Raw storage: each slot's lifetime starts when it is set to empty, by
-    // the constructor or init_stripe().
-    struct SlotsDeleter {
-        void operator()(std::atomic<uint64_t>* p) const noexcept {
-            ::operator delete(p, std::align_val_t{64});
-        }
-    };
-    std::unique_ptr<std::atomic<uint64_t>[], SlotsDeleter> slots_;
+    std::unique_ptr<std::atomic<uint64_t>[]> slots_;
     std::unique_ptr<Stripe[]> stripes_;
 
     uint64_t hash_to_bucket(uint64_t hash) const noexcept {
