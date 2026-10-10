@@ -16,7 +16,7 @@
 
 using udepot::PosixIO;
 using udepot::StoreConfig;
-using udepot::UDepot;
+using udepot::uDepot;
 
 static constexpr size_t kStoreSize = 4 * 1024 * 1024;
 
@@ -40,7 +40,7 @@ protected:
     }
 
     void TearDown() override {
-        UDepot<PosixIO>::index_footer_test_hook = nullptr;
+        uDepot<PosixIO>::index_footer_test_hook = nullptr;
         std::filesystem::remove(path_);
         std::filesystem::remove(crash_path());
     }
@@ -55,7 +55,7 @@ protected:
         return path_.string() + ".crash";
     }
 
-    void end_session(UDepot<PosixIO>& store) {
+    void end_session(uDepot<PosixIO>& store) {
         if (GetParam() == Shutdown::kClean) {
             store.close();
             return;
@@ -64,7 +64,7 @@ protected:
     }
 
     // The device as it is now, whatever close() writes after.
-    void crash(UDepot<PosixIO>& store) {
+    void crash(uDepot<PosixIO>& store) {
         const auto overwrite = std::filesystem::copy_options::overwrite_existing;
         std::filesystem::copy_file(path_, crash_path(), overwrite);
         store.close();
@@ -92,7 +92,7 @@ TEST_P(StoreRecoveryTest, DataSurvivesReopen) {
     constexpr int kKeys = 100;
 
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         for (int i = 0; i < kKeys; ++i) {
             ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0)
@@ -103,7 +103,7 @@ TEST_P(StoreRecoveryTest, DataSurvivesReopen) {
 
     {
         StoreConfig cfg = reopen_config();
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(cfg), 0);
 
         for (int i = 0; i < kKeys; ++i) {
@@ -124,7 +124,7 @@ TEST_P(StoreRecoveryTest, DeletedKeysStayDeletedAfterRecovery) {
     constexpr int kKeys = 40;
 
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         for (int i = 0; i < kKeys; ++i)
             ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
@@ -137,7 +137,7 @@ TEST_P(StoreRecoveryTest, DeletedKeysStayDeletedAfterRecovery) {
 
     {
         StoreConfig cfg = reopen_config();
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(cfg), 0);
 
         for (int i = 0; i < kKeys; ++i) {
@@ -164,7 +164,7 @@ TEST_P(StoreRecoveryTest, UpsertedKeysHaveNewestValueAfterRecovery) {
     constexpr int kKeys = 30;
 
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
 
         for (int i = 0; i < kKeys; ++i)
@@ -180,7 +180,7 @@ TEST_P(StoreRecoveryTest, UpsertedKeysHaveNewestValueAfterRecovery) {
 
     {
         StoreConfig cfg = reopen_config();
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(cfg), 0);
 
         for (int i = 0; i < kKeys; ++i) {
@@ -201,14 +201,14 @@ TEST_P(StoreRecoveryTest, UpsertedKeysHaveNewestValueAfterRecovery) {
 
 TEST_P(StoreRecoveryTest, RecoveryOnEmptyStoreSucceeds) {
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         end_session(store);
     }
 
     {
         StoreConfig cfg = reopen_config();
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(cfg), 0);
 
         uint8_t val[128];
@@ -223,7 +223,7 @@ TEST_P(StoreRecoveryTest, ForceDestroyIgnoresExistingData) {
     constexpr int kKeys = 20;
 
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         for (int i = 0; i < kKeys; ++i)
             ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
@@ -231,7 +231,7 @@ TEST_P(StoreRecoveryTest, ForceDestroyIgnoresExistingData) {
     }
 
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
 
         for (int i = 0; i < kKeys; ++i) {
@@ -249,7 +249,7 @@ TEST_P(StoreRecoveryTest, RecoveryWithManyKeys) {
     constexpr int kKeys = 500;
 
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         for (int i = 0; i < kKeys; ++i)
             ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
@@ -258,7 +258,7 @@ TEST_P(StoreRecoveryTest, RecoveryWithManyKeys) {
 
     {
         StoreConfig cfg = reopen_config();
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(cfg), 0);
 
         int found = 0;
@@ -284,7 +284,7 @@ TEST_P(StoreRecoveryTest, NewWritesAfterRecoveryWork) {
     constexpr int kNewKeys = 20;
 
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         for (int i = 0; i < kKeys; ++i)
             ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
@@ -293,7 +293,7 @@ TEST_P(StoreRecoveryTest, NewWritesAfterRecoveryWork) {
 
     {
         StoreConfig cfg = reopen_config();
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(cfg), 0);
 
         for (int i = kKeys; i < kKeys + kNewKeys; ++i)
@@ -313,7 +313,7 @@ TEST_P(StoreRecoveryTest, NewWritesAfterRecoveryWork) {
     }
 }
 
-static std::string get_value(UDepot<PosixIO>& store, const std::string& key) {
+static std::string get_value(uDepot<PosixIO>& store, const std::string& key) {
     uint8_t val[256];
     size_t n = 0;
     int rc = store.get(key, val, sizeof(val), &n).run_sync();
@@ -328,7 +328,7 @@ static std::string get_value(UDepot<PosixIO>& store, const std::string& key) {
 // and they may come back, which the paper accepts.
 TEST_P(StoreRecoveryTest, RejectedConditionalPutsAfterReopen) {
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         ASSERT_EQ(store.put("exists", "first").run_sync(), 0);
         ASSERT_EQ(store.put("exists", "rejected", udepot::PutMode::kCreate)
@@ -346,7 +346,7 @@ TEST_P(StoreRecoveryTest, RejectedConditionalPutsAfterReopen) {
         end_session(store);
     }
 
-    UDepot<PosixIO> store;
+    uDepot<PosixIO> store;
     ASSERT_EQ(store.open(reopen_config()), 0);
     if (GetParam() == Shutdown::kClean) {
         EXPECT_EQ(get_value(store, "exists"), "first");
@@ -367,7 +367,7 @@ TEST_P(StoreRecoveryTest, RejectedConditionalPutsAfterReopen) {
 TEST_P(StoreRecoveryTest, TombstonesSurviveReopenAndChurn) {
     constexpr int kKeys = 300;
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         for (int i = 0; i < kKeys; ++i)
             ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
@@ -376,7 +376,7 @@ TEST_P(StoreRecoveryTest, TombstonesSurviveReopenAndChurn) {
         end_session(store);
     }
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(reopen_config()), 0);
         for (int i = 0; i < kKeys; ++i)
             ASSERT_EQ(get_value(store, make_key(i)),
@@ -392,7 +392,7 @@ TEST_P(StoreRecoveryTest, TombstonesSurviveReopenAndChurn) {
             ASSERT_EQ(store.del(make_key(i)).run_sync(), 0);
         end_session(store);
     }
-    UDepot<PosixIO> store;
+    uDepot<PosixIO> store;
     ASSERT_EQ(store.open(reopen_config()), 0);
     for (int i = 0; i < kKeys; ++i)
         EXPECT_EQ(get_value(store, make_key(i)),
@@ -408,7 +408,7 @@ TEST_P(StoreRecoveryTest, GrownDirectorySurvivesReopen) {
     constexpr int kKeys = 1500;
     uint32_t tables = 0;
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         for (int i = 0; i < kKeys; ++i)
             ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
@@ -416,7 +416,7 @@ TEST_P(StoreRecoveryTest, GrownDirectorySurvivesReopen) {
         ASSERT_GT(tables, 2u);
         end_session(store);
     }
-    UDepot<PosixIO> store;
+    uDepot<PosixIO> store;
     ASSERT_EQ(store.open(reopen_config()), 0);
     if (GetParam() == Shutdown::kClean) {
         EXPECT_EQ(store.directory().num_tables(), tables);
@@ -432,7 +432,7 @@ TEST_P(StoreRecoveryTest, TableLargerThanASegmentSurvivesReopen) {
     config_.segment_size = 2048;  // 1 MiB: a 2^18-bucket table needs three
     config_.index_bits = 18;
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         for (int i = 0; i < 200; ++i)
             ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
@@ -440,7 +440,7 @@ TEST_P(StoreRecoveryTest, TableLargerThanASegmentSurvivesReopen) {
                       .run_sync(), -EEXIST);
         end_session(store);
     }
-    UDepot<PosixIO> store;
+    uDepot<PosixIO> store;
     ASSERT_EQ(store.open(reopen_config()), 0);
     for (int i = (GetParam() == Shutdown::kClean ? 0 : 1); i < 200; ++i)
         ASSERT_EQ(get_value(store, make_key(i)), make_val(i)) << make_key(i);
@@ -456,7 +456,7 @@ TEST_P(StoreRecoveryTest, DeviceMetadataSurvivesAFullDevice) {
     config_.segment_size = 256;  // 128 KiB: divides the 4 MiB store exactly
     constexpr int kKeys = 200;
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         for (int round = 0; round < 40; ++round)
             for (int i = 0; i < kKeys; ++i)
@@ -464,7 +464,7 @@ TEST_P(StoreRecoveryTest, DeviceMetadataSurvivesAFullDevice) {
                               .run_sync(), 0);
         end_session(store);
     }
-    UDepot<PosixIO> store;
+    uDepot<PosixIO> store;
     ASSERT_EQ(store.open(reopen_config()), 0);
     for (int i = 0; i < kKeys; ++i)
         ASSERT_EQ(get_value(store, make_key(i)), make_val(i + 39 * kKeys))
@@ -494,20 +494,20 @@ TEST_P(StoreIndexTest, RecreatedStoreDoesNotRecoverTheOldStoresRecords) {
     config_.segment_size = 2048;  // 1 MiB
     const std::string big(3000, 'o');
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         for (int i = 0; i < 5000; ++i)
             ASSERT_EQ(store.put("old" + std::to_string(i), big).run_sync(), 0);
         store.close();
     }
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);  // force_destroy: a new store
         for (int i = 0; i < 200; ++i)
             ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
         crash(store);
     }
-    UDepot<PosixIO> store;
+    uDepot<PosixIO> store;
     ASSERT_EQ(store.open(reopen_config()), 0);
     int resurrected = 0;
     for (int i = 0; i < 5000; ++i)
@@ -531,7 +531,7 @@ TEST_P(StoreIndexTest, RestoredIndexIsNotRestoredAgainAfterACrash) {
     constexpr int kKeys = 2000;
     const std::string big(1500, 'v');
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
         for (int round = 0; round < 15; ++round)
             for (int i = 0; i < kKeys; ++i)
@@ -541,14 +541,14 @@ TEST_P(StoreIndexTest, RestoredIndexIsNotRestoredAgainAfterACrash) {
         store.close();
     }
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(reopen_config()), 0);
         ASSERT_EQ(get_value(store, "k"), "before");
         ASSERT_EQ(store.put("k", "after").run_sync(), 0);
         ASSERT_EQ(store.put("new", "after").run_sync(), 0);
         crash(store);
     }
-    UDepot<PosixIO> store;
+    uDepot<PosixIO> store;
     ASSERT_EQ(store.open(reopen_config()), 0);
     EXPECT_EQ(get_value(store, "k"), "after");
     EXPECT_EQ(get_value(store, "new"), "after");
@@ -560,9 +560,9 @@ TEST_P(StoreIndexTest, RestoredIndexIsNotRestoredAgainAfterACrash) {
 TEST_P(StoreIndexTest, IncompleteIndexFallsBackToTheLog) {
     static int footers;
     footers = 0;
-    UDepot<PosixIO>::index_footer_test_hook = [] { return footers++ < 1; };
+    uDepot<PosixIO>::index_footer_test_hook = [] { return footers++ < 1; };
     {
-        UDepot<PosixIO> store;
+        uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);  // two tables: two footers
         for (int i = 0; i < 100; ++i)
             ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
@@ -570,10 +570,10 @@ TEST_P(StoreIndexTest, IncompleteIndexFallsBackToTheLog) {
                       .run_sync(), -EEXIST);
         store.close();
     }
-    UDepot<PosixIO>::index_footer_test_hook = nullptr;
+    uDepot<PosixIO>::index_footer_test_hook = nullptr;
     ASSERT_EQ(footers, 2);
 
-    UDepot<PosixIO> store;
+    uDepot<PosixIO> store;
     ASSERT_EQ(store.open(reopen_config()), 0);
     for (int i = 1; i < 100; ++i)
         ASSERT_EQ(get_value(store, make_key(i)), make_val(i)) << make_key(i);

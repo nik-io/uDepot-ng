@@ -16,7 +16,7 @@
 
 using udepot::SpdkIO;
 using udepot::StoreConfig;
-using udepot::UDepot;
+using udepot::uDepot;
 
 class SpdkStoreTest : public ::testing::Test {
 protected:
@@ -45,7 +45,7 @@ protected:
     }
 
     StoreConfig config_;
-    UDepot<SpdkIO> store_;
+    uDepot<SpdkIO> store_;
 };
 
 TEST_F(SpdkStoreTest, PutThenGetReturnsValue) {
@@ -165,7 +165,7 @@ std::string value_for(int key, int round, size_t len) {
     return v;
 }
 
-std::string get_or_empty(UDepot<SpdkIO>& store, const std::string& key,
+std::string get_or_empty(uDepot<SpdkIO>& store, const std::string& key,
                          size_t max) {
     std::string out(max, '\0');
     size_t n = 0;

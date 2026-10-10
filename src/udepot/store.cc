@@ -56,7 +56,7 @@ static constexpr uint32_t kGlobalSeed = 0xDEADBEEF;
 // own identity. A record left on the device by an earlier store, whose
 // timestamps restart from the same values, then fails it.
 template <typename IO>
-uint16_t UDepot<IO>::compute_crc16(const KvHeader& hdr) const {
+uint16_t uDepot<IO>::compute_crc16(const KvHeader& hdr) const {
     uint32_t crc = crc32_update(static_cast<uint32_t>(hdr.timestamp),
                                 reinterpret_cast<const uint8_t*>(&hdr),
                                 sizeof(hdr));
@@ -66,7 +66,7 @@ uint16_t UDepot<IO>::compute_crc16(const KvHeader& hdr) const {
 }
 
 template <typename IO>
-uint32_t UDepot<IO>::compute_crc32(
+uint32_t uDepot<IO>::compute_crc32(
     uint32_t seed, const uint8_t* data, size_t len) {
     uint32_t crc = crc32_update(seed, data, len);
     return crc32_update(crc, reinterpret_cast<const uint8_t*>(&kGlobalSeed),
@@ -74,10 +74,10 @@ uint32_t UDepot<IO>::compute_crc32(
 }
 
 template <typename IO>
-UDepot<IO>::UDepot() = default;
+uDepot<IO>::uDepot() = default;
 
 template <typename IO>
-UDepot<IO>::~UDepot() { close(); }
+uDepot<IO>::~uDepot() { close(); }
 
 static inline uint64_t align_up(uint64_t val, uint64_t align) {
     return (val + align - 1) / align * align;
@@ -86,7 +86,7 @@ static inline uint64_t align_up(uint64_t val, uint64_t align) {
 // ── Device / segment metadata ──────────────────────────────────────────────
 
 template <typename IO>
-uint64_t UDepot<IO>::dev_md_grain_offset() const {
+uint64_t uDepot<IO>::dev_md_grain_offset() const {
     uint64_t md_grains = align_up(sizeof(salsa::salsa_dev_md), grain_size_) /
                          grain_size_;
     return total_grains_ - md_grains;
@@ -94,7 +94,7 @@ uint64_t UDepot<IO>::dev_md_grain_offset() const {
 
 template <typename IO>
 template <typename Start>
-auto UDepot<IO>::run_internal(Start&& start) {
+auto uDepot<IO>::run_internal(Start&& start) {
     for (;;) {
         auto r = start().run_sync();
         if (r != -EAGAIN) return r;
@@ -104,7 +104,7 @@ auto UDepot<IO>::run_internal(Start&& start) {
 }
 
 template <typename IO>
-int UDepot<IO>::persist_dev_md() {
+int uDepot<IO>::persist_dev_md() {
     salsa::salsa_dev_md md{};
     md.physical_size = static_cast<u64>(total_grains_ * grain_size_);
     md.logical_size = md.physical_size;
@@ -128,7 +128,7 @@ int UDepot<IO>::persist_dev_md() {
 }
 
 template <typename IO>
-bool UDepot<IO>::validate_dev_md(salsa::salsa_dev_md* md_out) {
+bool uDepot<IO>::validate_dev_md(salsa::salsa_dev_md* md_out) {
     size_t aligned = align_up(sizeof(salsa::salsa_dev_md), grain_size_);
     IoBuffer buf = io_.alloc_buffer(aligned);
     if (!buf.data) return false;
@@ -155,7 +155,7 @@ bool UDepot<IO>::validate_dev_md(salsa::salsa_dev_md* md_out) {
 }
 
 template <typename IO>
-int UDepot<IO>::persist_seg_md(uint64_t grain_start, uint64_t timestamp,
+int uDepot<IO>::persist_seg_md(uint64_t grain_start, uint64_t timestamp,
                                uint8_t ctlr_type) {
     salsa::salsa_seg_md md{};
     md.segment_size = static_cast<u64>(get_seg_size());
@@ -183,7 +183,7 @@ int UDepot<IO>::persist_seg_md(uint64_t grain_start, uint64_t timestamp,
 }
 
 template <typename IO>
-bool UDepot<IO>::validate_seg_md(const salsa::salsa_seg_md& md) const {
+bool uDepot<IO>::validate_seg_md(const salsa::salsa_seg_md& md) const {
     if (md.seed != seed_) return false;
     if (md.segment_size != static_cast<u64>(get_seg_size())) return false;
     if (md.grain_size != grain_size_) return false;
@@ -197,7 +197,7 @@ bool UDepot<IO>::validate_seg_md(const salsa::salsa_seg_md& md) const {
 }
 
 template <typename IO>
-bool UDepot<IO>::read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md) {
+bool uDepot<IO>::read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md) {
     uint64_t md_grain = seg_base + get_seg_size() - seg_md_grains_;
     size_t md_bytes = static_cast<size_t>(seg_md_grains_) * grain_size_;
     IoBuffer md_buf = io_.alloc_buffer(md_bytes);
@@ -212,7 +212,7 @@ bool UDepot<IO>::read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md) {
 // ── Crash recovery ─────────────────────────────────────────────────────────
 
 template <typename IO>
-int UDepot<IO>::recover_record(uint64_t hash, std::span<const uint8_t> key,
+int uDepot<IO>::recover_record(uint64_t hash, std::span<const uint8_t> key,
                                uint64_t grain, uint16_t kv_grains,
                                bool tombstone) {
     // Same lookup as a put or del (legacy try_restore_entry ran
@@ -262,7 +262,7 @@ int UDepot<IO>::recover_record(uint64_t hash, std::span<const uint8_t> key,
 }
 
 template <typename IO>
-int UDepot<IO>::read_segment(uint64_t grain, uint64_t grains, IoBuffer& buf) {
+int uDepot<IO>::read_segment(uint64_t grain, uint64_t grains, IoBuffer& buf) {
     size_t bytes = static_cast<size_t>(grains) * grain_size_;
     if (!buf.data || buf.capacity < bytes) {
         buf = io_.alloc_buffer(bytes);
@@ -282,7 +282,7 @@ int UDepot<IO>::read_segment(uint64_t grain, uint64_t grains, IoBuffer& buf) {
 }
 
 template <typename IO>
-int UDepot<IO>::crash_recovery() {
+int uDepot<IO>::crash_recovery() {
     uint64_t seg_size = get_seg_size();
     uint64_t data_grains = seg_size - seg_md_grains_;
     uint64_t max_timestamp = 0;
@@ -428,7 +428,7 @@ bool same_identity(const IndexHdr& h, const T& f) {
 // timestamp (uDepot: checksum32(ts, ...)).
 template <typename IO>
 template <typename T>
-uint32_t UDepot<IO>::index_md_csum(const T& md) const {
+uint32_t uDepot<IO>::index_md_csum(const T& md) const {
     T copy = md;
     copy.csum = 0;
     return compute_crc32(static_cast<uint32_t>(seed_ ^ md.ts ^ (md.ts >> 32)),
@@ -436,7 +436,7 @@ uint32_t UDepot<IO>::index_md_csum(const T& md) const {
 }
 
 template <typename IO>
-void UDepot<IO>::index_seg_md_callback(uint64_t md_grain) {
+void uDepot<IO>::index_seg_md_callback(uint64_t md_grain) {
     // Whatever this segment held is about to be overwritten: no record in
     // it can come back.
     uint64_t seg_idx = scm_->grain_to_seg_idx(md_grain);
@@ -454,7 +454,7 @@ void UDepot<IO>::index_seg_md_callback(uint64_t md_grain) {
 // device GC cannot free a segment of, close() would hang. Retry for a while
 // instead; giving up costs only a log scan at the next open.
 template <typename IO>
-int UDepot<IO>::allocate_index_segment(uint64_t net_grains, u64* grain) {
+int uDepot<IO>::allocate_index_segment(uint64_t net_grains, u64* grain) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
     for (;;) {
@@ -466,7 +466,7 @@ int UDepot<IO>::allocate_index_segment(uint64_t net_grains, u64* grain) {
 }
 
 template <typename IO>
-int UDepot<IO>::flush_index() {
+int uDepot<IO>::flush_index() {
     DirSnapshot& snap = directory_->snapshot();
     const uint64_t net_grains = get_seg_size() - seg_md_grains_;
     const size_t net_bytes = static_cast<size_t>(net_grains) * grain_size_;
@@ -572,7 +572,7 @@ int UDepot<IO>::flush_index() {
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::tombstone_grains(uint64_t pba, uint64_t seg_ts,
+CoroTask<int> uDepot<IO>::tombstone_grains(uint64_t pba, uint64_t seg_ts,
                                            uint64_t* grains) {
     IoBuffer buf = io_.alloc_buffer(grain_size_);
     if (!buf.data) co_return -ENOMEM;
@@ -588,7 +588,7 @@ CoroTask<int> UDepot<IO>::tombstone_grains(uint64_t pba, uint64_t seg_ts,
 }
 
 template <typename IO>
-int UDepot<IO>::restore_index(bool* restored) {
+int uDepot<IO>::restore_index(bool* restored) {
     *restored = false;
     const uint64_t seg_size = get_seg_size();
     const uint64_t net_grains = seg_size - seg_md_grains_;
@@ -814,7 +814,7 @@ int UDepot<IO>::restore_index(bool* restored) {
 }
 
 template <typename IO>
-int UDepot<IO>::open(const StoreConfig& config) {
+int uDepot<IO>::open(const StoreConfig& config) {
     grain_size_ = config.grain_size;
 
     if constexpr (requires { io_.set_queue_depth(config.queue_depth); })
@@ -1006,7 +1006,7 @@ int UDepot<IO>::open(const StoreConfig& config) {
     // but a get that found a record there before the overwrite may still be
     // about to read it. Hold the segment back a grace period, as
     // gc_callback does for the segments it cleans.
-    scm_->set_defer_free_seg(&UDepot::defer_free_seg, this);
+    scm_->set_defer_free_seg(&uDepot::defer_free_seg, this);
 
     rc = scm_->init_threads();
     if (rc != 0) return fail(-rc);
@@ -1015,12 +1015,12 @@ int UDepot<IO>::open(const StoreConfig& config) {
         std::lock_guard<std::mutex> lock(space_mu_);
         space_stop_ = false;
     }
-    space_waker_ = std::thread(&UDepot::space_waker_loop, this);
+    space_waker_ = std::thread(&uDepot::space_waker_loop, this);
     return 0;
 }
 
 template <typename IO>
-void UDepot<IO>::close() {
+void uDepot<IO>::close() {
     // As uDepot's shutdown(): no operation may be in progress or start
     // (store.h), so none is waiting for space or a grow either.
     stop_space_waker();
@@ -1065,7 +1065,7 @@ void UDepot<IO>::close() {
 }
 
 template <typename IO>
-int UDepot<IO>::try_allocate_grains(uint64_t count, uint64_t* grain) {
+int uDepot<IO>::try_allocate_grains(uint64_t count, uint64_t* grain) {
     u64 grain_out = 0;
     int rc = salsa::SalsaCtlr::allocate_grains_no_wait(
         static_cast<u64>(count), &grain_out);
@@ -1084,7 +1084,7 @@ int UDepot<IO>::try_allocate_grains(uint64_t count, uint64_t* grain) {
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::allocate_or_wait(
+CoroTask<int> uDepot<IO>::allocate_or_wait(
     uint64_t count, uint64_t* grain, std::optional<Rcu::ReadGuard>& guard,
     KeyProbe* probe) {
     for (;;) {
@@ -1098,7 +1098,7 @@ CoroTask<int> UDepot<IO>::allocate_or_wait(
 }
 
 template <typename IO>
-bool UDepot<IO>::SpaceWait::await_suspend(std::coroutine_handle<> h) {
+bool uDepot<IO>::SpaceWait::await_suspend(std::coroutine_handle<> h) {
     std::lock_guard<std::mutex> lock(store->space_mu_);
     assert(!store->space_stop_);  // no operation may race close()
     if (grow != Directory::kAnyGeneration)
@@ -1110,7 +1110,7 @@ bool UDepot<IO>::SpaceWait::await_suspend(std::coroutine_handle<> h) {
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::wait_for_grow(uint64_t gen, bool grow,
+CoroTask<int> uDepot<IO>::wait_for_grow(uint64_t gen, bool grow,
                                         std::optional<Rcu::ReadGuard>& guard,
                                         KeyProbe* probe) {
     // The grow waits for read sections, so leave ours first.
@@ -1123,7 +1123,7 @@ CoroTask<int> UDepot<IO>::wait_for_grow(uint64_t gen, bool grow,
 
 // Resume every waiter, with space_mu_ released. Called with it held.
 template <typename IO>
-void UDepot<IO>::resume_waiters(std::unique_lock<std::mutex>& lock) {
+void uDepot<IO>::resume_waiters(std::unique_lock<std::mutex>& lock) {
     auto waiters = std::move(space_waiters_);
     space_waiters_.clear();
     lock.unlock();
@@ -1135,7 +1135,7 @@ void UDepot<IO>::resume_waiters(std::unique_lock<std::mutex>& lock) {
 }
 
 template <typename IO>
-void UDepot<IO>::space_waker_loop() {
+void uDepot<IO>::space_waker_loop() {
     std::unique_lock<std::mutex> lock(space_mu_);
     while (!space_stop_) {
         if (grow_request_) {
@@ -1167,7 +1167,7 @@ void UDepot<IO>::space_waker_loop() {
 }
 
 template <typename IO>
-void UDepot<IO>::stop_space_waker() {
+void uDepot<IO>::stop_space_waker() {
     {
         std::lock_guard<std::mutex> lock(space_mu_);
         space_stop_ = true;
@@ -1177,20 +1177,20 @@ void UDepot<IO>::stop_space_waker() {
 }
 
 template <typename IO>
-void UDepot<IO>::invalidate_grains(uint64_t grain, uint64_t count,
+void uDepot<IO>::invalidate_grains(uint64_t grain, uint64_t count,
                                    bool reloc) {
     salsa::SalsaCtlr::invalidate_grains(
         static_cast<u64>(grain), static_cast<u64>(count), reloc);
 }
 
 template <typename IO>
-void UDepot<IO>::release_grains(uint64_t grain, uint64_t count, bool reloc) {
+void uDepot<IO>::release_grains(uint64_t grain, uint64_t count, bool reloc) {
     salsa::SalsaCtlr::release_grains(static_cast<u64>(grain),
                                      static_cast<u64>(count), 0, reloc);
 }
 
 template <typename IO>
-int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
+int uDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
                           const uint8_t* rec, bool drop_tombstones) {
     KvHeader hdr;
     std::memcpy(&hdr, rec, sizeof(hdr));
@@ -1298,7 +1298,7 @@ int UDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
 // Relocating GC, as uDepot's non-memcache runtimes used: every record the
 // directory still references moves out, then the segment is freed.
 template <typename IO>
-int UDepot<IO>::gc_callback(u64 grain_start, u64 grain_nr) {
+int uDepot<IO>::gc_callback(u64 grain_start, u64 grain_nr) {
     uint64_t victim = scm_->grain_to_seg_idx(grain_start);
     uint64_t victim_ts = seg_timestamps_[victim].load(std::memory_order_acquire);
 
@@ -1361,15 +1361,15 @@ int UDepot<IO>::gc_callback(u64 grain_start, u64 grain_nr) {
 }
 
 template <typename IO>
-void UDepot<IO>::defer_free_seg(void* arg, struct segment* seg) {
-    auto* self = static_cast<UDepot*>(arg);
+void uDepot<IO>::defer_free_seg(void* arg, struct segment* seg) {
+    auto* self = static_cast<uDepot*>(arg);
     // seg_live_ stays set: the segment's metadata and old records stay on
     // disk, and recoverable, until it is reused.
     self->rcu_.call([self, seg] { self->scm_->put_free_seg(seg); });
 }
 
 template <typename IO>
-void UDepot<IO>::seg_md_callback(u64 grain_start, u64 /*grain_nr*/,
+void uDepot<IO>::seg_md_callback(u64 grain_start, u64 /*grain_nr*/,
                                  u64 alloc_nr) {
     // The count this segment was given, not get_seg_alloc_nr(): two streams
     // can stage segments at once, and reading the counter after both had
@@ -1393,7 +1393,7 @@ void UDepot<IO>::seg_md_callback(u64 grain_start, u64 /*grain_nr*/,
 }
 
 template <typename IO>
-bool UDepot<IO>::newer_than(uint64_t new_pba, uint64_t old_pba) const {
+bool uDepot<IO>::newer_than(uint64_t new_pba, uint64_t old_pba) const {
     uint64_t old_seg = scm_->grain_to_seg_idx(old_pba);
     uint64_t new_seg = scm_->grain_to_seg_idx(new_pba);
     if (old_seg != new_seg)
@@ -1408,7 +1408,7 @@ bool UDepot<IO>::newer_than(uint64_t new_pba, uint64_t old_pba) const {
 // is reused (PR #3 review, finding 13). The record is live (the directory
 // points at it), so its segment is not reused meanwhile.
 template <typename IO>
-uint64_t UDepot<IO>::version_of(uint64_t pba) const {
+uint64_t uDepot<IO>::version_of(uint64_t pba) const {
     const uint64_t seg_size = get_seg_size();
     const uint64_t ts =
         seg_timestamps_[scm_->grain_to_seg_idx(pba)].load(
@@ -1419,7 +1419,7 @@ uint64_t UDepot<IO>::version_of(uint64_t pba) const {
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::probe_key(uint64_t hash,
+CoroTask<int> uDepot<IO>::probe_key(uint64_t hash,
                                     std::span<const uint8_t> key,
                                     KeyProbe& probe) {
     const uint16_t tomb_grains =
@@ -1445,7 +1445,7 @@ CoroTask<int> UDepot<IO>::probe_key(uint64_t hash,
 }
 
 template <typename IO>
-bool UDepot<IO>::probe_settled(const HashTable& table, uint64_t hash,
+bool uDepot<IO>::probe_settled(const HashTable& table, uint64_t hash,
                                const KeyProbe& probe, HashEntry* match) {
     *match = HashEntry{};
     for (uint32_t start = 0; ; ) {
@@ -1459,7 +1459,7 @@ bool UDepot<IO>::probe_settled(const HashTable& table, uint64_t hash,
 }
 
 template <typename IO>
-int UDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
+int uDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
                            PutMode mode, uint64_t if_version,
                            uint16_t kv_grains, uint64_t pba,
                            HashEntry* replaced, uint64_t* gen) {
@@ -1503,7 +1503,7 @@ int UDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
 }
 
 template <typename IO>
-int UDepot<IO>::check_sizes(size_t key_size, size_t val_size) const {
+int uDepot<IO>::check_sizes(size_t key_size, size_t val_size) const {
     if (key_size == 0 || key_size > UINT16_MAX) return -EINVAL;
     if (val_size >= kTombstoneValSize) return -EINVAL;  // reserved
     if (kv_total_grains(key_size, val_size) > HashEntry::kKvSizeMask)
@@ -1512,7 +1512,7 @@ int UDepot<IO>::check_sizes(size_t key_size, size_t val_size) const {
 }
 
 template <typename IO>
-PutBuffer UDepot<IO>::alloc_put_buffer(size_t key_size, size_t val_size) {
+PutBuffer uDepot<IO>::alloc_put_buffer(size_t key_size, size_t val_size) {
     PutBuffer pb;
     if (check_sizes(key_size, val_size) != 0) return pb;
     size_t total = kv_total_grains(key_size, val_size) * grain_size_;
@@ -1529,7 +1529,7 @@ PutBuffer UDepot<IO>::alloc_put_buffer(size_t key_size, size_t val_size) {
 }
 
 template <typename IO>
-GetBuffer UDepot<IO>::alloc_get_buffer(size_t key_size, size_t val_size) {
+GetBuffer uDepot<IO>::alloc_get_buffer(size_t key_size, size_t val_size) {
     GetBuffer gb;
     if (check_sizes(key_size, val_size) != 0) return gb;
     gb.buf_ = io_.alloc_buffer(kv_total_grains(key_size, val_size) *
@@ -1540,7 +1540,7 @@ GetBuffer UDepot<IO>::alloc_get_buffer(size_t key_size, size_t val_size) {
 // Not coroutines: both hand over to put_record(), so the copying put
 // costs one coroutine frame, like the zero-copy one.
 template <typename IO>
-CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
+CoroTask<int> uDepot<IO>::put(std::span<const uint8_t> key,
                               std::span<const uint8_t> val,
                               PutMode mode, uint64_t if_version) {
     PutBuffer rec;
@@ -1556,14 +1556,14 @@ CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key,
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::put(std::span<const uint8_t> key, PutBuffer& val,
+CoroTask<int> uDepot<IO>::put(std::span<const uint8_t> key, PutBuffer& val,
                               PutMode mode, uint64_t if_version) {
     int rc = (!val.valid() || key.size() != val.key_size_) ? -EINVAL : 0;
     return put_record(key, &val, PutBuffer{}, rc, mode, if_version);
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::put_record(std::span<const uint8_t> key_in,
+CoroTask<int> uDepot<IO>::put_record(std::span<const uint8_t> key_in,
                                      PutBuffer* zc, PutBuffer owned,
                                      int prep_rc, PutMode mode,
                                      uint64_t if_version) {
@@ -1652,7 +1652,7 @@ CoroTask<int> UDepot<IO>::put_record(std::span<const uint8_t> key_in,
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::verify_key_at_pba(
+CoroTask<int> uDepot<IO>::verify_key_at_pba(
     uint64_t pba, uint16_t kv_grains,
     std::span<const uint8_t> key, KvHeader* hdr_out) {
 
@@ -1687,7 +1687,7 @@ CoroTask<int> UDepot<IO>::verify_key_at_pba(
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
+CoroTask<int> uDepot<IO>::get(std::span<const uint8_t> key,
                               uint8_t* val_out, size_t val_buf_size,
                               size_t* val_size_out, uint64_t* version_out) {
     return get_record(key, nullptr, val_out, val_buf_size, val_size_out,
@@ -1695,7 +1695,7 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
+CoroTask<int> uDepot<IO>::get(std::span<const uint8_t> key,
                               GetBuffer* val_out, uint64_t* version_out) {
     if (val_out) {
         val_out->val_off_ = 0;
@@ -1705,7 +1705,7 @@ CoroTask<int> UDepot<IO>::get(std::span<const uint8_t> key,
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::get_record(std::span<const uint8_t> key,
+CoroTask<int> uDepot<IO>::get_record(std::span<const uint8_t> key,
                                      GetBuffer* zc, uint8_t* val_out,
                                      size_t val_buf_size,
                                      size_t* val_size_out,
@@ -1787,7 +1787,7 @@ CoroTask<int> UDepot<IO>::get_record(std::span<const uint8_t> key,
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::write_tombstone(
+CoroTask<int> uDepot<IO>::write_tombstone(
     std::span<const uint8_t> key, uint64_t* tomb_out,
     std::optional<Rcu::ReadGuard>& guard, KeyProbe* probe) {
     uint64_t tomb_grains = kv_total_grains(key.size(), 0);
@@ -1832,7 +1832,7 @@ CoroTask<int> UDepot<IO>::write_tombstone(
 }
 
 template <typename IO>
-int UDepot<IO>::commit_del(uint64_t hash, const KeyProbe& probe,
+int uDepot<IO>::commit_del(uint64_t hash, const KeyProbe& probe,
                            uint64_t if_version, uint64_t tomb_pba,
                            HashEntry* removed, uint64_t* gen) {
     auto locked = directory_->lock_for(hash);
@@ -1860,7 +1860,7 @@ int UDepot<IO>::commit_del(uint64_t hash, const KeyProbe& probe,
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::del(std::span<const uint8_t> key,
+CoroTask<int> uDepot<IO>::del(std::span<const uint8_t> key,
                               uint64_t if_version) {
     if (key.empty() || key.size() > UINT16_MAX) co_return -EINVAL;
 
@@ -1910,7 +1910,7 @@ CoroTask<int> UDepot<IO>::del(std::span<const uint8_t> key,
 }
 
 template <typename IO>
-CoroTask<int> UDepot<IO>::exists(std::span<const uint8_t> key,
+CoroTask<int> uDepot<IO>::exists(std::span<const uint8_t> key,
                                  size_t* val_size_out) {
     if (key.empty()) co_return -EINVAL;
 
@@ -1939,13 +1939,13 @@ CoroTask<int> UDepot<IO>::exists(std::span<const uint8_t> key,
 }
 
 // Explicit instantiations.
-template class UDepot<PosixIO>;
-template class UDepot<AioIO>;
+template class uDepot<PosixIO>;
+template class uDepot<AioIO>;
 #ifdef UDEPOT_BUILD_URING
-template class UDepot<UringIO>;
+template class uDepot<UringIO>;
 #endif
 #ifdef UDEPOT_BUILD_SPDK
-template class UDepot<SpdkIO>;
+template class uDepot<SpdkIO>;
 #endif
 
 }  // namespace udepot

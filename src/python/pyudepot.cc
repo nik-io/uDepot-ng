@@ -11,7 +11,7 @@
 #include "udepot/store.h"
 #include "udepot/io/aio.h"
 
-using Store = udepot::UDepot<udepot::AioIO>;
+using Store = udepot::uDepot<udepot::AioIO>;
 
 extern "C" {
 

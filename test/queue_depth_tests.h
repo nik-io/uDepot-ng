@@ -156,7 +156,7 @@ udepot::CoroTask<int> hold_completions(Store& store, std::string key,
 template <typename Traits>
 class QueueDepthTest : public ::testing::Test {
 protected:
-    using Store = udepot::UDepot<typename Traits::IO>;
+    using Store = udepot::uDepot<typename Traits::IO>;
 
     static void SetUpTestSuite() { Traits::suite_setup(); }
     static void TearDownTestSuite() { Traits::suite_teardown(); }

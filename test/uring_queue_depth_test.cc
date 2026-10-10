@@ -66,7 +66,7 @@ TEST(UringSubmit, RefusedSubmissionsAreRetriedByThePoller) {
     config.force_destroy = true;
     config.queue_depth = 4;  // a 4-entry submission queue
     UringTraits::configure(config);
-    udepot::UDepot<udepot::UringIO> store;
+    udepot::uDepot<udepot::UringIO> store;
     ASSERT_EQ(store.open(config), 0);
 
     constexpr int kKeys = 64;

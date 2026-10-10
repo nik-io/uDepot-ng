@@ -22,7 +22,7 @@
 using udepot::MemcacheServer;
 using udepot::PosixIO;
 using udepot::StoreConfig;
-using udepot::UDepot;
+using udepot::uDepot;
 
 static constexpr size_t kStoreSize = 4 * 1024 * 1024;
 
@@ -177,7 +177,7 @@ protected:
         config.force_destroy = true;
         ASSERT_EQ(store_.open(config), 0);
 
-        MemcacheServer<UDepot<PosixIO>>::Config mc_config;
+        MemcacheServer<uDepot<PosixIO>>::Config mc_config;
         mc_config.bind_addr = "127.0.0.1";
         mc_config.port = 0;  // Ephemeral port.
         ASSERT_EQ(server_.start(mc_config), 0);
@@ -198,8 +198,8 @@ protected:
     virtual uint32_t grain_size() const { return 512; }
 
     std::filesystem::path path_;
-    UDepot<PosixIO> store_;
-    MemcacheServer<UDepot<PosixIO>> server_{store_};
+    uDepot<PosixIO> store_;
+    MemcacheServer<uDepot<PosixIO>> server_{store_};
     uint16_t port_ = 0;
 };
 
@@ -702,7 +702,7 @@ TEST_F(MemcacheLargeGrainTest, AppendBeyondMaxValueIsRefused) {
     McClient client;
     ASSERT_TRUE(client.connect(port_));
 
-    const size_t max = MemcacheServer<UDepot<PosixIO>>::kMaxValueLen;
+    const size_t max = MemcacheServer<uDepot<PosixIO>>::kMaxValueLen;
     std::string val(max, 'M');
     ASSERT_TRUE(client.send_cmd("set full 0 0 " + std::to_string(max) +
                                 "\r\n" + val + "\r\n"));

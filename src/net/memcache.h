@@ -12,11 +12,11 @@
 
 namespace udepot {
 
-// Memcache text protocol server for UDepot.
+// Memcache text protocol server for uDepot.
 //
 // Implements the standard memcache text protocol (GET, SET, ADD, REPLACE,
 // DELETE, INCR, DECR, APPEND, PREPEND, STATS, VERSION, QUIT) on top of
-// any UDepot<IO> store instance.
+// any uDepot<IO> store instance.
 //
 // Value storage format (matches uDepot):
 //   [user_data][expiry: int64_t, 8 bytes][flags: uint32_t, 4 bytes]

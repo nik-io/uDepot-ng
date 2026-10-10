@@ -20,7 +20,7 @@
 
 using udepot::PosixIO;
 using udepot::StoreConfig;
-using udepot::UDepot;
+using udepot::uDepot;
 
 static constexpr size_t kStoreSize = 4 * 1024 * 1024;  // 4 MiB
 
@@ -45,7 +45,7 @@ protected:
 
     std::filesystem::path path_;
     StoreConfig config_;
-    UDepot<PosixIO> store_;
+    uDepot<PosixIO> store_;
 };
 
 // --- Put and Get ---

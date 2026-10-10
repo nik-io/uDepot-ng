@@ -12,7 +12,7 @@
 #include "udepot/store.h"
 #include "udepot/io/aio.h"
 
-using Store = udepot::UDepot<udepot::AioIO>;
+using Store = udepot::uDepot<udepot::AioIO>;
 
 // As in uDepot's JNI binding, get/put/del do not take g_mtx: the caller
 // must ensure none is in progress during shutdown(). One that comes before

@@ -16,7 +16,7 @@
 
 using udepot::AioIO;
 using udepot::StoreConfig;
-using udepot::UDepot;
+using udepot::uDepot;
 
 static constexpr size_t kStoreSize = 4 * 1024 * 1024;
 
@@ -41,7 +41,7 @@ protected:
 
     std::filesystem::path path_;
     StoreConfig config_;
-    UDepot<AioIO> store_;
+    uDepot<AioIO> store_;
 };
 
 TEST_F(AioStoreTest, PutThenGetReturnsValue) {

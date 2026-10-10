@@ -18,7 +18,7 @@
 
 using udepot::PosixIO;
 using udepot::StoreConfig;
-using udepot::UDepot;
+using udepot::uDepot;
 
 static constexpr size_t kStoreSize = 64 * 1024 * 1024;  // 64 MiB
 
@@ -44,7 +44,7 @@ protected:
 
     std::filesystem::path path_;
     StoreConfig config_;
-    UDepot<PosixIO> store_;
+    uDepot<PosixIO> store_;
 };
 
 static std::string make_key(int thread_id, int i) {

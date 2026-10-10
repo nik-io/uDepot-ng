@@ -234,7 +234,7 @@ if(UDEPOT_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/src/jni/com/ibm/udepot/uDepotJNI.java
         )
         set(JNI_TEST_SRC
-            ${CMAKE_CURRENT_SOURCE_DIR}/test/jni/UDepotJNITest.java
+            ${CMAKE_CURRENT_SOURCE_DIR}/test/jni/uDepotJNITest.java
         )
         set(JNI_CLASSES_DIR ${CMAKE_CURRENT_BINARY_DIR}/jni-classes)
         file(MAKE_DIRECTORY ${JNI_CLASSES_DIR})
@@ -247,25 +247,25 @@ if(UDEPOT_BUILD_TESTS)
             COMMENT "Compiling uDepotJNI.java"
         )
         add_custom_command(
-            OUTPUT ${JNI_CLASSES_DIR}/UDepotJNITest.class
+            OUTPUT ${JNI_CLASSES_DIR}/uDepotJNITest.class
             COMMAND ${Java_JAVAC_EXECUTABLE}
                 -cp ${JNI_CLASSES_DIR}
                 -d ${JNI_CLASSES_DIR}
                 ${JNI_TEST_SRC}
             DEPENDS ${JNI_TEST_SRC}
                     ${JNI_CLASSES_DIR}/com/ibm/udepot/uDepotJNI.class
-            COMMENT "Compiling UDepotJNITest.java"
+            COMMENT "Compiling uDepotJNITest.java"
         )
         add_custom_target(jni_classes ALL
             DEPENDS ${JNI_CLASSES_DIR}/com/ibm/udepot/uDepotJNI.class
-                    ${JNI_CLASSES_DIR}/UDepotJNITest.class
+                    ${JNI_CLASSES_DIR}/uDepotJNITest.class
         )
         add_test(
             NAME jni_test
             COMMAND ${Java_JAVA_EXECUTABLE}
                 -cp ${JNI_CLASSES_DIR}
                 -Djava.library.path=$<TARGET_FILE_DIR:uDepotJNI>
-                UDepotJNITest
+                uDepotJNITest
         )
         set_tests_properties(jni_test PROPERTIES TIMEOUT 60)
     endif()

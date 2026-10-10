@@ -41,7 +41,7 @@ public:
 
     int open(const char* path, size_t size);
     // Completes all I/O already submitted, then tears down. No new I/O may
-    // be submitted once close() has begun (UDepot::close guarantees this).
+    // be submitted once close() has begun (uDepot::close guarantees this).
     void close();
 
     CoroTask<ssize_t> pread(void* buf, size_t count, off_t offset);

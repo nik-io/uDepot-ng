@@ -28,7 +28,7 @@
 using udepot::AioIO;
 using udepot::PosixIO;
 using udepot::StoreConfig;
-using udepot::UDepot;
+using udepot::uDepot;
 
 static constexpr uint64_t kPrime = 0x9E3779B97F4A7C15ULL;
 
@@ -61,7 +61,7 @@ struct ThreadResult {
 };
 
 template <typename IO>
-static ThreadResult run_thread(UDepot<IO>& store,
+static ThreadResult run_thread(uDepot<IO>& store,
                                const BenchConfig& cfg,
                                int thread_id) {
     ThreadResult result;
@@ -192,7 +192,7 @@ static double median(std::vector<double> v) {
 // On a get the value lands in the caller's slot either way; it is checked
 // after the batch, outside the timing.
 template <typename IO>
-static int run_compare(UDepot<IO>& store, const BenchConfig& cfg) {
+static int run_compare(uDepot<IO>& store, const BenchConfig& cfg) {
     const uint64_t batch = cfg.ops;
     const size_t vsz = cfg.val_size;
     // Each phase runs 2 batches per round on fresh keys.
@@ -321,7 +321,7 @@ static int run_bench(const BenchConfig& cfg) {
     // namespace keeps the previous run's store.
     sc.force_destroy = true;
 
-    UDepot<IO> store;
+    uDepot<IO> store;
     int rc = store.open(sc);
     if (rc != 0) {
         fprintf(stderr, "open failed: %d\n", rc);

@@ -15,7 +15,7 @@
 #include <gtest/gtest.h>
 
 using udepot::StoreConfig;
-using udepot::UDepot;
+using udepot::uDepot;
 using udepot::UringIO;
 
 static constexpr size_t kStoreSize = 4 * 1024 * 1024;
@@ -42,7 +42,7 @@ protected:
 
     std::filesystem::path path_;
     StoreConfig config_;
-    UDepot<UringIO> store_;
+    uDepot<UringIO> store_;
 };
 
 TEST_F(UringStoreTest, PutThenGetReturnsValue) {

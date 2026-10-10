@@ -113,7 +113,7 @@ static int64_t resolve_expiry(uint64_t client_exptime) {
     if (client_exptime == 0) return 0;
     auto now = static_cast<int64_t>(std::time(nullptr));
     if (static_cast<int64_t>(client_exptime) <=
-        MemcacheServer<UDepot<PosixIO>>::kRealtimeMaxdelta) {
+        MemcacheServer<uDepot<PosixIO>>::kRealtimeMaxdelta) {
         return now + static_cast<int64_t>(client_exptime);
     }
     return static_cast<int64_t>(client_exptime);
@@ -783,10 +783,10 @@ void MemcacheServer<Store>::handle_connection(int fd) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Explicit template instantiations
 // ─────────────────────────────────────────────────────────────────────────────
-template class MemcacheServer<UDepot<PosixIO>>;
-template class MemcacheServer<UDepot<AioIO>>;
+template class MemcacheServer<uDepot<PosixIO>>;
+template class MemcacheServer<uDepot<AioIO>>;
 #ifdef UDEPOT_BUILD_URING
-template class MemcacheServer<UDepot<UringIO>>;
+template class MemcacheServer<uDepot<UringIO>>;
 #endif
 
 }  // namespace udepot

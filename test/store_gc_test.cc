@@ -30,7 +30,7 @@
 using udepot::AioIO;
 using udepot::PosixIO;
 using udepot::StoreConfig;
-using udepot::UDepot;
+using udepot::uDepot;
 
 namespace {
 
@@ -88,7 +88,7 @@ protected:
 
     std::filesystem::path path_;
     StoreConfig config_;
-    UDepot<PosixIO> store_;
+    uDepot<PosixIO> store_;
 };
 
 }  // namespace
@@ -205,7 +205,7 @@ TEST_F(StoreGcTest, CrashSnapshotRecoversAcknowledgedWrites) {
     // "Crash": copy the device while the store is still open.
     std::filesystem::copy_file(path_, snapshot_path(),
                                std::filesystem::copy_options::overwrite_existing);
-    UDepot<PosixIO> recovered;
+    uDepot<PosixIO> recovered;
     StoreConfig cfg = config_;
     std::string snap = snapshot_path().string();
     cfg.path = snap.c_str();
@@ -228,7 +228,7 @@ TEST(StoreGcAioTest, ReadsStayCorrectWhileGcRelocates) {
     auto path = std::filesystem::temp_directory_path() /
                 ("udepot_store_gc_aio_" + std::to_string(getpid()));
     StoreConfig config = gc_config(path);
-    UDepot<AioIO> store;
+    uDepot<AioIO> store;
     ASSERT_EQ(store.open(config), 0);
 
     constexpr int kKeys = 100;
@@ -318,7 +318,7 @@ TEST(StoreGcAioTest, DirectoryGrowsFromPollerThread) {
     StoreConfig config = gc_config(path);
     config.initial_tables = 1;
     config.index_bits = 6;
-    UDepot<AioIO> store;
+    uDepot<AioIO> store;
     ASSERT_EQ(store.open(config), 0);
 
     constexpr int kThreads = 4;
@@ -372,7 +372,7 @@ TEST_F(StoreGcTest, RecoveryDoesNotDuplicateKeysSharingATag) {
 
     // Two keys with the same tag and bucket.
     auto tag_bucket = [&](const std::string& k) {
-        uint64_t h = store_.hash_key(UDepot<PosixIO>::as_bytes(k));
+        uint64_t h = store_.hash_key(uDepot<PosixIO>::as_bytes(k));
         return (h >> 56) << 8 | (h & 0xF);
     };
     std::map<uint64_t, std::string> seen;
@@ -461,7 +461,7 @@ TEST_F(StoreGcTest, GcRelocationRacingPutRecoversAsAcknowledged) {
     raced = 0;
     static std::atomic<int> hooked{0};
     hooked = 0;
-    UDepot<PosixIO>::gc_relocation_test_hook = [](std::span<const uint8_t> k) {
+    uDepot<PosixIO>::gc_relocation_test_hook = [](std::span<const uint8_t> k) {
         hooked.fetch_add(1);
         {
             std::lock_guard<std::mutex> lock(mu);
@@ -474,7 +474,7 @@ TEST_F(StoreGcTest, GcRelocationRacingPutRecoversAsAcknowledged) {
         std::this_thread::sleep_for(std::chrono::microseconds(300));
     };
     struct ResetHook {
-        ~ResetHook() { UDepot<PosixIO>::gc_relocation_test_hook = nullptr; }
+        ~ResetHook() { uDepot<PosixIO>::gc_relocation_test_hook = nullptr; }
     } reset_hook;
 
     // Interleaved, so every segment mixes long-lived records with ones
@@ -532,7 +532,7 @@ TEST_F(StoreGcTest, GcRelocationRacingPutRecoversAsAcknowledged) {
                              value_for(i, 2, kVal)).run_sync(), 0);
     stop = true;
     racer.join();
-    UDepot<PosixIO>::gc_relocation_test_hook = nullptr;
+    uDepot<PosixIO>::gc_relocation_test_hook = nullptr;
     ASSERT_EQ(errors.load(), 0);
     ASSERT_GT(raced.load(), 0) << "no relocation was raced; hooked="
                                << hooked.load();
@@ -540,7 +540,7 @@ TEST_F(StoreGcTest, GcRelocationRacingPutRecoversAsAcknowledged) {
     // "Crash": the log scan must reproduce exactly what was acknowledged.
     std::filesystem::copy_file(path_, snapshot_path(),
                                std::filesystem::copy_options::overwrite_existing);
-    UDepot<PosixIO> recovered;
+    uDepot<PosixIO> recovered;
     StoreConfig cfg = config_;
     std::string snap = snapshot_path().string();
     cfg.path = snap.c_str();
@@ -571,7 +571,7 @@ TEST_F(StoreGcTest, GetSurvivesItsSegmentBeingRecycled) {
     static std::atomic<uint64_t> puts{0};
     armed = false;
     puts = 0;
-    UDepot<PosixIO>::get_read_test_hook = [](std::span<const uint8_t>) {
+    uDepot<PosixIO>::get_read_test_hook = [](std::span<const uint8_t>) {
         if (!armed.exchange(false)) return;
         // Hold the read until the writer has wrapped around the device
         // twice, so the record's segment is overwritten if it was freed, or
@@ -595,7 +595,7 @@ TEST_F(StoreGcTest, GetSurvivesItsSegmentBeingRecycled) {
         }
     };
     struct ResetHook {
-        ~ResetHook() { UDepot<PosixIO>::get_read_test_hook = nullptr; }
+        ~ResetHook() { uDepot<PosixIO>::get_read_test_hook = nullptr; }
     } reset_hook;
 
     // Every key is rewritten each round, so whole segments go dead and are
@@ -624,7 +624,7 @@ TEST_F(StoreGcTest, GetSurvivesItsSegmentBeingRecycled) {
     }
     stop = true;
     writer.join();
-    UDepot<PosixIO>::get_read_test_hook = nullptr;
+    uDepot<PosixIO>::get_read_test_hook = nullptr;
     EXPECT_EQ(put_errors.load(), 0);
     EXPECT_EQ(bad, 0) << "of " << kReads << " reads held across a recycle";
 }
@@ -641,14 +641,14 @@ TEST_F(StoreGcTest, RelocationNeverMovesIntoAnOlderSegment) {
     static std::atomic<int> into_older{0};
     relocations = 0;
     into_older = 0;
-    UDepot<PosixIO>::gc_relocation_order_test_hook =
+    uDepot<PosixIO>::gc_relocation_order_test_hook =
         [](std::span<const uint8_t>, uint64_t victim_ts, uint64_t dst_ts) {
             relocations.fetch_add(1);
             if (dst_ts <= victim_ts) into_older.fetch_add(1);
         };
     struct ResetHook {
         ~ResetHook() {
-            UDepot<PosixIO>::gc_relocation_order_test_hook = nullptr;
+            uDepot<PosixIO>::gc_relocation_order_test_hook = nullptr;
         }
     } reset_hook;
 
@@ -668,7 +668,7 @@ TEST_F(StoreGcTest, RelocationNeverMovesIntoAnOlderSegment) {
         ASSERT_EQ(store_.put("h" + std::to_string(i % kHot), val).run_sync(),
                   0);
     store_.close();
-    UDepot<PosixIO>::gc_relocation_order_test_hook = nullptr;
+    uDepot<PosixIO>::gc_relocation_order_test_hook = nullptr;
 
     EXPECT_GT(relocations.load(), 0);
     EXPECT_EQ(into_older.load(), 0) << "of " << relocations.load()
@@ -721,14 +721,14 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
     path = path_;
     drops = 0;
     unsafe = 0;
-    UDepot<PosixIO>::gc_tombstone_drop_test_hook =
+    uDepot<PosixIO>::gc_tombstone_drop_test_hook =
         [](std::span<const uint8_t> key, uint64_t victim_ts) {
             drops.fetch_add(1);
             if (older_copy_on_disk(path, key, victim_ts)) unsafe.fetch_add(1);
         };
     struct ResetHook {
         ~ResetHook() {
-            UDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
+            uDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
         }
     } reset_hook;
 
@@ -746,7 +746,7 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
         }
     }
     store_.close();
-    UDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
+    uDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
 
     // Tombstones must still be reclaimed, or they would take space forever.
     EXPECT_GT(drops.load(), 0);
@@ -805,19 +805,19 @@ TEST_F(StoreGcTest, SegmentTimestampsAreUnique) {
     static std::mutex mu;
     static std::vector<uint64_t> stamps;
     stamps.clear();
-    UDepot<PosixIO>::seg_md_test_hook = [](uint64_t ts) {
+    uDepot<PosixIO>::seg_md_test_hook = [](uint64_t ts) {
         std::lock_guard<std::mutex> lock(mu);
         stamps.push_back(ts);
     };
     // Widen the window between the counter's increment and the stamp, so
     // the two streams' stagings overlap.
-    UDepot<PosixIO>::seg_md_enter_test_hook = [] {
+    uDepot<PosixIO>::seg_md_enter_test_hook = [] {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     };
     struct ResetHook {
         ~ResetHook() {
-            UDepot<PosixIO>::seg_md_test_hook = nullptr;
-            UDepot<PosixIO>::seg_md_enter_test_hook = nullptr;
+            uDepot<PosixIO>::seg_md_test_hook = nullptr;
+            uDepot<PosixIO>::seg_md_enter_test_hook = nullptr;
         }
     } reset_hook;
 
@@ -835,8 +835,8 @@ TEST_F(StoreGcTest, SegmentTimestampsAreUnique) {
         }
     }
     store_.close();
-    UDepot<PosixIO>::seg_md_test_hook = nullptr;
-    UDepot<PosixIO>::seg_md_enter_test_hook = nullptr;
+    uDepot<PosixIO>::seg_md_test_hook = nullptr;
+    uDepot<PosixIO>::seg_md_enter_test_hook = nullptr;
 
     std::lock_guard<std::mutex> lock(mu);
     std::vector<uint64_t> sorted = stamps;
