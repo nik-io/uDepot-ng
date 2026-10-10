@@ -167,11 +167,22 @@ zero-copy/copy ratios; the gate is the median of 5 such runs. Zero copy is
 uDepot's property, not the caller's: given a buffer it handed out
 (`alloc_put_buffer()`, `alloc_get_buffer()`), put and get do their I/O on
 it directly, and given other memory they copy through one of their own. So
-the bench sets both modes up as a caller would, outside the timing: every
-buffer allocated and every value written up front, plain memory for the
-copying API and uDepot's buffers for the zero-copy one, the same values in
-both. The timed loops only issue operations; gets are checked afterwards.
-An earlier version allocated a `PutBuffer` per put inside the timed loop. The two
+the bench sets both modes up as a caller would, and as legacy's
+`udepot-test` does (one Mbuff or value buffer per task, reused): one buffer
+per operation in flight -- one, the loop being synchronous -- allocated
+before the timing and reused for every operation, plain memory for the
+copying API and uDepot's buffers for the zero-copy one. Each put writes its
+key's 8-byte tag into the value and each get checks it, in both modes.
+
+Two earlier versions measured the wrong thing. One allocated a `PutBuffer`
+per put inside the timed loop. The next gave every op of a batch its own
+buffer (500 per batch, ~16 MiB per mode): cache-cold, which the copying
+path hides (it copies the cold buffer into a hot record buffer of its own,
+which the kernel then copies) and zero copy cannot (the kernel copies from
+the cold buffer itself). On `/dev/shm`, where the kernel copies either way,
+that made zero copy 2-12% slower on an AMD EPYC 9V45 and 20-48% faster on a
+9V74, and failed `main`. The caller's buffers belong to its in-flight
+operations, not to every key it ever writes. The two
 batches of a round share whatever drifts (the runner, GC, a network
 target), so the ratio isolates the copies zero copy avoids. It used to
 compare separate runs of each, by median: absolute throughput differs by up

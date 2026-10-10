@@ -12,7 +12,6 @@
 #endif
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -184,61 +183,67 @@ static double median(std::vector<double> v) {
 // Zero copy is a property of uDepot, not of the caller: given a buffer it
 // handed out (alloc_put_buffer(), alloc_get_buffer()), put() and get() do
 // their I/O on that buffer directly; given any other memory, they copy
-// through a record buffer of their own. So both modes are set up the way a
-// caller would: every buffer is allocated and every value written before
-// anything is timed, plain memory for the copying API and uDepot's buffers
-// for the zero-copy one, and slot j of a batch holds the same key size and
-// value in both. The timed loops issue the operations and nothing else.
-// On a get the value lands in the caller's slot either way; it is checked
-// after the batch, outside the timing.
+// through a record buffer of their own. Both modes are set up as a caller
+// would, and as uDepot's udepot-test does (one Mbuff, or one value buffer,
+// per task, reused for every operation): one buffer per operation in
+// flight -- here one, the loop being synchronous -- allocated before
+// anything is timed and reused, plain memory for the copying API and
+// uDepot's buffers for the zero-copy one. Each put writes its key's 8-byte
+// tag into the value and each get checks it, the same in both modes.
+//
+// A buffer per operation instead (an earlier version: 500 per batch, ~16
+// MiB per mode) made the caller's buffers cache-cold, which the copying
+// path hides -- it copies from the cold buffer into a record buffer of its
+// own, reused and hot, which the kernel then copies -- and zero copy
+// cannot: the kernel copied from the cold buffer itself. On tmpfs, where
+// the kernel copies either way, that read as zero copy 2-12% slower on
+// some CPUs (AMD EPYC 9V45) and 20-48% faster on others.
 template <typename IO>
 static int run_compare(uDepot<IO>& store, const BenchConfig& cfg) {
     const uint64_t batch = cfg.ops;
     const size_t vsz = cfg.val_size;
-    // Each phase runs 2 batches per round on fresh keys.
-    const uint64_t nkeys = 2 * batch * cfg.compare_rounds;
-    auto key_size = [](uint64_t slot) -> size_t { return 8 + slot % 24; };
-
-    std::vector<std::array<uint8_t, 32>> keys(nkeys);
-    for (uint64_t i = 0; i < nkeys; ++i) {
-        keys[i].fill(0);
-        const uint64_t id = (cfg.seed + i) * kPrime;
-        std::memcpy(keys[i].data(), &id, sizeof(id));
+    if (vsz < sizeof(uint64_t)) {
+        fprintf(stderr, "--compare needs --val-size of at least 8\n");
+        return 1;
     }
-    auto key = [&](uint64_t i) {
-        return std::span<const uint8_t>(keys[i].data(), key_size(i % batch));
+    constexpr size_t kKeySize = 16;  // one size: a PutBuffer is per key size
+    auto tag_of = [&](uint64_t i) { return (cfg.seed + i) * kPrime; };
+    auto set_key = [&](uint64_t i, uint8_t* key) {
+        const uint64_t id = tag_of(i);
+        std::memcpy(key, &id, sizeof(id));
+        std::memset(key + sizeof(id), 0, kKeySize - sizeof(id));
     };
 
-    std::vector<std::vector<uint8_t>> put_copy(batch), get_copy(batch);
-    std::vector<udepot::PutBuffer> put_zc(batch);
-    std::vector<udepot::GetBuffer> get_zc(batch);
-    std::vector<size_t> got_size(batch);
-    for (uint64_t j = 0; j < batch; ++j) {
-        put_copy[j].resize(vsz);
-        for (size_t k = 0; k < vsz; ++k)
-            put_copy[j][k] = static_cast<uint8_t>((cfg.seed + j) * 131 + k * 7);
-        get_copy[j].resize(vsz);
-        put_zc[j] = store.alloc_put_buffer(key_size(j), vsz);
-        get_zc[j] = store.alloc_get_buffer(key_size(j), vsz);
-        if (!put_zc[j].valid() || !get_zc[j].valid()) {
-            fprintf(stderr, "buffer allocation failed: slot=%lu\n",
-                    static_cast<unsigned long>(j));
-            return 1;
-        }
-        std::memcpy(put_zc[j].value().data(), put_copy[j].data(), vsz);
+    std::vector<uint8_t> put_copy(vsz), get_copy(vsz);
+    for (size_t k = 0; k < vsz; ++k)
+        put_copy[k] = static_cast<uint8_t>(cfg.seed * 131 + k * 7);
+    udepot::PutBuffer put_zc = store.alloc_put_buffer(kKeySize, vsz);
+    udepot::GetBuffer get_zc = store.alloc_get_buffer(kKeySize, vsz);
+    if (!put_zc.valid() || !get_zc.valid()) {
+        fprintf(stderr, "buffer allocation failed\n");
+        return 1;
     }
+    std::memcpy(put_zc.value().data(), put_copy.data(), vsz);
+    uint8_t key[kKeySize];
+    const std::span<const uint8_t> key_span(key, kKeySize);
 
     auto put_batch = [&](uint64_t first, bool zc) -> double {
         const double t0 = now_secs();
-        for (uint64_t j = 0; j < batch; ++j) {
-            const int rc =
-                zc ? store.put(key(first + j), put_zc[j]).run_sync()
-                   : store.put(key(first + j),
-                               std::span<const uint8_t>(put_copy[j]))
+        for (uint64_t i = first; i < first + batch; ++i) {
+            set_key(i, key);
+            const uint64_t tag = tag_of(i);
+            int rc;
+            if (zc) {
+                std::memcpy(put_zc.value().data(), &tag, sizeof(tag));
+                rc = store.put(key_span, put_zc).run_sync();
+            } else {
+                std::memcpy(put_copy.data(), &tag, sizeof(tag));
+                rc = store.put(key_span, std::span<const uint8_t>(put_copy))
                          .run_sync();
+            }
             if (rc != 0) {
                 fprintf(stderr, "put failed: i=%lu rc=%d\n",
-                        static_cast<unsigned long>(first + j), rc);
+                        static_cast<unsigned long>(i), rc);
                 return -1;
             }
         }
@@ -246,38 +251,34 @@ static int run_compare(uDepot<IO>& store, const BenchConfig& cfg) {
     };
     auto get_batch = [&](uint64_t first, bool zc) -> double {
         const double t0 = now_secs();
-        for (uint64_t j = 0; j < batch; ++j) {
-            const int rc =
-                zc ? store.get(key(first + j), &get_zc[j]).run_sync()
-                   : store.get(key(first + j), get_copy[j].data(), vsz,
-                               &got_size[j])
-                         .run_sync();
-            if (rc != 0) {
+        for (uint64_t i = first; i < first + batch; ++i) {
+            set_key(i, key);
+            int rc;
+            size_t n = 0;
+            const uint8_t* got;
+            if (zc) {
+                rc = store.get(key_span, &get_zc).run_sync();
+                n = get_zc.value().size();
+                got = get_zc.value().data();
+            } else {
+                rc = store.get(key_span, get_copy.data(), vsz, &n).run_sync();
+                got = get_copy.data();
+            }
+            uint64_t tag = 0;
+            if (rc == 0) std::memcpy(&tag, got, sizeof(tag));
+            if (rc != 0 || n != vsz || tag != tag_of(i)) {
                 fprintf(stderr, "get failed: i=%lu rc=%d\n",
-                        static_cast<unsigned long>(first + j), rc);
+                        static_cast<unsigned long>(i), rc);
                 return -1;
             }
         }
-        const double secs = now_secs() - t0;
-        for (uint64_t j = 0; j < batch; ++j) {
-            std::span<const uint8_t> got =
-                zc ? get_zc[j].value()
-                   : std::span<const uint8_t>(get_copy[j].data(),
-                                              got_size[j]);
-            if (got.size() != vsz ||
-                std::memcmp(got.data(), put_copy[j].data(), vsz) != 0) {
-                fprintf(stderr, "get returned the wrong value: i=%lu\n",
-                        static_cast<unsigned long>(first + j));
-                return -1;
-            }
-        }
-        return secs;
+        return now_secs() - t0;
     };
     struct Phase {
         std::vector<double> copy, zc, ratio;
     };
-    // The get phase reads back the put phase's keys in the same order, so
-    // each batch's key i holds slot i % batch's value.
+    // The get phase reads back the put phase's keys in the same order, each
+    // checked for the tag its put wrote.
     auto phase = [&](auto run_batch, Phase* ph) {
         uint64_t next = 0;
         for (int r = 0; r < cfg.compare_rounds; ++r) {
