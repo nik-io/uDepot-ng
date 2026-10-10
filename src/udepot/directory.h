@@ -81,12 +81,17 @@ struct DirSnapshot {
     // it under their stripe locks and back off until the copy is published.
     std::atomic<bool> frozen{false};
 
-    // Fresh, empty tables.
-    DirSnapshot(uint32_t table_bits, uint32_t index_bits, uint64_t generation)
+    // Fresh, empty tables; or, for a resize (`lazy`), tables whose
+    // stripes are set up as they migrate (HashTable::Uninitialized).
+    DirSnapshot(uint32_t table_bits, uint32_t index_bits, uint64_t generation,
+                bool lazy = false)
         : table_bits(table_bits), generation(generation) {
         tables.reserve(1u << table_bits);
         for (uint32_t i = 0; i < (1u << table_bits); ++i)
-            tables.push_back(std::make_shared<HashTable>(index_bits));
+            tables.push_back(
+                lazy ? std::make_shared<HashTable>(
+                           index_bits, HashTable::Uninitialized{})
+                     : std::make_shared<HashTable>(index_bits));
     }
     // Another snapshot's tables.
     DirSnapshot(std::vector<std::shared_ptr<HashTable>> tables,

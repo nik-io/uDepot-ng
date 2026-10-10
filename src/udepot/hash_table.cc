@@ -4,6 +4,8 @@
 #include "udepot/hash_table.h"
 
 #include <algorithm>
+#include <memory>
+#include <new>
 
 namespace udepot {
 
@@ -23,15 +25,13 @@ HashTable::WriteLock::WriteLock(std::mutex* first, std::mutex* second)
     if (second) second_ = std::unique_lock<std::mutex>(*second);
 }
 
-HashTable::HashTable(uint32_t index_bits)
+HashTable::HashTable(uint32_t index_bits, Uninitialized)
     : index_bits_(index_bits),
       num_buckets_(1ULL << index_bits),
       bucket_mask_(num_buckets_ - 1),
-      slots_(std::make_unique<std::atomic<uint64_t>[]>(
-          num_buckets_ + HashEntry::kHopRange)) {
-    for (uint64_t i = 0; i < total_slots(); ++i)
-        slots_[i].store(HashEntry::kEmpty, std::memory_order_relaxed);
-
+      slots_(static_cast<std::atomic<uint64_t>*>(::operator new(
+          (num_buckets_ + HashEntry::kHopRange) * sizeof(std::atomic<uint64_t>),
+          std::align_val_t{64}))) {
     // As uDepot's uDepotMap::restore(): halve the stripe count until each
     // stripe covers a write's whole reach, so a write needs at most two.
     num_stripes_ = kMaxStripes;
@@ -40,6 +40,16 @@ HashTable::HashTable(uint32_t index_bits)
         num_stripes_ /= 2;
     slots_per_stripe_ = (total_slots() + num_stripes_ - 1) / num_stripes_;
     stripes_ = std::make_unique<Stripe[]>(num_stripes_);
+}
+
+HashTable::HashTable(uint32_t index_bits)
+    : HashTable(index_bits, Uninitialized{}) {
+    for (uint64_t s = 0; s < num_stripes_; ++s) init_stripe(s);
+}
+
+void HashTable::init_stripe(uint64_t stripe) noexcept {
+    for (uint64_t i = stripe_begin(stripe); i < stripe_end(stripe); ++i)
+        std::construct_at(&slots_[i], HashEntry::kEmpty);
 }
 
 HashTable::~HashTable() = default;

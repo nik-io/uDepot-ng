@@ -315,6 +315,13 @@ if(UDEPOT_BUILD_TESTS)
     add_custom_target(run_perf_test ${_perf_cmds}
         DEPENDS udepot_ng_bench USES_TERMINAL)
 
+    # Put latency while the directory grows: incremental resize against the
+    # freeze-and-copy grow (scripts/perf-resize-latency.sh). Release only.
+    add_custom_target(run_resize_latency_test
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/perf-resize-latency.sh
+                ${CMAKE_CURRENT_BINARY_DIR}
+        DEPENDS udepot_ng_bench USES_TERMINAL)
+
     # Legacy uDepot benchmark for the perf regression gate.
     # Requires UDEPOT_ROOT pointing to a built uDepot tree with libudepot.a.
     if(NOT DEFINED UDEPOT_ROOT)

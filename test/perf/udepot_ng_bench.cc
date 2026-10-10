@@ -48,6 +48,9 @@ struct BenchConfig {
     udepot::ResizeMode resize_mode = udepot::ResizeMode::kIncremental;
     uint32_t initial_tables = 4;
     uint32_t index_bits = 14;
+    // Record each put's latency and print percentiles (--latency): what a
+    // resize costs writers shows in the tail, not in the throughput.
+    bool latency = false;
 };
 
 static double now_secs() {
@@ -61,7 +64,27 @@ struct ThreadResult {
     double exists_secs = 0;
     double del_secs = 0;
     int errors = 0;
+    std::vector<uint32_t> put_ns;  // with --latency
 };
+
+// Put latency percentiles over every thread's puts, and the number of puts
+// past 100 us and 1 ms: a resize that stalls writers shows up there.
+static void print_put_latency(std::vector<uint32_t> ns) {
+    if (ns.empty()) return;
+    std::sort(ns.begin(), ns.end());
+    auto pct = [&](double p) {
+        size_t i = static_cast<size_t>(p / 100.0 * (ns.size() - 1));
+        return ns[i] / 1000.0;
+    };
+    size_t over_100us = ns.end() - std::lower_bound(ns.begin(), ns.end(),
+                                                    100000u);
+    size_t over_1ms = ns.end() - std::lower_bound(ns.begin(), ns.end(),
+                                                  1000000u);
+    printf("PUT latency us: p50=%.2f p90=%.2f p99=%.2f p99.9=%.2f "
+           "p99.99=%.2f max=%.2f over_100us=%zu over_1ms=%zu n=%zu\n",
+           pct(50), pct(90), pct(99), pct(99.9), pct(99.99),
+           ns.back() / 1000.0, over_100us, over_1ms, ns.size());
+}
 
 template <typename IO>
 static ThreadResult run_thread(uDepot<IO>& store,
@@ -74,6 +97,7 @@ static ThreadResult run_thread(uDepot<IO>& store,
     uint8_t keyb[32] = {};
 
     // PUT
+    if (cfg.latency) result.put_ns.reserve(cfg.ops);
     double t0 = now_secs();
     for (uint64_t i = 0; i < cfg.ops; ++i) {
         uint64_t key = (thread_seed + i) * kPrime;
@@ -83,9 +107,15 @@ static ThreadResult run_thread(uDepot<IO>& store,
         std::memcpy(keyb, &key, sizeof(key));
 
         std::memcpy(val.data(), &valu, sizeof(valu));
+        const auto p0 = std::chrono::steady_clock::now();
         int rc = store.put(
             std::span<const uint8_t>(keyb, key_size),
             std::span<const uint8_t>(val.data(), cfg.val_size)).run_sync();
+        if (cfg.latency)
+            result.put_ns.push_back(static_cast<uint32_t>(std::min<int64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - p0).count(),
+                UINT32_MAX)));
         if (rc != 0) {
             fprintf(stderr, "put failed: thread=%d i=%lu rc=%d\n",
                     thread_id, static_cast<unsigned long>(i), rc);
@@ -324,6 +354,7 @@ static int run_bench(const BenchConfig& cfg) {
                r.exists_secs, cfg.ops / (r.exists_secs * 1e6));
         printf("DELs Aggregate time=%lfs Mops/sec=%lf\n",
                r.del_secs, cfg.ops / (r.del_secs * 1e6));
+        print_put_latency(std::move(r.put_ns));
 #ifdef UDEPOT_BUILD_SPDK
         // I/Os SPDK copied through a bounce buffer because their buffer was
         // not DMA memory: zero copy hands the device the store's own.
@@ -362,8 +393,13 @@ static int run_bench(const BenchConfig& cfg) {
                max_exists, total_ops / (max_exists * 1e6), cfg.threads);
         printf("DELs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
                max_del, total_ops / (max_del * 1e6), cfg.threads);
+        std::vector<uint32_t> all;
+        for (auto& r : results)
+            all.insert(all.end(), r.put_ns.begin(), r.put_ns.end());
+        print_put_latency(std::move(all));
     }
 
+    printf("TABLES %u\n", store.directory().num_tables());
     store.close();
     return 0;
 }
@@ -385,7 +421,8 @@ static void usage() {
         "  --resize-mode <m>  incremental (default) or freeze: how a full\n"
         "                 table grows the directory\n"
         "  --initial-tables <n> --index-bits <b>  Directory geometry\n"
-        "                 (default 4 and 14); small values force resizes\n");
+        "                 (default 4 and 14); small values force resizes\n"
+        "  --latency      Print put latency percentiles\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -422,6 +459,8 @@ int main(int argc, char* argv[]) {
                 usage();
                 return 1;
             }
+        } else if (arg == "--latency") {
+            cfg.latency = true;
         } else if (arg == "--initial-tables" && i + 1 < argc) {
             cfg.initial_tables = std::stoul(argv[++i]);
         } else if (arg == "--index-bits" && i + 1 < argc) {

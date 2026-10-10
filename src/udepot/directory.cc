@@ -130,6 +130,10 @@ void Directory::migrate_stripe(DirSnapshot& snap, uint32_t old_table,
                                uint64_t stripe) {
     Resize& rs = *snap.resize;
     const HashTable& old = *rs.old[old_table];
+    // The new tables' slots in this stripe come to life here: nothing has
+    // read or written them before it migrates.
+    snap.tables[2 * old_table]->init_stripe(stripe);
+    snap.tables[2 * old_table + 1]->init_stripe(stripe);
     // An entry's new table is its old one plus the next tag bit; its slot
     // does not change. Each old slot goes to exactly one new table, and no
     // write reaches a stripe's new slots before it migrates: the copy
@@ -273,8 +277,12 @@ int Directory::resize(uint64_t seen) {
     // Allocated here, on the space waker, never on a writer (paper: "Hash
     // tables are pre-allocated during the resize operation in a separate
     // thread to avoid delays").
+    // Lazily: each stripe of the new tables is set up as it migrates.
+    // Setting them all up here made every writer whose table was full wait
+    // for it (223 ms at 32 tables of 2^18 buckets), which is the stall the
+    // incremental resize exists to avoid (scripts/perf-resize-latency.sh).
     auto* snap = new DirSnapshot(old_snap->table_bits + 1, index_bits_,
-                                 old_snap->generation + 1);
+                                 old_snap->generation + 1, /*lazy=*/true);
     auto rs = std::make_unique<Resize>();
     rs->old = old_snap->tables;
     rs->stripes = rs->old[0]->num_stripes();

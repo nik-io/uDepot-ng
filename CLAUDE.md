@@ -200,6 +200,18 @@ buffers. A mutation handing out non-DMA buffers failed it with 75126
 bounces. Paired, zero copy was faster in all 25 SPDK runs measured (PUT
 +0.5 to +7%, GET +1 to +11%).
 
+### Resize tail latency
+
+`scripts/perf-resize-latency.sh` (or `cmake --build build --target
+run_resize_latency_test`) measures put latency while the directory grows,
+for the incremental resize, the freeze-and-copy grow
+(`ResizeMode::kFreeze`) and a no-grow baseline. The incremental resize
+exists for the tail: its worst put must stay near the no-grow baseline's,
+and the script fails unless its median worst put is under a quarter of the
+freeze's. It caught the space waker initializing the new tables up front
+(writers waited 223 ms for it), which "merely below the freeze" did not.
+Not in CI: the default 5 rounds take about two minutes.
+
 ### Performance regression gate
 
 **uDepot-ng must be strictly equal to or faster than uDepot on every

@@ -198,8 +198,25 @@ writers or readers while a resize runs.
   and starts the next; a region nothing writes would otherwise keep the
   writer waiting indefinitely. Ending a handover early waits for a grace
   period, which is why this too runs on the waker, never on an I/O poller.
+- **New tables are set up lazily.** The waker only allocates them; each
+  stripe's slots are initialized when it migrates, under its lock, before
+  its flag is set (nothing reads or writes a stripe's new slots earlier).
+  Initializing them all up front took the waker 223 ms at 32 tables of
+  2^18 buckets, and every writer whose table was full waited for it: the
+  incremental resize's worst put was no better than the freeze's.
 - **Close and recovery** finish a pending resize first: the index is
   persisted as one geometry, and recovery grows inline, alone.
+
+**Measured** (`scripts/perf-resize-latency.sh`, 4 writers, 4M puts on
+`/dev/shm`, 1 -> 32 tables of 2^18 buckets, 5 runs each): the worst put is
+3.7-9.2 ms with the incremental resize, 93-128 ms with the freeze, and
+6-37 ms with no grow at all (salsa's segment allocation and scheduling set
+that floor). p99.99 and the count of puts over 1 ms are alike in all three:
+in this closed-loop benchmark a freeze stalls only the put each writer has
+in flight, so it shows in the maximum. p99.9 is ~10 us higher with the
+incremental resize: the writes that migrate a stripe pay for it. The script
+fails unless the incremental resize's median worst put is under a quarter
+of the freeze's.
 
 `StoreConfig::resize_mode = ResizeMode::kFreeze` keeps the earlier
 mechanism, to compare against (`udepot_ng_bench --resize-mode freeze`):

@@ -41,6 +41,16 @@ public:
 
     // Construct a hash table with 2^index_bits buckets.
     explicit HashTable(uint32_t index_bits);
+
+    // As above, with the slots left uninitialized (untouched memory): a
+    // resize's new table, whose stripes nothing reads or writes until they
+    // migrate. init_stripe() sets a stripe's slots up, before its migration
+    // copies into it. Initializing a whole directory's new tables up front
+    // took the space waker 223 ms at 32 tables of 2^18 buckets, and every
+    // writer whose table was full waited for it.
+    struct Uninitialized {};
+    HashTable(uint32_t index_bits, Uninitialized);
+    void init_stripe(uint64_t stripe) noexcept;
     ~HashTable();
 
     HashTable(const HashTable&) = delete;
@@ -178,7 +188,14 @@ private:
     uint64_t num_stripes_;
     uint64_t slots_per_stripe_;
 
-    std::unique_ptr<std::atomic<uint64_t>[]> slots_;
+    // Raw storage: each slot's lifetime starts when it is set to empty, by
+    // the constructor or init_stripe().
+    struct SlotsDeleter {
+        void operator()(std::atomic<uint64_t>* p) const noexcept {
+            ::operator delete(p, std::align_val_t{64});
+        }
+    };
+    std::unique_ptr<std::atomic<uint64_t>[], SlotsDeleter> slots_;
     std::unique_ptr<Stripe[]> stripes_;
 
     uint64_t hash_to_bucket(uint64_t hash) const noexcept {
