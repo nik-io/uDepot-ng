@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -57,6 +58,13 @@ struct BenchConfig {
     // slow put, and the puts it would have issued meanwhile are never
     // measured (coordinated omission). 0 = closed loop.
     double rate = 0;
+    // Puts each thread keeps in flight (--qd). A put waiting out a resize
+    // then holds one slot, not the thread: the others keep going, and the
+    // wait shows as that put's latency and as the puts that queue behind a
+    // full window. 1 = one put at a time.
+    uint32_t qd = 1;
+    // Only the put phase (--put-only): the latency runs need nothing else.
+    bool put_only = false;
 };
 
 static double now_secs() {
@@ -92,6 +100,82 @@ static void print_put_latency(std::vector<uint32_t> ns) {
            ns.back() / 1000.0, over_100us, over_1ms, ns.size());
 }
 
+// The put phase: up to cfg.qd puts in flight. With --rate, put i is due at
+// put_start + i / rate; it is issued then, or as soon as a slot frees, and
+// its latency counts from when it was due. Returns false on a failed put,
+// once every put in flight has completed.
+template <typename IO>
+static bool put_window(uDepot<IO>& store, const BenchConfig& cfg,
+                       int thread_id,
+                       std::chrono::steady_clock::time_point put_start,
+                       ThreadResult& result) {
+    using Clock = std::chrono::steady_clock;
+    struct Slot {
+        std::optional<udepot::CoroTask<int>> task;
+        Clock::time_point t0;
+        uint64_t i = 0;
+        uint8_t key[32] = {};
+        std::vector<uint8_t> val;
+    };
+    const uint64_t thread_seed = cfg.seed + thread_id * 1000000ULL;
+    std::vector<Slot> slots(std::max<uint32_t>(cfg.qd, 1));
+    std::vector<size_t> free_slots;
+    for (size_t k = 0; k < slots.size(); ++k) {
+        slots[k].val.assign(cfg.val_size, 0);
+        free_slots.push_back(slots.size() - 1 - k);
+    }
+
+    // Reap a finished put: record its latency, free its slot.
+    auto reap = [&](Slot& s) {
+        int rc = s.task->run_sync();
+        s.task.reset();
+        if (cfg.latency)
+            result.put_ns.push_back(static_cast<uint32_t>(std::min<int64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    Clock::now() - s.t0).count(),
+                UINT32_MAX)));
+        if (rc != 0 && !result.errors) {
+            fprintf(stderr, "put failed: thread=%d i=%lu rc=%d\n",
+                    thread_id, static_cast<unsigned long>(s.i), rc);
+            ++result.errors;
+        }
+        free_slots.push_back(&s - slots.data());
+    };
+
+    uint64_t next = 0;
+    while (true) {
+        // Reap first, so a completion is timed before the next issue.
+        for (auto& s : slots)
+            if (s.task && s.task->await_ready()) reap(s);
+        const bool issuing = next < cfg.ops && !result.errors;
+        if (!issuing && free_slots.size() == slots.size()) break;
+        if (issuing && !free_slots.empty()) {
+            auto t = Clock::now();
+            if (cfg.rate > 0) {
+                const auto due = put_start + std::chrono::nanoseconds(
+                    static_cast<int64_t>(next * 1e9 / cfg.rate));
+                if (t < due) { udepot::poll_this_thread(); continue; }
+                t = due;
+            }
+            Slot& s = slots[free_slots.back()];
+            free_slots.pop_back();
+            const uint64_t key = (thread_seed + next) * kPrime;
+            const uint64_t valu = key * kPrime;
+            const uint64_t key_size = 8 + (key % 24);
+            std::memcpy(s.key, &key, sizeof(key));
+            std::memcpy(s.val.data(), &valu, sizeof(valu));
+            s.t0 = t;
+            s.i = next++;
+            s.task.emplace(store.put(
+                std::span<const uint8_t>(s.key, key_size),
+                std::span<const uint8_t>(s.val.data(), cfg.val_size)));
+            continue;
+        }
+        udepot::poll_this_thread();
+    }
+    return !result.errors;
+}
+
 template <typename IO>
 static ThreadResult run_thread(uDepot<IO>& store,
                                const BenchConfig& cfg,
@@ -106,38 +190,10 @@ static ThreadResult run_thread(uDepot<IO>& store,
     if (cfg.latency) result.put_ns.reserve(cfg.ops);
     const auto put_start = std::chrono::steady_clock::now();
     double t0 = now_secs();
-    for (uint64_t i = 0; i < cfg.ops; ++i) {
-        uint64_t key = (thread_seed + i) * kPrime;
-        uint64_t valu = key * kPrime;
-        uint64_t key_size = 8 + (key % 24);
-
-        std::memcpy(keyb, &key, sizeof(key));
-
-        std::memcpy(val.data(), &valu, sizeof(valu));
-        auto p0 = std::chrono::steady_clock::now();
-        if (cfg.rate > 0) {
-            // Due at put_start + i / rate; wait if early, count from then.
-            const auto due = put_start + std::chrono::nanoseconds(
-                static_cast<int64_t>(i * 1e9 / cfg.rate));
-            while (std::chrono::steady_clock::now() < due) {}
-            p0 = due;
-        }
-        int rc = store.put(
-            std::span<const uint8_t>(keyb, key_size),
-            std::span<const uint8_t>(val.data(), cfg.val_size)).run_sync();
-        if (cfg.latency)
-            result.put_ns.push_back(static_cast<uint32_t>(std::min<int64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - p0).count(),
-                UINT32_MAX)));
-        if (rc != 0) {
-            fprintf(stderr, "put failed: thread=%d i=%lu rc=%d\n",
-                    thread_id, static_cast<unsigned long>(i), rc);
-            ++result.errors;
-            return result;
-        }
-    }
+    if (!put_window(store, cfg, thread_id, put_start, result))
+        return result;
     result.put_secs = now_secs() - t0;
+    if (cfg.put_only) return result;
 
     // GET
     std::vector<uint8_t> val_out(cfg.val_size);
@@ -362,12 +418,14 @@ static int run_bench(const BenchConfig& cfg) {
 
         printf("PUTs Aggregate time=%lfs Mops/sec=%lf\n",
                r.put_secs, cfg.ops / (r.put_secs * 1e6));
-        printf("GETs Aggregate time=%lfs Mops/sec=%lf\n",
-               r.get_secs, cfg.ops / (r.get_secs * 1e6));
-        printf("EXISTs Aggregate time=%lfs Mops/sec=%lf\n",
-               r.exists_secs, cfg.ops / (r.exists_secs * 1e6));
-        printf("DELs Aggregate time=%lfs Mops/sec=%lf\n",
-               r.del_secs, cfg.ops / (r.del_secs * 1e6));
+        if (!cfg.put_only) {
+            printf("GETs Aggregate time=%lfs Mops/sec=%lf\n",
+                   r.get_secs, cfg.ops / (r.get_secs * 1e6));
+            printf("EXISTs Aggregate time=%lfs Mops/sec=%lf\n",
+                   r.exists_secs, cfg.ops / (r.exists_secs * 1e6));
+            printf("DELs Aggregate time=%lfs Mops/sec=%lf\n",
+                   r.del_secs, cfg.ops / (r.del_secs * 1e6));
+        }
         print_put_latency(std::move(r.put_ns));
 #ifdef UDEPOT_BUILD_SPDK
         // I/Os SPDK copied through a bounce buffer because their buffer was
@@ -401,12 +459,14 @@ static int run_bench(const BenchConfig& cfg) {
 
         printf("PUTs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
                max_put, total_ops / (max_put * 1e6), cfg.threads);
-        printf("GETs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
-               max_get, total_ops / (max_get * 1e6), cfg.threads);
-        printf("EXISTs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
-               max_exists, total_ops / (max_exists * 1e6), cfg.threads);
-        printf("DELs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
-               max_del, total_ops / (max_del * 1e6), cfg.threads);
+        if (!cfg.put_only) {
+            printf("GETs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
+                   max_get, total_ops / (max_get * 1e6), cfg.threads);
+            printf("EXISTs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
+                   max_exists, total_ops / (max_exists * 1e6), cfg.threads);
+            printf("DELs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
+                   max_del, total_ops / (max_del * 1e6), cfg.threads);
+        }
         std::vector<uint32_t> all;
         for (auto& r : results)
             all.insert(all.end(), r.put_ns.begin(), r.put_ns.end());
@@ -438,7 +498,9 @@ static void usage() {
         "                 (default 4 and 14); small values force resizes\n"
         "  --latency      Print put latency percentiles\n"
         "  --rate <n>     Open loop: n puts/s per thread, latency counted\n"
-        "                 from each put's due time (with --latency)\n");
+        "                 from each put's due time (with --latency)\n"
+        "  --qd <n>       Puts each thread keeps in flight (default: 1)\n"
+        "  --put-only     Run only the put phase\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -477,6 +539,10 @@ int main(int argc, char* argv[]) {
             }
         } else if (arg == "--latency") {
             cfg.latency = true;
+        } else if (arg == "--put-only") {
+            cfg.put_only = true;
+        } else if (arg == "--qd" && i + 1 < argc) {
+            cfg.qd = std::stoul(argv[++i]);
         } else if (arg == "--rate" && i + 1 < argc) {
             cfg.rate = std::stod(argv[++i]);
         } else if (arg == "--initial-tables" && i + 1 < argc) {

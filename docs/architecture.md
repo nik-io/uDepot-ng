@@ -222,6 +222,15 @@ starting. At ~35% load the incremental resize's p95 matched the baseline.
 A closed loop cannot show any of this below the maximum: a stalled writer
 records one slow put, and the puts it would have issued are never measured.
 
+On aio this does not hold yet. A put's commit, and so any stripe migration
+it does, resumes on the store's single completion poller: the migrations
+that two posix writers share run there one after another, and every
+writer's completions wait behind them. With 16 puts in flight per writer
+the incremental resize's p95 was 721 us against the freeze's 233 us, whose
+copy runs on the waker, off the completion path. The CI gate
+(`scripts/perf-resize-latency.sh`, 16 in flight per writer) runs on posix
+until that is fixed.
+
 `StoreConfig::resize_mode = ResizeMode::kFreeze` keeps the earlier
 mechanism, to compare against (`udepot_ng_bench --resize-mode freeze`):
 the waker sets the snapshot's `frozen` flag, which writers check under their

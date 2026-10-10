@@ -24,16 +24,29 @@
 #   - Two writers on /dev/shm, leaving CPUs to salsa's allocator and the
 #     space waker: at four writers on four CPUs even the no-grow baseline's
 #     p99 was milliseconds.
+#   - QD (default 16) puts in flight per writer (udepot_ng_bench --qd): a
+#     put waiting out a resize holds one slot, not its writer, as it would
+#     under a real client.
 #
-# Each run: 2 writers, 2M puts, the directory growing from 1 to 32 tables
-# (no-grow starts at 32). Runs are interleaved across the modes.
+# Each run: 2 writers, 2M puts, the directory growing from 1 to 32 tables.
+# Fewer puts stop at 16 tables, and the freeze's last copy is then too short
+# to separate the modes reliably. Runs are interleaved across the modes;
+# NOGROW=1 adds a baseline starting at 32 tables (not gated). Three runs
+# take about 30 s, the CI budget.
+#
+# Posix only for now: on aio a put's commit, and so its stripe migrations,
+# run on the store's single completion poller, which serializes the
+# migrations and inverts the result (see CLAUDE.md, "Resize tail latency").
 #
 # Usage: perf-resize-latency.sh [build_dir] [runs]
 set -uo pipefail
 
 BUILD_DIR="${1:-build}"
-RUNS="${2:-5}"
+RUNS="${2:-3}"
 LOAD="${LOAD:-0.6}"
+QD="${QD:-16}"
+MODES="incremental freeze"
+[ "${NOGROW:-0}" = 1 ] && MODES+=" nogrow"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 case "$BUILD_DIR" in
     /*) BIN="$BUILD_DIR/udepot_ng_bench" ;;
@@ -43,7 +56,7 @@ esac
 FILE="/dev/shm/udepot-ng-resize-latency.store"
 trap 'rm -f "$FILE"' EXIT
 COMMON=(--backend posix -f "$FILE" -w 1000000 --threads 2 --grain-size 64
-        --val-size 16 --index-bits 17)
+        --val-size 16 --index-bits 17 --put-only --qd "$QD")
 
 mode_args() {
     case "$1" in
@@ -60,7 +73,7 @@ mops=$("$BIN" "${COMMON[@]}" $(mode_args nogrow) 2>/dev/null |
                                                            print kv[2] } }')
 [ -n "$mops" ] || { echo "FATAL: the calibration run produced no throughput" >&2; exit 2; }
 RATE=$(awk -v m="$mops" -v l="$LOAD" 'BEGIN { printf "%d", m * 1e6 / 2 * l }')
-echo "capacity ${mops} Mops/s (2 writers); open loop at ${RATE} puts/s per writer (load ${LOAD})" >&2
+echo "capacity ${mops} Mops/s (2 writers, qd ${QD}); open loop at ${RATE} puts/s per writer (load ${LOAD})" >&2
 
 run() {  # mode -> "p95 p99 max"
     rm -f "$FILE"
@@ -75,7 +88,11 @@ median() { printf '%s\n' "$@" | sort -n | \
 
 declare -A p95 p99 max
 for r in $(seq 1 "$RUNS"); do
-    for m in incremental freeze nogrow; do
+    # Alternate which mode runs first, so neither always gets the warmer
+    # (or the noisier) slot.
+    order=$MODES
+    [ $((r % 2)) = 0 ] && order=$(printf '%s\n' $MODES | tac | tr '\n' ' ')
+    for m in $order; do
         read -r a b c <<<"$(run "$m")"
         [ -n "$c" ] || { echo "FATAL: a $m run produced no latency" >&2; exit 2; }
         echo "  run $r $m: p95=${a}us p99=${b}us max=${c}us" >&2
@@ -84,7 +101,7 @@ for r in $(seq 1 "$RUNS"); do
 done
 
 echo "put latency, median of $RUNS runs (us):" >&2
-for m in incremental freeze nogrow; do
+for m in $MODES; do
     printf '  %-11s p95=%s p99=%s max=%s\n' "$m" "$(median ${p95[$m]})" \
         "$(median ${p99[$m]})" "$(median ${max[$m]})" >&2
 done
