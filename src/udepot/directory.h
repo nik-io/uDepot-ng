@@ -16,6 +16,20 @@
 
 namespace udepot {
 
+// Where a directory's tables come from and go. The store backs each table
+// with an index segment of its own for the table's life, as uDepot's
+// uDepotDirectoryMap::grow() allocates one per table; tests use memory.
+class TableSource {
+public:
+    virtual ~TableSource() = default;
+    // A new, cleared table, or nullptr if there is no space for one.
+    virtual std::unique_ptr<HashTable> new_table() = 0;
+    // `table` has left the directory (or never entered it): no writer
+    // reaches it, though readers may until a grace period ends. Release
+    // what backs it on the device; its memory goes with the table.
+    virtual void retire_table(HashTable& table) = 0;
+};
+
 // A snapshot of the directory: 2^table_bits hash tables. Immutable once
 // published; grow() creates a new one.
 //
@@ -35,12 +49,9 @@ struct DirSnapshot {
     // their stripe lock and back off; readers ignore it.
     std::atomic<bool> frozen{false};
 
-    DirSnapshot(uint32_t table_bits, uint32_t index_bits, uint64_t generation)
-        : table_bits(table_bits), generation(generation) {
-        tables.reserve(1u << table_bits);
-        for (uint32_t i = 0; i < (1u << table_bits); ++i)
-            tables.push_back(std::make_unique<HashTable>(index_bits));
-    }
+    // `tables` holds a power of two of them, at most 2^kMaxTableBits.
+    DirSnapshot(std::vector<std::unique_ptr<HashTable>> tables,
+                uint64_t generation);
 
     uint32_t size() const noexcept {
         return static_cast<uint32_t>(tables.size());
@@ -75,8 +86,10 @@ struct DirSnapshot {
 // (wait_for_grow) and retries on the new snapshot.
 class Directory {
 public:
-    // initial_tables is rounded up to a power of two.
-    Directory(Rcu& rcu, uint32_t initial_tables, uint32_t index_bits);
+    // Starts with `tables` (a power of two of them; uDepot starts with
+    // one), and takes grown ones from `source`.
+    Directory(Rcu& rcu, TableSource& source,
+              std::vector<std::unique_ptr<HashTable>> tables);
     ~Directory();
 
     Directory(const Directory&) = delete;
@@ -123,13 +136,13 @@ public:
 
     // Double the number of tables, unless the current snapshot is no longer
     // the one of generation `seen` (another grow did it). Returns 0, or
-    // -ENOSPC at the maximum size. Waits for a grace period, so it must not be called inside a
-    // read-side section, nor on a thread whose progress in-flight
+    // -ENOSPC at the maximum size or if the source has no space for the
+    // new tables. Waits for a grace period, so it must not be called inside
+    // a read-side section, nor on a thread whose progress in-flight
     // operations depend on (an I/O poller).
     int grow(uint64_t seen = kAnyGeneration);
 
     uint32_t num_tables() const noexcept;
-    uint32_t index_bits() const noexcept;
 
     // The current snapshot, for callers no grow or write can race:
     // persisting the index at close() and restoring it at open().
@@ -139,7 +152,7 @@ public:
 
 private:
     Rcu& rcu_;
-    uint32_t index_bits_;
+    TableSource& source_;
     alignas(64) std::atomic<DirSnapshot*> current_;
     alignas(64) std::mutex grow_mutex_;  // one grow at a time
     std::mutex grown_mu_;

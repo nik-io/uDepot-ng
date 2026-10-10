@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -34,8 +35,6 @@ protected:
         config_.path = path_.c_str();
         config_.size = kStoreSize;
         config_.grain_size = 512;
-        config_.initial_tables = 2;
-        config_.index_bits = 10;
         config_.force_destroy = true;
     }
 
@@ -404,7 +403,8 @@ TEST_P(StoreRecoveryTest, TombstonesSurviveReopenAndChurn) {
 
 // The directory comes back at the size it had grown to.
 TEST_P(StoreRecoveryTest, GrownDirectorySurvivesReopen) {
-    config_.index_bits = 6;
+    config_.size = 16 * 1024 * 1024 + 4096;
+    config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
     constexpr int kKeys = 1500;
     uint32_t tables = 0;
     {
@@ -418,33 +418,48 @@ TEST_P(StoreRecoveryTest, GrownDirectorySurvivesReopen) {
     }
     uDepot<PosixIO> store;
     ASSERT_EQ(store.open(reopen_config()), 0);
+    EXPECT_EQ(store.index_restored(), GetParam() == Shutdown::kClean);
     if (GetParam() == Shutdown::kClean) {
         EXPECT_EQ(store.directory().num_tables(), tables);
     }
     for (int i = 0; i < kKeys; ++i)
         ASSERT_EQ(get_value(store, make_key(i)), make_val(i)) << make_key(i);
+    // Whichever way it came back, the directory has its segments again
+    // (crash recovery builds it in memory first), so a clean close
+    // persists it.
+    tables = store.directory().num_tables();
     store.close();
+    uDepot<PosixIO> again;
+    ASSERT_EQ(again.open(reopen_config()), 0);
+    EXPECT_TRUE(again.index_restored());
+    EXPECT_EQ(again.directory().num_tables(), tables);
+    for (int i = 0; i < kKeys; ++i)
+        ASSERT_EQ(get_value(again, make_key(i)), make_val(i)) << make_key(i);
+    again.close();
 }
 
-// A table larger than a segment spans several index segments.
-TEST_P(StoreRecoveryTest, TableLargerThanASegmentSurvivesReopen) {
-    config_.size = 32 * 1024 * 1024 + 4096;
-    config_.segment_size = 2048;  // 1 MiB: a 2^18-bucket table needs three
-    config_.index_bits = 18;
-    {
+// As in uDepot, a table fills its segment: the segment size sets the
+// table's width, whatever the device, and a table never spans segments.
+TEST_P(StoreRecoveryTest, SegmentSizeSetsTheTableSize) {
+    for (uint64_t seg : {16u, 64u, 2048u}) {
+        config_.size = 32 * 1024 * 1024 + 4096;
+        config_.segment_size = seg;
         uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);
-        for (int i = 0; i < 200; ++i)
+        const auto& table = *store.directory().snapshot().tables[0];
+        const size_t net = (seg - 1) * config_.grain_size;  // 1 md grain
+        EXPECT_EQ(table.index_bits(), udepot::HashTable::index_bits_for(net));
+        EXPECT_EQ(table.region().net_bytes(), net);
+        EXPECT_EQ(table.region().map_bytes(), seg * config_.grain_size);
+        for (int i = 0; i < 50; ++i)
             ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
-        ASSERT_EQ(store.put(make_key(0), "rejected", udepot::PutMode::kCreate)
-                      .run_sync(), -EEXIST);
         end_session(store);
+        uDepot<PosixIO> again;
+        ASSERT_EQ(again.open(reopen_config()), 0);
+        for (int i = 0; i < 50; ++i)
+            ASSERT_EQ(get_value(again, make_key(i)), make_val(i));
+        again.close();
     }
-    uDepot<PosixIO> store;
-    ASSERT_EQ(store.open(reopen_config()), 0);
-    for (int i = (GetParam() == Shutdown::kClean ? 0 : 1); i < 200; ++i)
-        ASSERT_EQ(get_value(store, make_key(i)), make_val(i)) << make_key(i);
-    store.close();
 }
 
 // The device metadata lives in the tail past the last whole segment. A
@@ -527,7 +542,6 @@ TEST_P(StoreIndexTest, RecreatedStoreDoesNotRecoverTheOldStoresRecords) {
 TEST_P(StoreIndexTest, RestoredIndexIsNotRestoredAgainAfterACrash) {
     config_.size = 32 * 1024 * 1024 + 4096;
     config_.segment_size = 2048;  // 1 MiB
-    config_.initial_tables = 1;
     constexpr int kKeys = 2000;
     const std::string big(1500, 'v');
     {
@@ -561,11 +575,14 @@ TEST_P(StoreIndexTest, IncompleteIndexFallsBackToTheLog) {
     static int footers;
     footers = 0;
     uDepot<PosixIO>::index_footer_test_hook = [] { return footers++ < 1; };
+    config_.size = 16 * 1024 * 1024 + 4096;
+    config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
     {
         uDepot<PosixIO> store;
-        ASSERT_EQ(store.open(config()), 0);  // two tables: two footers
-        for (int i = 0; i < 100; ++i)
+        ASSERT_EQ(store.open(config()), 0);
+        for (int i = 0; i < 1000; ++i)
             ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        ASSERT_GE(store.directory().num_tables(), 2u);  // two footers at least
         ASSERT_EQ(store.put(make_key(0), "rejected", udepot::PutMode::kCreate)
                       .run_sync(), -EEXIST);
         store.close();
@@ -575,11 +592,158 @@ TEST_P(StoreIndexTest, IncompleteIndexFallsBackToTheLog) {
 
     uDepot<PosixIO> store;
     ASSERT_EQ(store.open(reopen_config()), 0);
-    for (int i = 1; i < 100; ++i)
+    EXPECT_FALSE(store.index_restored());
+    for (int i = 1; i < 1000; ++i)
         ASSERT_EQ(get_value(store, make_key(i)), make_val(i)) << make_key(i);
     // Only the log holds the rejected record: seeing it proves the log
     // was scanned rather than the half-written index restored.
     EXPECT_EQ(get_value(store, make_key(0)), "rejected");
+    store.close();
+}
+
+// As uDepot's directory, each table keeps one index segment for its life:
+// close() writes it back there, and the next open restores it from there.
+TEST_P(StoreIndexTest, TablesKeepTheirSegmentsAcrossReopen) {
+    config_.size = 16 * 1024 * 1024 + 4096;
+    config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
+    auto grains = [](uDepot<PosixIO>& store) {
+        std::set<uint64_t> g;
+        for (auto& t : store.directory().snapshot().tables)
+            g.insert(t->region().grain());
+        return g;
+    };
+    std::set<uint64_t> before;
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        for (int i = 0; i < 1500; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        before = grains(store);
+        ASSERT_GE(before.size(), 4u);
+        ASSERT_EQ(before.size(), store.directory().num_tables())
+            << "two tables share a segment";
+        store.close();
+    }
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(reopen_config()), 0);
+    EXPECT_TRUE(store.index_restored());
+    EXPECT_EQ(grains(store), before);
+    for (int i = 0; i < 1500; ++i)
+        ASSERT_EQ(get_value(store, make_key(i)), make_val(i)) << make_key(i);
+    // And they are still the store's for the session: nothing else may
+    // take their segments, writes and a grow go on, and the next close
+    // writes them back to the same place.
+    for (int i = 1500; i < 3000; ++i)
+        ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+    std::set<uint64_t> grown = grains(store);
+    store.close();
+    uDepot<PosixIO> again;
+    ASSERT_EQ(again.open(reopen_config()), 0);
+    EXPECT_TRUE(again.index_restored());
+    EXPECT_EQ(grains(again), grown);
+    for (int i = 0; i < 3000; ++i)
+        ASSERT_EQ(get_value(again, make_key(i)), make_val(i)) << make_key(i);
+    again.close();
+}
+
+// A restored table's segment stays the table's: with the device churned
+// several times over, every free segment is reused for data, and one the
+// table had lost would have its records overwritten by the table at close,
+// or the table by them.
+TEST_P(StoreIndexTest, RestoredTablesKeepTheirSegmentsUnderChurn) {
+    config_.size = 4 * 1024 * 1024 + 4096;
+    config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
+    constexpr int kKeys = 1500;
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        for (int i = 0; i < kKeys; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        store.close();
+    }
+    constexpr int kRounds = 16;  // about three times the device
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(reopen_config()), 0);
+        ASSERT_TRUE(store.index_restored());
+        for (int round = 1; round <= kRounds; ++round)
+            for (int i = 0; i < kKeys; ++i)
+                ASSERT_EQ(store.put(make_key(i), make_val(i + round * kKeys))
+                              .run_sync(), 0);
+        store.close();
+    }
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(reopen_config()), 0);
+    EXPECT_TRUE(store.index_restored());
+    for (int i = 0; i < kKeys; ++i)
+        ASSERT_EQ(get_value(store, make_key(i)), make_val(i + kRounds * kKeys))
+            << make_key(i);
+    store.close();
+}
+
+// As uDepot's KV_conf::sanitize_segment_size, a store's segment size is
+// whole pages; with it the default segment (2^29 bytes + 2 grains) becomes
+// a 2 MiB multiple, which a table maps on huge pages.
+TEST_P(StoreIndexTest, SegmentSizeIsWholePages) {
+    config_.size = 64 * 1024 * 1024 + 4096;
+    config_.segment_size = 4096 + 2;  // 2 MiB + 2 grains
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(config()), 0);
+    const auto& region = store.directory().snapshot().tables[0]->region();
+    EXPECT_EQ(region.map_bytes(), size_t{4096} * config_.grain_size);
+    EXPECT_EQ(region.map_bytes() % udepot::TableRegion::kHugePage, 0u);
+    store.close();
+}
+
+// The index holds its segments for the whole session, so a store full of
+// live data can still write it back at close. It used to take its
+// segments only then, and a full store fell back to the log scan.
+TEST_P(StoreIndexTest, AFullStoreStillPersistsItsIndex) {
+    config_.segment_size = 64;  // 32 KiB
+    const std::string val(200, 'f');  // get_value reads up to 256
+    int written = 0;
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        for (;; ++written) {
+            int rc = store.put(make_key(written), val).run_sync();
+            if (rc == -ENOSPC) break;
+            ASSERT_EQ(rc, 0);
+        }
+        ASSERT_GT(written, 100);
+        store.close();
+    }
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(reopen_config()), 0);
+    EXPECT_TRUE(store.index_restored());
+    for (int i = 0; i < written; ++i)
+        ASSERT_EQ(get_value(store, make_key(i)), val) << make_key(i);
+    store.close();
+}
+
+// A grow that finds no index segment for its tables fails the put that
+// needed it with -ENOSPC, as uDepot's put does, instead of retrying
+// forever; the next put that finds its table full tries again.
+TEST_P(StoreIndexTest, AGrowWithoutASegmentFailsThePut) {
+    config_.size = 16 * 1024 * 1024 + 4096;
+    config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(config()), 0);
+    uDepot<PosixIO>::index_segment_test_hook = [] { return false; };
+    int i = 0;
+    int rc = 0;
+    for (; i < 5000; ++i) {
+        rc = store.put(make_key(i), make_val(i)).run_sync();
+        if (rc != 0) break;
+    }
+    uDepot<PosixIO>::index_segment_test_hook = nullptr;
+    EXPECT_EQ(rc, -ENOSPC);
+    EXPECT_EQ(store.directory().num_tables(), 1u);
+    // With segments to be had again, the same put grows the directory.
+    ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+    EXPECT_EQ(store.directory().num_tables(), 2u);
+    for (int j = 0; j <= i; ++j)
+        ASSERT_EQ(get_value(store, make_key(j)), make_val(j)) << make_key(j);
     store.close();
 }
 

@@ -9,21 +9,20 @@
 
 namespace udepot {
 
-namespace {
-
-uint32_t table_bits_for(uint32_t tables) {
-    uint32_t bits = 0;
-    while ((1u << bits) < tables && bits < DirSnapshot::kMaxTableBits) ++bits;
-    return bits;
+DirSnapshot::DirSnapshot(std::vector<std::unique_ptr<HashTable>> tables,
+                         uint64_t generation)
+    : tables(std::move(tables)),
+      table_bits(static_cast<uint32_t>(std::countr_zero(this->tables.size()))),
+      generation(generation) {
+    assert(std::has_single_bit(this->tables.size()) &&
+           table_bits <= kMaxTableBits);
 }
 
-}  // namespace
-
-Directory::Directory(Rcu& rcu, uint32_t initial_tables, uint32_t index_bits)
+Directory::Directory(Rcu& rcu, TableSource& source,
+                     std::vector<std::unique_ptr<HashTable>> tables)
     : rcu_(rcu),
-      index_bits_(index_bits),
-      current_(new DirSnapshot(table_bits_for(initial_tables), index_bits,
-                               0)) {}
+      source_(source),
+      current_(new DirSnapshot(std::move(tables), 0)) {}
 
 Directory::~Directory() {
     // Snapshots retired by grow() are freed by RCU callbacks.
@@ -89,8 +88,19 @@ int Directory::grow(uint64_t seen) {
         return 0;  // someone else grew it
     if (old_snap->table_bits >= DirSnapshot::kMaxTableBits) return -ENOSPC;
 
-    // Allocated before freezing: writers stall only for the copy.
-    auto* new_snap = new DirSnapshot(old_snap->table_bits + 1, index_bits_,
+    // Allocated before freezing: writers stall only for the copy. As
+    // uDepot's grow(), each new table gets a segment of its own.
+    std::vector<std::unique_ptr<HashTable>> tables;
+    tables.reserve(2 * old_snap->size());
+    for (uint32_t i = 0; i < 2 * old_snap->size(); ++i) {
+        auto table = source_.new_table();
+        if (!table) {
+            for (auto& t : tables) source_.retire_table(*t);
+            return -ENOSPC;
+        }
+        tables.push_back(std::move(table));
+    }
+    auto* new_snap = new DirSnapshot(std::move(tables),
                                      old_snap->generation + 1);
 
     // As uDepot's rwpflock write_enter + write_wait_readers, for writers
@@ -123,6 +133,9 @@ int Directory::grow(uint64_t seen) {
     }
     grown_cv_.notify_all();
 
+    // The old tables' segments are free once no writer can reach them, as
+    // uDepot's grow() invalidates them; readers still use their memory.
+    for (auto& t : old_snap->tables) source_.retire_table(*t);
     // Readers may still be in the old snapshot: free it after a grace
     // period, off this path (call_rcu).
     rcu_.call([old_snap] { delete old_snap; });
@@ -133,7 +146,5 @@ uint32_t Directory::num_tables() const noexcept {
     Rcu::ReadGuard guard(rcu_);
     return current_.load(std::memory_order_acquire)->size();
 }
-
-uint32_t Directory::index_bits() const noexcept { return index_bits_; }
 
 }  // namespace udepot

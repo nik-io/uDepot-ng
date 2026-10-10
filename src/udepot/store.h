@@ -70,10 +70,11 @@ struct StoreConfig {
     const char* path = nullptr;
     size_t size = 0;
     uint32_t grain_size = 512;
-    uint32_t initial_tables = 2;
-    uint32_t index_bits = 10;
-    // Segment size in grains. 0 = auto (uDepot default: (1<<29)/grain_size + 2,
-    // halved until it fits the device).
+    // Segment size in grains, sanitized to whole pages as uDepot's
+    // KV_conf::sanitize_segment_size. 0 = auto (uDepot default:
+    // (1<<29)/grain_size + 2, halved until it fits the device). It also
+    // sizes the directory's hash tables: each fills one index segment, as
+    // in uDepot, so smaller segments make smaller tables.
     uint64_t segment_size = 0;
     // Overprovision in per-mille (200 = 20% reserved for GC).
     uint32_t overprovision = 200;
@@ -298,6 +299,13 @@ public:
     using FooterHook = bool (*)();
     inline static std::atomic<FooterHook> index_footer_test_hook{nullptr};
 
+    // Test seam, never set in production: called before allocating an
+    // index segment for a new table; returning false fails the allocation,
+    // as on a device with no segment free for one.
+    using IndexSegmentHook = bool (*)();
+    inline static std::atomic<IndexSegmentHook> index_segment_test_hook{
+        nullptr};
+
     Directory& directory() { return *directory_; }
     const Directory& directory() const { return *directory_; }
     Rcu& rcu() { return rcu_; }
@@ -305,11 +313,15 @@ public:
     uint32_t grain_size() const { return grain_size_; }
     // The device seed: binds segment metadata and records to this store.
     uint64_t seed() const noexcept { return seed_; }
+    // Whether open() restored the index from its segments (the store was
+    // shut down cleanly), rather than scanning the log.
+    bool index_restored() const noexcept { return index_restored_; }
 
 private:
     Rcu rcu_;
     IO io_;
     Directory* directory_ = nullptr;
+    bool index_restored_ = false;
     uint32_t grain_size_ = 512;
     uint64_t total_grains_ = 0;
 
@@ -341,16 +353,22 @@ private:
         uDepot* store;
         // A grow of this snapshot generation to run, if any.
         uint64_t grow = Directory::kAnyGeneration;
+        std::coroutine_handle<> handle{};
+        // That grow's result, as uDepot's put gets its grow()'s: set by the
+        // waker when the grow fails.
+        int result = 0;
         bool await_ready() noexcept { return false; }
         bool await_suspend(std::coroutine_handle<> h);
-        void await_resume() noexcept {}
+        int await_resume() noexcept { return result; }
     };
     void space_waker_loop();
     void stop_space_waker();
-    void resume_waiters(std::unique_lock<std::mutex>& lock);
+    // Resume every waiter; those that asked for a grow of `gen` get `rc`.
+    void resume_waiters(std::unique_lock<std::mutex>& lock,
+                        uint64_t gen = Directory::kAnyGeneration, int rc = 0);
     std::mutex space_mu_;
     std::condition_variable space_cv_;
-    std::vector<std::coroutine_handle<>> space_waiters_;  // space_mu_
+    std::vector<SpaceWait*> space_waiters_;  // space_mu_
     std::optional<uint64_t> grow_request_;                // space_mu_
     bool space_stop_ = false;                             // space_mu_
     std::thread space_waker_;
@@ -404,12 +422,14 @@ private:
     }
 
     // ── Index segments (paper §4.4) ─────────────────────────────────────
-    // close() flushes the hash tables to index segments, and an open after
-    // a clean shutdown restores them instead of scanning the log; the log
-    // stays the source of truth after a crash. As uDepot's
-    // uDepotDirectoryMap, the index has a salsa controller of its own: a
-    // net-segment allocation fills exactly one segment, and its segments'
-    // metadata carry its type, so the log scan skips them.
+    // As uDepot's uDepotDirectoryMap, each hash table maps to an index
+    // segment of its own for the table's whole life: the table fills the
+    // segment, lives in a mapping of it (TableRegion), and is written back
+    // to it at close(). An open after a clean shutdown restores the tables
+    // from their segments instead of scanning the log; the log stays the
+    // source of truth after a crash. The index has a salsa controller of
+    // its own: a net-segment allocation fills exactly one segment, and its
+    // segments' metadata carry its type, so the log scan skips them.
     class IndexCtlr final : public salsa::SalsaCtlr {
     public:
         explicit IndexCtlr(uDepot* store) : store_(store) {}
@@ -424,10 +444,35 @@ private:
         uDepot* store_;
     };
     std::unique_ptr<IndexCtlr> index_ctlr_;
+    // The directory's tables, each on an index segment.
+    class IndexTables final : public TableSource {
+    public:
+        explicit IndexTables(uDepot* store) : store_(store) {}
+        std::unique_ptr<HashTable> new_table() override {
+            return store_->new_index_table();
+        }
+        void retire_table(HashTable& table) override {
+            store_->retire_index_table(table);
+        }
+
+    private:
+        uDepot* store_;
+    };
+    IndexTables index_tables_{this};
+    // While crash recovery walks the log, every segment holding records it
+    // has yet to read is in use, and on a full device no other is free:
+    // tables then live in memory alone, and get their segments once the
+    // walk has freed the dead ones (assign_index_segments).
+    bool index_unbacked_ = false;
+    std::unique_ptr<HashTable> new_index_table();
+    void retire_index_table(HashTable& table);
+    int assign_index_segments();
+    // The directory with its first table (uDepot's init: grow() from none).
+    int create_directory();
     // Newest index timestamp seen on the device; the next flush is newer.
     uint64_t index_ts_ = 0;
     void index_seg_md_callback(uint64_t md_grain);
-    // Write every table to index segments, footers last. Returns 0 or
+    // Write every table back to its segment, footers last. Returns 0 or
     // -errno; on failure no complete index is left, and the next open
     // scans the log.
     int flush_index();
@@ -525,8 +570,9 @@ private:
                    uint64_t tomb_pba, HashEntry* removed, uint64_t* gen);
 
     // Wait, outside the read section, until the snapshot of `gen` has been
-    // replaced, asking the waker to grow it if `grow`. As in
-    // allocate_or_wait, `guard` is released and `probe` cleared meanwhile.
+    // replaced, asking the waker to grow it if `grow`; -ENOSPC if that grow
+    // found no index segment for its tables. As in allocate_or_wait,
+    // `guard` is released and `probe` cleared meanwhile.
     CoroTask<int> wait_for_grow(uint64_t gen, bool grow,
                                 std::optional<Rcu::ReadGuard>& guard,
                                 KeyProbe* probe);

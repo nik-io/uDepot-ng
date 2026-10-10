@@ -176,6 +176,13 @@ or on an I/O poller thread (which in-flight reads may be waiting on): a
 writer that finds its table full leaves its section and suspends, and the
 store's waker thread runs the grow.
 
+Writers stall for the whole copy, which grows with the index (tens of ms
+from 16 to 32 tables of 2^17 slots). The paper's incremental resize (§4.3)
+would spread it over the writes; it was implemented and measured, and
+dropped (`docs/udepot-paper.md`, §4.3). `udepot_ng_bench --latency --rate
+--qd` measures put latency through grows (a small `--segment-size`, so small
+tables, forces them).
+
 ### 3. Eager-Start C++23 Coroutines
 
 All API operations return an eagerly-started coroutine. The coroutine body
@@ -529,8 +536,8 @@ metadata; see `docs/udepot-paper.md`, §4.4), so a uDepot-ng store and a uDepot
 store can read each other. **Known divergences:**
 
 - Index segment headers and footers extend uDepot's `dirmap_hdr` /
-  `dirmap_ftr` (below) with the table's size and its part number. uDepot
-  sized every table to fill its segment, so it needed neither.
+  `dirmap_ftr` (below) with the table's size, which restore checks against
+  the size the segment gives.
 
 ### Record identity
 
@@ -582,36 +589,72 @@ device overwrote it and the next open started an empty store.
 
 ### Index segments (paper §4.4)
 
-`close()` flushes the directory to index segments, and an open after a clean
-shutdown restores it instead of scanning the log. After a crash the log scan
-decides, as the paper says: *"the persistent source of truth is the log"*.
+As uDepot's `uDepotDirectoryMap`, the directory's hash tables map to index
+segments: each table has one of its own for its whole life, is as large as
+the segment allows, and is written back to it at `close()`. An open after a
+clean shutdown restores the tables from their segments instead of scanning
+the log. After a crash the log scan decides, as the paper says: *"the
+persistent source of truth is the log"*.
 
-- **Allocation.** As uDepot's `uDepotDirectoryMap`, the index has a salsa
-  controller of its own (`IndexCtlr`). A net-segment allocation fills exactly
-  one segment, and its segment metadata carry the index controller's type,
-  so the log scan skips index segments. uDepot keeps its tables mmap'd on
-  index segments for the store's whole life; uDepot-ng's tables live in
-  memory (SPDK has no mmap) and are written with explicit writes at
-  `close()`, while GC still runs to free the segments they need. If they
-  cannot be written, the next open scans the log.
-- **Layout**, one table (or one part of a table larger than a segment) per
-  index segment, as uDepot lays out a directory segment:
+- **One segment per table.** The index has a salsa controller of its own
+  (`IndexCtlr`), so its segments' metadata carry its type and the log scan
+  skips them. A new table, at open or in a grow, takes a net-segment
+  allocation (exactly one segment), and keeps it until a grow retires the
+  table (`TableSource`); its grains stay valid meanwhile, so neither GC nor
+  a data allocation can take it, and a store full of live data can still
+  write its index back. Retired tables' grains are invalidated as the grow
+  publishes the new snapshot; their memory waits out a grace period.
+- **Size.** As `uDepotMap::restore`: the largest power of two of buckets,
+  plus one neighborhood, that fits between the header and the footer
+  (`HashTable::index_bits_for`). The segment size is the only knob; tests
+  get small tables from small segments. The directory starts with one
+  table, as uDepot's `init()` grows from none.
+- **Memory** (`TableRegion`). An anonymous mapping of the whole segment,
+  uDepot's mapping on its AIO and SPDK backends: read from the segment on
+  restore, written back at close. As uDepot's fix for the shutdown overrun
+  (0e0b0a0), the mapping always spans the full segment
+  (`get_seg_size() * grain`), on huge pages when that is a 2 MiB multiple
+  (segments tile the device from offset 0, so such a segment is 2 MiB
+  aligned as well), falling back to 4 KiB pages if no huge page is free;
+  any other size maps on 4 KiB pages. The footer at the end of the net
+  region is then always inside the mapping, and the segment's salsa
+  metadata in the tail past it is never written from it. As uDepot's
+  `KV_conf::sanitize_segment_size`, a store's segment size is whole pages,
+  which makes the default (2^29 bytes + 2 grains) a 2 MiB multiple for
+  grains under 2 KiB. Verified: with huge pages reserved, strace shows the
+  table's segment mapped `MAP_HUGETLB`, and the store suites pass on it.
+- **Layout**, as uDepot lays out a directory segment:
   `[IndexHdr 512 B | slots, 8 B each | ... | IndexFtr 512 B]`, the footer at
   the end of the net segment. Slots are `HashEntry`'s raw 64 bits, which use
   uDepot's bitfield layout.
-- **Ordering.** Every table is written before any footer, and a footer
+- **Close.** GC stops first: it relocates records, updating the tables,
+  which are then written back as they stand. Each table's header and slots
+  go to its segment, and only once every table is there its footer, which
   carries a checksum bound to the device seed and the flush's timestamp,
-  which is newer than any index seen on the device. An index is complete
-  when, for its timestamp, every (table, part) has a valid footer; only the
-  newest index is considered.
-- **Restore.** Load the tables; rebuild salsa's per-segment valid counts from
-  the entries, as uDepot's `restore()` does: a live entry holds `kv_size`
-  grains, a deleted one its tombstone's, read from the tombstone's header.
-  Index segments are not restored, so salsa sees them as free.
+  newer than any index seen on the device. An index is complete when, for
+  its timestamp, every table has a valid footer; only the newest index is
+  considered. If the writes fail, the next open scans the log.
+- **Restore.** Map each table over its segment and read it in; rebuild
+  salsa's per-segment valid counts from the entries, as uDepot's
+  `restore()` does (a live entry holds `kv_size` grains, a deleted one its
+  tombstone's, read from the tombstone's header); keep the tables' segments
+  for the session. Index segments that are not the current index's are
+  free.
 - **Invalidation.** Every valid footer found at open is cleared before
   anything is written, restored or not, as uDepot's `invalidate_ftr()`:
   otherwise a crash later in the session could restore an index older than
   the log.
+- **Crash recovery** walks the log segment by segment, restoring each and
+  invalidating its dead grains as it goes. Its tables live in memory alone
+  until the walk is done, then take their segments once salsa's threads
+  run. uDepot instead restores every data segment before its first grow, so
+  the grow cannot take one whose records are unread; on a full device that
+  provisions more than salsa's capacity, which salsa drops (only an assert
+  checks it), and the walk's invalidations then underflow salsa's used
+  count, so every later allocation fails.
+- **A grow with no segment free** fails: the write whose table was full
+  gets -ENOSPC, as uDepot's put does when its grow fails, rather than
+  waiting forever; the next write that finds its table full asks again.
 - **No periodic flush, deliberately.** The paper also flushes *"periodically
   to speed recovery"*. uDepot gets that only from the kernel writing back
   its mmap'd tables, and its footers are valid only after a clean shutdown,
@@ -620,15 +663,6 @@ decides, as the paper says: *"the persistent source of truth is the log"*.
   flushed index and then replays the log written since (dropping entries
   that point into segments reused after the flush), which neither has. That
   path is a design of its own, deferred until there is a need for it.
-- **Not yet: index space charged up front.** uDepot keeps its tables on
-  index segments for the whole session, so their space is taken as the
-  directory grows, and a full store can still keep its index. uDepot-ng
-  allocates the segments at `close()`, so a store full of live data falls
-  back to the log scan on its next open. Holding a segment per table only
-  costs the index's size when a table fills its segment, as uDepot sizes
-  them; uDepot-ng sizes tables by `index_bits` instead, so a small table
-  would hold a whole segment. This waits for the resize work, which
-  revisits table geometry.
 
 ## Implementation Order
 

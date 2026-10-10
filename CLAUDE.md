@@ -46,9 +46,13 @@
     paper. Where the paper and legacy uDepot's code disagree, **follow the
     paper, or ask**; where both are silent, legacy is the reference. Notable
     consequences already decided: empty values are valid (tombstones need their
-    own encoding); the index is flushed to index segments and restored on a
-    clean start, with the log scan only after a crash; resize is incremental
-    per lock region with a shadow directory; PUT writes before it checks, and
+    own encoding); each directory table maps to an index segment of its own
+    for its life, as large as the segment allows (smaller tables come from a
+    smaller segment size, never from a separate setting), is written back
+    there at close and restored from it on a clean start, with the log scan
+    only after a crash; the directory grows
+    by freeze-and-copy, not the paper's incremental resize (tried in PR #8,
+    dropped: see `docs/udepot-paper.md`, §4.3); PUT writes before it checks, and
     Memcache paths may carry weaker durability than the store.
 
 ## Project Overview

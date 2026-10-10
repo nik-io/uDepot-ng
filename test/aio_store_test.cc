@@ -27,8 +27,6 @@ protected:
         config_.path = path_.c_str();
         config_.size = kStoreSize;
         config_.grain_size = 512;
-        config_.initial_tables = 2;
-        config_.index_bits = 10;
         config_.force_destroy = true;
 
         ASSERT_EQ(store_.open(config_), 0);
