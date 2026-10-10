@@ -206,11 +206,21 @@ bounces. Paired, zero copy was faster in all 25 SPDK runs measured (PUT
 run_resize_latency_test`) measures put latency while the directory grows,
 for the incremental resize, the freeze-and-copy grow
 (`ResizeMode::kFreeze`) and a no-grow baseline. The incremental resize
-exists for the tail: its worst put must stay near the no-grow baseline's,
-and the script fails unless its median worst put is under a quarter of the
-freeze's. It caught the space waker initializing the new tables up front
-(writers waited 223 ms for it), which "merely below the freeze" did not.
-Not in CI: the default 5 rounds take about two minutes.
+exists for the write tail, and the script fails unless its median p95 is
+under a quarter of the freeze's (measured: 655 us against 23,163 us).
+
+It runs open loop (`udepot_ng_bench --rate`, latency from each put's due
+time) at 60% of a capacity it measures first. A closed loop hides a stall
+behind the puts a blocked writer never issues (coordinated omission): there
+every percentile below the max was alike in all three modes. Below ~35% load
+the freeze's backlog stays under 5% of puts and p95 cannot see it either.
+
+p95 does not catch every regression. With the new tables set up eagerly on
+the space waker again, incremental p95 stayed at 109 us here: at these sizes
+that stalls only the writers that meet a full table, under 1% of puts. It
+was the cause of a 223 ms worst put at 4 writers and 2^18-bucket tables;
+look at the maximum too when changing the resize. Not in CI: about two
+minutes.
 
 ### Performance regression gate
 

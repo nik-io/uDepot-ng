@@ -207,16 +207,20 @@ writers or readers while a resize runs.
 - **Close and recovery** finish a pending resize first: the index is
   persisted as one geometry, and recovery grows inline, alone.
 
-**Measured** (`scripts/perf-resize-latency.sh`, 4 writers, 4M puts on
-`/dev/shm`, 1 -> 32 tables of 2^18 buckets, 5 runs each): the worst put is
-3.7-9.2 ms with the incremental resize, 93-128 ms with the freeze, and
-6-37 ms with no grow at all (salsa's segment allocation and scheduling set
-that floor). p99.99 and the count of puts over 1 ms are alike in all three:
-in this closed-loop benchmark a freeze stalls only the put each writer has
-in flight, so it shows in the maximum. p99.9 is ~10 us higher with the
-incremental resize: the writes that migrate a stripe pay for it. The script
-fails unless the incremental resize's median worst put is under a quarter
-of the freeze's.
+**Measured** (`scripts/perf-resize-latency.sh`): put latency with the
+directory growing 1 -> 32 tables of 2^17 buckets, 2 writers issuing puts
+open loop at 60% of measured capacity, latency counted from each put's due
+time. Medians of 5 runs: p95 655 us incremental, 23,163 us freeze, 131 us
+with no grow; p99 5.0, 51.2 and 1.7 ms. The freeze stalls writers for its
+whole copy (10 waits totalling 202 ms in one run); the incremental resize
+never makes a writer wait for the waker (5 waits, 1.6 ms in all, longest
+0.48 ms). What remains above the no-grow baseline is the migration work:
+~60 us per stripe (copy 4,097 slots, set up both new stripes), 992 per run,
+60 ms in all against the freeze's 202 ms of stalls, but bunched, because
+random keys touch every stripe within a few hundred puts of a resize
+starting. At ~35% load the incremental resize's p95 matched the baseline.
+A closed loop cannot show any of this below the maximum: a stalled writer
+records one slow put, and the puts it would have issued are never measured.
 
 `StoreConfig::resize_mode = ResizeMode::kFreeze` keeps the earlier
 mechanism, to compare against (`udepot_ng_bench --resize-mode freeze`):

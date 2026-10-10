@@ -51,6 +51,12 @@ struct BenchConfig {
     // Record each put's latency and print percentiles (--latency): what a
     // resize costs writers shows in the tail, not in the throughput.
     bool latency = false;
+    // Open loop (--rate): each thread issues puts at this many per second
+    // and a put's latency counts from when it was due, not when it was
+    // issued. A closed loop hides a stall: a writer stuck for 100 ms has one
+    // slow put, and the puts it would have issued meanwhile are never
+    // measured (coordinated omission). 0 = closed loop.
+    double rate = 0;
 };
 
 static double now_secs() {
@@ -80,9 +86,9 @@ static void print_put_latency(std::vector<uint32_t> ns) {
                                                     100000u);
     size_t over_1ms = ns.end() - std::lower_bound(ns.begin(), ns.end(),
                                                   1000000u);
-    printf("PUT latency us: p50=%.2f p90=%.2f p99=%.2f p99.9=%.2f "
+    printf("PUT latency us: p50=%.2f p90=%.2f p95=%.2f p99=%.2f p99.9=%.2f "
            "p99.99=%.2f max=%.2f over_100us=%zu over_1ms=%zu n=%zu\n",
-           pct(50), pct(90), pct(99), pct(99.9), pct(99.99),
+           pct(50), pct(90), pct(95), pct(99), pct(99.9), pct(99.99),
            ns.back() / 1000.0, over_100us, over_1ms, ns.size());
 }
 
@@ -98,6 +104,7 @@ static ThreadResult run_thread(uDepot<IO>& store,
 
     // PUT
     if (cfg.latency) result.put_ns.reserve(cfg.ops);
+    const auto put_start = std::chrono::steady_clock::now();
     double t0 = now_secs();
     for (uint64_t i = 0; i < cfg.ops; ++i) {
         uint64_t key = (thread_seed + i) * kPrime;
@@ -107,7 +114,14 @@ static ThreadResult run_thread(uDepot<IO>& store,
         std::memcpy(keyb, &key, sizeof(key));
 
         std::memcpy(val.data(), &valu, sizeof(valu));
-        const auto p0 = std::chrono::steady_clock::now();
+        auto p0 = std::chrono::steady_clock::now();
+        if (cfg.rate > 0) {
+            // Due at put_start + i / rate; wait if early, count from then.
+            const auto due = put_start + std::chrono::nanoseconds(
+                static_cast<int64_t>(i * 1e9 / cfg.rate));
+            while (std::chrono::steady_clock::now() < due) {}
+            p0 = due;
+        }
         int rc = store.put(
             std::span<const uint8_t>(keyb, key_size),
             std::span<const uint8_t>(val.data(), cfg.val_size)).run_sync();
@@ -422,7 +436,9 @@ static void usage() {
         "                 table grows the directory\n"
         "  --initial-tables <n> --index-bits <b>  Directory geometry\n"
         "                 (default 4 and 14); small values force resizes\n"
-        "  --latency      Print put latency percentiles\n");
+        "  --latency      Print put latency percentiles\n"
+        "  --rate <n>     Open loop: n puts/s per thread, latency counted\n"
+        "                 from each put's due time (with --latency)\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -461,6 +477,8 @@ int main(int argc, char* argv[]) {
             }
         } else if (arg == "--latency") {
             cfg.latency = true;
+        } else if (arg == "--rate" && i + 1 < argc) {
+            cfg.rate = std::stod(argv[++i]);
         } else if (arg == "--initial-tables" && i + 1 < argc) {
             cfg.initial_tables = std::stoul(argv[++i]);
         } else if (arg == "--index-bits" && i + 1 < argc) {
