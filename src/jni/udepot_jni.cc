@@ -44,8 +44,6 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_init(
     config.path = path;
     config.size = static_cast<size_t>(size);
     config.grain_size = 512;
-    config.initial_tables = 4;
-    config.index_bits = 14;
 
     int rc = g_store.open(config);
     env->ReleaseStringUTFChars(fname, path);

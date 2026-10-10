@@ -45,10 +45,10 @@ struct BenchConfig {
     // R rounds, each a batch of `ops` copying operations and a batch of
     // `ops` zero-copy ones, in alternating order, against the same store.
     int compare_rounds = 0;
-    // Directory geometry (--initial-tables, --index-bits): small values
-    // make the directory grow during the run.
-    uint32_t initial_tables = 4;
-    uint32_t index_bits = 14;
+    // Segment size in grains (--segment-size), 0 for the store's default.
+    // It also sizes the directory's tables, one per index segment: small
+    // segments make the directory grow during the run.
+    uint64_t segment_size = 0;
     // Record each put's latency and print percentiles (--latency): what a
     // grow costs writers shows in the tail, not in the throughput.
     bool latency = false;
@@ -390,8 +390,7 @@ static int run_bench(const BenchConfig& cfg) {
     sc.path = cfg.file;
     sc.size = cfg.store_size;
     sc.grain_size = cfg.grain_size;
-    sc.initial_tables = cfg.initial_tables;
-    sc.index_bits = cfg.index_bits;
+    sc.segment_size = cfg.segment_size;
     // Every run starts empty: a file is removed between runs, but an SPDK
     // namespace keeps the previous run's store.
     sc.force_destroy = true;
@@ -491,8 +490,8 @@ static void usage() {
         "                 uses the namespace UDEPOT_NVMEF names, whole\n"
         "  --compare <r>  Copy vs zero copy in one store: r rounds of a\n"
         "                 batch of -w ops each way, order alternating\n"
-        "  --initial-tables <n> --index-bits <b>  Directory geometry\n"
-        "                 (default 4 and 14); small values force grows\n"
+        "  --segment-size <grains>  Segment size, which also sizes the\n"
+        "                 directory's tables; small values force grows\n"
         "  --latency      Print put latency percentiles\n"
         "  --rate <n>     Open loop: n puts/s per thread, latency counted\n"
         "                 from each put's due time (with --latency)\n"
@@ -531,10 +530,8 @@ int main(int argc, char* argv[]) {
             cfg.qd = std::stoul(argv[++i]);
         } else if (arg == "--rate" && i + 1 < argc) {
             cfg.rate = std::stod(argv[++i]);
-        } else if (arg == "--initial-tables" && i + 1 < argc) {
-            cfg.initial_tables = std::stoul(argv[++i]);
-        } else if (arg == "--index-bits" && i + 1 < argc) {
-            cfg.index_bits = std::stoul(argv[++i]);
+        } else if (arg == "--segment-size" && i + 1 < argc) {
+            cfg.segment_size = std::stoull(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
             usage();
             return 0;

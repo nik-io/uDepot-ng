@@ -95,6 +95,22 @@ public:
         slot.store(kEmpty, order);
     }
 
+    // The same, for a slot in a table's mapped segment.
+    static HashEntry load(std::atomic_ref<uint64_t> slot,
+                          std::memory_order order = std::memory_order_acquire) {
+        return HashEntry{slot.load(order)};
+    }
+
+    static void store(std::atomic_ref<uint64_t> slot, HashEntry entry,
+                      std::memory_order order = std::memory_order_release) {
+        slot.store(entry.raw_, order);
+    }
+
+    static void clear(std::atomic_ref<uint64_t> slot,
+                      std::memory_order order = std::memory_order_release) {
+        slot.store(kEmpty, order);
+    }
+
     bool operator==(const HashEntry& other) const noexcept {
         return raw_ == other.raw_;
     }

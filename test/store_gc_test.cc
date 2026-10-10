@@ -41,8 +41,6 @@ StoreConfig gc_config(const std::filesystem::path& path) {
     config.path = path.c_str();
     config.size = kStoreSize;
     config.grain_size = 512;
-    config.initial_tables = 4;
-    config.index_bits = 12;
     config.segment_size = 2048;  // 1 MiB segments: GC kicks in quickly
     config.force_destroy = true;
     return config;
@@ -274,8 +272,9 @@ TEST(StoreGcAioTest, ReadsStayCorrectWhileGcRelocates) {
 // Regression: a full neighborhood failed the put with ENOSPC; uDepot grows
 // the directory instead. Writers racing the grow must not lose entries.
 TEST_F(StoreGcTest, DirectoryGrowsUnderConcurrentPuts) {
-    config_.initial_tables = 1;
-    config_.index_bits = 6;  // 64 buckets: full after a few hundred keys
+    // 8 KiB segments: tables of 512 buckets, full after a few hundred keys.
+    // (A 4 KiB one cannot leave the device a tail for its metadata.)
+    config_.segment_size = 16;
     ASSERT_EQ(store_.open(config_), 0);
     constexpr int kThreads = 4;
     constexpr int kPerThread = 1500;
@@ -316,8 +315,7 @@ TEST(StoreGcAioTest, DirectoryGrowsFromPollerThread) {
     auto path = std::filesystem::temp_directory_path() /
                 ("udepot_store_grow_aio_" + std::to_string(getpid()));
     StoreConfig config = gc_config(path);
-    config.initial_tables = 1;
-    config.index_bits = 6;
+    config.segment_size = 16;  // 8 KiB: tables of 512 buckets
     uDepot<AioIO> store;
     ASSERT_EQ(store.open(config), 0);
 
@@ -366,14 +364,14 @@ TEST(StoreGcAioTest, DirectoryGrowsFromPollerThread) {
 // newer record was inserted as a second entry instead of replacing the
 // older one, so the stale value could be read, and survived a delete.
 TEST_F(StoreGcTest, RecoveryDoesNotDuplicateKeysSharingATag) {
-    config_.initial_tables = 1;
-    config_.index_bits = 4;
     ASSERT_EQ(store_.open(config_), 0);
 
     // Two keys with the same tag and bucket.
+    const uint64_t bucket_mask =
+        (uint64_t{1} << store_.directory().snapshot().tables[0]->index_bits()) - 1;
     auto tag_bucket = [&](const std::string& k) {
         uint64_t h = store_.hash_key(uDepot<PosixIO>::as_bytes(k));
-        return (h >> 56) << 8 | (h & 0xF);
+        return (h >> 56) << 40 | (h & bucket_mask);
     };
     std::map<uint64_t, std::string> seen;
     std::string a, b;

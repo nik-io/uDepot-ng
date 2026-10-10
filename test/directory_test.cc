@@ -3,6 +3,8 @@
 
 #include "udepot/directory.h"
 
+#include "table_test_util.h"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -14,6 +16,7 @@
 using udepot::Directory;
 using udepot::HashEntry;
 using udepot::Rcu;
+using udepot::test::MemTables;
 using udepot::hash_to_tag;
 
 static uint64_t make_hash(uint64_t bucket, uint8_t tag, uint32_t index_bits) {
@@ -28,7 +31,8 @@ protected:
 };
 
 TEST_F(DirectoryTest, InsertAndLookup) {
-    Directory dir(rcu_, 4, 10);
+    MemTables source(10);
+    Directory dir(rcu_, source, source.initial(4));
 
     rcu_idx_ = rcu_.read_lock();
     uint64_t hash = make_hash(42, 0xCC, 10);
@@ -42,7 +46,8 @@ TEST_F(DirectoryTest, InsertAndLookup) {
 }
 
 TEST_F(DirectoryTest, LookupMiss) {
-    Directory dir(rcu_, 4, 10);
+    MemTables source(10);
+    Directory dir(rcu_, source, source.initial(4));
 
     rcu_idx_ = rcu_.read_lock();
     uint64_t hash = make_hash(42, 0xCC, 10);
@@ -51,7 +56,8 @@ TEST_F(DirectoryTest, LookupMiss) {
 }
 
 TEST_F(DirectoryTest, InsertAndRemove) {
-    Directory dir(rcu_, 4, 10);
+    MemTables source(10);
+    Directory dir(rcu_, source, source.initial(4));
 
     rcu_idx_ = rcu_.read_lock();
     uint64_t hash = make_hash(42, 0xCC, 10);
@@ -62,7 +68,8 @@ TEST_F(DirectoryTest, InsertAndRemove) {
 }
 
 TEST_F(DirectoryTest, MultipleTablesRouteCorrectly) {
-    Directory dir(rcu_, 8, 10);
+    MemTables source(10);
+    Directory dir(rcu_, source, source.initial(8));
 
     rcu_idx_ = rcu_.read_lock();
     // Insert entries that should land in different tables.
@@ -82,7 +89,8 @@ TEST_F(DirectoryTest, MultipleTablesRouteCorrectly) {
 }
 
 TEST_F(DirectoryTest, GrowPreservesEntries) {
-    Directory dir(rcu_, 2, 10);
+    MemTables source(10);
+    Directory dir(rcu_, source, source.initial(2));
 
     rcu_idx_ = rcu_.read_lock();
     // Insert entries.
@@ -108,7 +116,8 @@ TEST_F(DirectoryTest, GrowPreservesEntries) {
 }
 
 TEST_F(DirectoryTest, GrowTwice) {
-    Directory dir(rcu_, 1, 8);
+    MemTables source(8);
+    Directory dir(rcu_, source, source.initial(1));
 
     rcu_idx_ = rcu_.read_lock();
     for (uint64_t i = 0; i < 50; ++i) {
@@ -133,7 +142,8 @@ TEST_F(DirectoryTest, GrowTwice) {
 }
 
 TEST_F(DirectoryTest, ConcurrentReadsAndGrow) {
-    Directory dir(rcu_, 2, 12);
+    MemTables source(12);
+    Directory dir(rcu_, source, source.initial(2));
     constexpr int kEntries = 500;
 
     // Pre-populate.
@@ -200,7 +210,8 @@ TEST_F(DirectoryTest, ConcurrentReadsAndGrow) {
 // retries on the new snapshot. No stripe lock is held by grow().
 TEST_F(DirectoryTest, ConcurrentWritersAndGrowLoseNothing) {
     constexpr uint32_t kBits = 14;
-    Directory dir(rcu_, 1, kBits);
+    MemTables source(kBits);
+    Directory dir(rcu_, source, source.initial(1));
     constexpr int kWriters = 4;
     constexpr int kPerWriter = 2500;  // 10000 entries in 16384 buckets
     std::atomic<int> started{0};
@@ -260,4 +271,43 @@ TEST_F(DirectoryTest, ConcurrentWritersAndGrowLoseNothing) {
         for (int i = 0; i < kPerWriter; ++i)
             if (dir.entry_at(hash_of(w, i), pba_of(w, i)).empty()) ++lost;
     EXPECT_EQ(lost, 0) << "frozen waits: " << frozen_waits.load();
+}
+
+// As uDepot's grow(), each new table needs a segment of its own. Without
+// one the grow fails, returns the tables it did get, and loses nothing.
+TEST_F(DirectoryTest, GrowWithoutSpaceFailsAndKeepsEntries) {
+    MemTables source(8, /*budget=*/3);  // room for 1 + 2, not 2 + 4
+    Directory dir(rcu_, source, source.initial(1));
+    {
+        Rcu::ReadGuard guard(rcu_);
+        for (uint64_t i = 0; i < 100; ++i)
+            ASSERT_EQ(dir.insert(make_hash(i, static_cast<uint8_t>(i), 8), 1,
+                                 i),
+                      0);
+    }
+    ASSERT_EQ(dir.grow(), 0);
+    EXPECT_EQ(dir.num_tables(), 2u);
+    EXPECT_EQ(dir.grow_failures(), 0u);
+
+    EXPECT_EQ(dir.grow(), -ENOSPC);
+    EXPECT_EQ(dir.grow_failures(), 1u);
+    EXPECT_EQ(dir.num_tables(), 2u);
+    EXPECT_EQ(source.live(), 2u) << "a failed grow kept a table";
+    Rcu::ReadGuard guard(rcu_);
+    for (uint64_t i = 0; i < 100; ++i)
+        EXPECT_EQ(dir.lookup(make_hash(i, static_cast<uint8_t>(i), 8)).pba(),
+                  i);
+}
+
+// The old tables leave the directory with the grow: their segments are
+// retired then, while readers may still use their memory.
+TEST_F(DirectoryTest, GrowRetiresTheOldTables) {
+    MemTables source(8);
+    Directory dir(rcu_, source, source.initial(2));
+    ASSERT_EQ(dir.grow(), 0);
+    EXPECT_EQ(source.retired(), 2u);
+    EXPECT_EQ(source.live(), 4u);
+    ASSERT_EQ(dir.grow(), 0);
+    EXPECT_EQ(source.retired(), 6u);
+    EXPECT_EQ(source.live(), 8u);
 }

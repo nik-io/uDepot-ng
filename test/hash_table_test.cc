@@ -3,6 +3,10 @@
 
 #include "udepot/hash_table.h"
 
+#include "table_test_util.h"
+
+#include <sys/mman.h>
+
 #include <atomic>
 #include <cstdint>
 #include <thread>
@@ -13,6 +17,7 @@
 using udepot::HashEntry;
 using udepot::HashTable;
 using udepot::hash_to_tag;
+using udepot::test::make_table;
 
 // Construct a hash value that maps to a specific bucket and tag.
 static uint64_t make_hash(uint64_t bucket, uint8_t tag, uint32_t index_bits) {
@@ -67,7 +72,8 @@ TEST(HashEntry, MaxValues) {
 }
 
 TEST(HashTable, InsertAndLookup) {
-    HashTable table(10);  // 1024 buckets
+    auto table_owner = make_table(10);
+    HashTable& table = *table_owner;  // 1024 buckets
     uint64_t hash = make_hash(42, 0xCC, 10);
     EXPECT_EQ(table.insert(hash, 5, 1000), 0);
 
@@ -79,14 +85,16 @@ TEST(HashTable, InsertAndLookup) {
 }
 
 TEST(HashTable, LookupMiss) {
-    HashTable table(10);
+    auto table_owner = make_table(10);
+    HashTable& table = *table_owner;
     uint64_t hash = make_hash(42, 0xCC, 10);
     HashEntry found = table.lookup(hash);
     EXPECT_TRUE(found.empty());
 }
 
 TEST(HashTable, InsertAndRemove) {
-    HashTable table(10);
+    auto table_owner = make_table(10);
+    HashTable& table = *table_owner;
     uint64_t hash = make_hash(42, 0xCC, 10);
     EXPECT_EQ(table.insert(hash, 5, 1000), 0);
     EXPECT_TRUE(table.remove(hash, 1000));
@@ -94,13 +102,15 @@ TEST(HashTable, InsertAndRemove) {
 }
 
 TEST(HashTable, RemoveMiss) {
-    HashTable table(10);
+    auto table_owner = make_table(10);
+    HashTable& table = *table_owner;
     uint64_t hash = make_hash(42, 0xCC, 10);
     EXPECT_FALSE(table.remove(hash, 999));
 }
 
 TEST(HashTable, MultipleInsertsSameBucket) {
-    HashTable table(10);
+    auto table_owner = make_table(10);
+    HashTable& table = *table_owner;
     // Insert multiple entries that hash to the same bucket but different tags.
     for (uint8_t tag = 1; tag <= 20; ++tag) {
         uint64_t hash = make_hash(100, tag, 10);
@@ -119,7 +129,8 @@ TEST(HashTable, MultipleInsertsSameBucket) {
 
 TEST(HashTable, FillAndOverflow) {
     // Small table to test overflow.
-    HashTable table(4);  // 16 buckets
+    auto table_owner = make_table(4);
+    HashTable& table = *table_owner;  // 16 buckets
     int inserted = 0;
     for (int i = 0; i < 100; ++i) {
         uint64_t hash = make_hash(0, static_cast<uint8_t>(i + 1), 4);
@@ -139,7 +150,8 @@ TEST(HashTable, FillAndOverflow) {
 // stripe locks, entries would silently be lost.
 TEST(HashTable, ConcurrentWritersAdjacentBuckets) {
     constexpr uint32_t kBits = 14;  // 16384 buckets
-    HashTable table(kBits);
+    auto table_owner = make_table(kBits);
+    HashTable& table = *table_owner;
     constexpr int kWriters = 4;
     constexpr int kEntriesPerWriter = 500;
     std::atomic<int> failures{0};
@@ -190,7 +202,8 @@ TEST(HashTable, ConcurrentWritersAdjacentBuckets) {
 }
 
 TEST(HashTable, ConcurrentReadsWhileWriting) {
-    HashTable table(14);  // 16384 buckets
+    auto table_owner = make_table(14);
+    HashTable& table = *table_owner;  // 16384 buckets
     constexpr int kNumWriters = 2;
     constexpr int kNumReaders = 4;
     constexpr int kOpsPerThread = 5000;
@@ -244,7 +257,8 @@ TEST(HashTable, ConcurrentReadsWhileWriting) {
 }
 
 TEST(HashTable, DeletedEntriesVisibleOnlyOnRequest) {
-    HashTable table(10);
+    auto table_owner = make_table(10);
+    HashTable& table = *table_owner;
     uint64_t hash = make_hash(42, 0xCC, 10);
     ASSERT_EQ(table.insert(hash, 3, 1000), 0);
     // Delete: the entry stays, pointing at the tombstone.
@@ -262,9 +276,11 @@ TEST(HashTable, DeletedEntriesVisibleOnlyOnRequest) {
 // Stripes follow uDepot's rule: as many as fit (up to kMaxStripes) while
 // each still covers a write's whole reach, so a write locks at most two.
 TEST(HashTable, StripesCoverAWritesReach) {
-    HashTable small(10);  // 1024 buckets: smaller than one write's reach
+    auto small_owner = make_table(10);
+    HashTable& small = *small_owner;  // 1024 buckets: smaller than one write's reach
     EXPECT_EQ(small.num_stripes(), 1u);
-    HashTable big(20);
+    auto big_owner = make_table(20);
+    HashTable& big = *big_owner;
     EXPECT_GT(big.num_stripes(), 1u);
     EXPECT_LE(big.num_stripes(), HashTable::kMaxStripes);
     uint64_t reach = HashEntry::kHopRange * (HashTable::kMaxDisplace + 2);
@@ -275,7 +291,8 @@ TEST(HashTable, StripesCoverAWritesReach) {
 // neighborhoods away by moving entries forward; every entry stays findable.
 TEST(HashTable, FullNeighborhoodDisplacesForward) {
     constexpr uint32_t kBits = 12;
-    HashTable table(kBits);
+    auto table_owner = make_table(kBits);
+    HashTable& table = *table_owner;
     // Fill bucket 100's neighborhood and the next few buckets' slots.
     std::vector<uint64_t> hashes;
     for (int i = 0; i < 48; ++i) {
@@ -302,7 +319,8 @@ TEST(HashTable, FullNeighborhoodDisplacesForward) {
 // full so the directory grows.
 TEST(HashTable, InsertSearchIsBounded) {
     constexpr uint32_t kBits = 14;
-    HashTable table(kBits);
+    auto table_owner = make_table(kBits);
+    HashTable& table = *table_owner;
     uint64_t window = HashEntry::kHopRange * (HashTable::kMaxDisplace + 1);
     // Occupy every slot of bucket 0's search window with entries homed at
     // their own slot, so none can be displaced into bucket 0's
@@ -326,7 +344,8 @@ TEST(HashTable, ConcurrentWritersAcrossStripeBoundaries) {
     int lost = 0;
 
     for (int round = 0; round < kRounds; ++round) {
-        HashTable table(kBits);
+        auto table_owner = make_table(kBits);
+    HashTable& table = *table_owner;
         ASSERT_GT(table.num_stripes(), 2u);
         const uint64_t boundary = table.total_slots() / table.num_stripes();
         auto bucket_of = [&](int w, int i) {
@@ -369,4 +388,85 @@ TEST(HashTable, ConcurrentWritersAcrossStripeBoundaries) {
         lost += kWriters * kPerWriter - failures.load() - found;
     }
     EXPECT_EQ(lost, 0) << "entries inserted but not findable";
+}
+
+// As uDepot's uDepotMap::restore(): a table takes the largest power of two
+// of buckets, plus one neighborhood, that fits between the region's header
+// and footer. A smaller segment is a smaller table.
+TEST(HashTable, SizeFollowsItsSegment) {
+    using udepot::TableRegion;
+    using udepot::test::table_net_bytes;
+    for (uint32_t bits : {1u, 4u, 10u, 16u}) {
+        EXPECT_EQ(HashTable::index_bits_for(table_net_bytes(bits)), bits);
+        // Bytes short of the next power of two still round down.
+        EXPECT_EQ(HashTable::index_bits_for(table_net_bytes(bits + 1) - 8),
+                  bits);
+    }
+    EXPECT_EQ(HashTable::index_bits_for(2 * TableRegion::kMdBytes), 0u);
+    EXPECT_EQ(HashTable::index_bits_for(
+                  2 * TableRegion::kMdBytes +
+                  (HashEntry::kHopRange + 1) * sizeof(uint64_t)),
+              0u);
+
+    const size_t net = 1 << 20;
+    HashTable table(TableRegion::map(net, net, TableRegion::kNoSegment));
+    EXPECT_EQ(table.index_bits(), HashTable::index_bits_for(net));
+    EXPECT_LE(table.used_bytes(), table.region().footer_offset());
+}
+
+// A new table is cleared over its slots only (uDepot: memset to -1); the
+// header and footer around them stay as they were.
+TEST(HashTable, ClearMarksEverySlotUnused) {
+    using udepot::TableRegion;
+    const size_t net = udepot::test::table_net_bytes(8);
+    HashTable table(TableRegion::map(4096, net, TableRegion::kNoSegment));
+    table.clear();
+    for (uint64_t i = 0; i < table.total_slots(); ++i)
+        ASSERT_TRUE(table.load_slot(i).empty()) << i;
+    const uint8_t* base = table.region().base();
+    for (size_t b = 0; b < TableRegion::kMdBytes; ++b) {
+        ASSERT_EQ(base[b], 0) << "header byte " << b;
+        ASSERT_EQ(base[table.region().footer_offset() + b], 0)
+            << "footer byte " << b;
+    }
+}
+
+// As uDepot (0e0b0a0): a table maps its whole segment, metadata tail
+// included, so the footer at the end of the net region is always inside
+// the mapping; on huge pages only when the segment is a 2 MiB multiple.
+TEST(TableRegion, MapsTheWholeSegment) {
+    using udepot::TableRegion;
+    const size_t seg = (3 << 20) + 4096;  // not a 2 MiB multiple
+    const size_t net = seg - 512;
+    TableRegion r = TableRegion::map(seg, net, 42);
+    ASSERT_TRUE(r.valid());
+    EXPECT_FALSE(r.huge());
+    EXPECT_EQ(r.map_bytes(), seg);
+    EXPECT_EQ(r.net_bytes(), net);
+    EXPECT_EQ(r.grain(), 42u);
+    EXPECT_EQ(r.footer_offset(), net - TableRegion::kMdBytes);
+    // Zero, and writable to the segment's last byte.
+    EXPECT_EQ(r.base()[0], 0);
+    EXPECT_EQ(r.base()[seg - 1], 0);
+    r.base()[seg - 1] = 1;
+
+    TableRegion moved = std::move(r);
+    EXPECT_FALSE(r.valid());
+    EXPECT_EQ(moved.base()[seg - 1], 1);
+}
+
+TEST(TableRegion, HugePagesWhenTheSegmentIsA2MiBMultiple) {
+    using udepot::TableRegion;
+    // Whether the system has a huge page to give.
+    void* probe = mmap(nullptr, TableRegion::kHugePage, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    const bool available = probe != MAP_FAILED;
+    if (available) munmap(probe, TableRegion::kHugePage);
+
+    TableRegion r =
+        TableRegion::map(TableRegion::kHugePage, TableRegion::kHugePage - 512,
+                         TableRegion::kNoSegment);
+    ASSERT_TRUE(r.valid());  // on 4 KiB pages if there is no huge page
+    EXPECT_EQ(r.huge(), available);
+    EXPECT_EQ(r.map_bytes(), TableRegion::kHugePage);
 }

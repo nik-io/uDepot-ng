@@ -35,6 +35,7 @@ add_compile_options(-Wall -Wextra -Werror)
 add_library(udepot
     src/udepot/rcu.cc
     src/udepot/hash_table.cc
+    src/udepot/table_region.cc
     src/udepot/directory.cc
     src/udepot/store.cc
     src/udepot/io/aio.cc

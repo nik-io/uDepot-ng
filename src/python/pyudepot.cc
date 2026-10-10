@@ -25,8 +25,6 @@ void* uDepotOpen(const char* fname, uint64_t size, int force_destroy) {
     config.path = fname;
     config.size = static_cast<size_t>(size);
     config.grain_size = 4096;
-    config.initial_tables = 4;
-    config.index_bits = 14;
 
     int rc = store->open(config);
     if (rc != 0) {
