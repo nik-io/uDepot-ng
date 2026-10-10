@@ -137,20 +137,10 @@ public:
     // Double the number of tables, unless the current snapshot is no longer
     // the one of generation `seen` (another grow did it). Returns 0, or
     // -ENOSPC at the maximum size or if the source has no space for the
-    // new tables (counted by grow_failures()). Waits for a grace period,
-    // so it must not be called inside a read-side section, nor on a thread
-    // whose progress in-flight operations depend on (an I/O poller).
+    // new tables. Waits for a grace period, so it must not be called inside
+    // a read-side section, nor on a thread whose progress in-flight
+    // operations depend on (an I/O poller).
     int grow(uint64_t seen = kAnyGeneration);
-
-    // Grows that found no space for their tables, so far.
-    uint64_t grow_failures() const noexcept {
-        return grow_failures_.load(std::memory_order_acquire);
-    }
-
-    // The current snapshot's generation. Caller must hold an RCU read lock.
-    uint64_t generation() const noexcept {
-        return current_.load(std::memory_order_acquire)->generation;
-    }
 
     uint32_t num_tables() const noexcept;
 
@@ -163,7 +153,6 @@ public:
 private:
     Rcu& rcu_;
     TableSource& source_;
-    std::atomic<uint64_t> grow_failures_{0};
     alignas(64) std::atomic<DirSnapshot*> current_;
     alignas(64) std::mutex grow_mutex_;  // one grow at a time
     std::mutex grown_mu_;

@@ -1128,7 +1128,8 @@ bool uDepot<IO>::SpaceWait::await_suspend(std::coroutine_handle<> h) {
     if (grow != Directory::kAnyGeneration)
         store->grow_request_ =
             std::max(store->grow_request_.value_or(0), grow);
-    store->space_waiters_.push_back(h);
+    handle = h;
+    store->space_waiters_.push_back(this);
     store->space_cv_.notify_one();
     return true;
 }
@@ -1140,25 +1141,25 @@ CoroTask<int> uDepot<IO>::wait_for_grow(uint64_t gen, bool grow,
     // The grow waits for read sections, so leave ours first.
     guard.reset();
     if (probe) probe->n = 0;
-    const uint64_t failures = directory_->grow_failures();
-    co_await SpaceWait{this, grow ? gen : Directory::kAnyGeneration};
-    guard.emplace(rcu_);
-    // As uDepot's put on a failed grow: no index segment was free for the
-    // new tables, so the write fails rather than retrying. A later write
+    // As uDepot's put on a failed grow (no index segment was free for the
+    // new tables): the write fails rather than retrying. A later write
     // that finds its table full asks for another grow.
-    if (grow && directory_->grow_failures() != failures &&
-        directory_->generation() == gen)
-        co_return -ENOSPC;
-    co_return 0;
+    int rc = co_await SpaceWait{this, grow ? gen : Directory::kAnyGeneration};
+    guard.emplace(rcu_);
+    co_return rc;
 }
 
 // Resume every waiter, with space_mu_ released. Called with it held.
 template <typename IO>
-void uDepot<IO>::resume_waiters(std::unique_lock<std::mutex>& lock) {
+void uDepot<IO>::resume_waiters(std::unique_lock<std::mutex>& lock,
+                                uint64_t gen, int rc) {
     auto waiters = std::move(space_waiters_);
     space_waiters_.clear();
     lock.unlock();
-    for (auto h : waiters) h.resume();
+    for (SpaceWait* w : waiters) {
+        if (rc != 0 && w->grow == gen) w->result = rc;
+        w->handle.resume();  // `w` lives in the resumed frame: done with it
+    }
     // Resumed operations may have submitted I/O from this thread; on a
     // backend that completes on the submitting thread, see it through.
     while (poll_this_thread()) {}
@@ -1176,11 +1177,13 @@ void uDepot<IO>::space_waker_loop() {
             uint64_t gen = *grow_request_;
             grow_request_.reset();
             lock.unlock();
-            // -ENOSPC: at the maximum size commit_put reports it, and for
-            // want of an index segment wait_for_grow does.
-            directory_->grow(gen);
+            // -ENOSPC at the maximum size (commit_put reports that itself),
+            // or for want of an index segment: the waiters that asked for
+            // this grow get it, and with them answered, so is the request.
+            int rc = directory_->grow(gen);
             lock.lock();
-            resume_waiters(lock);
+            if (grow_request_ == gen) grow_request_.reset();
+            resume_waiters(lock, gen, rc);
             continue;
         }
         if (space_waiters_.empty()) {

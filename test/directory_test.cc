@@ -287,10 +287,8 @@ TEST_F(DirectoryTest, GrowWithoutSpaceFailsAndKeepsEntries) {
     }
     ASSERT_EQ(dir.grow(), 0);
     EXPECT_EQ(dir.num_tables(), 2u);
-    EXPECT_EQ(dir.grow_failures(), 0u);
 
     EXPECT_EQ(dir.grow(), -ENOSPC);
-    EXPECT_EQ(dir.grow_failures(), 1u);
     EXPECT_EQ(dir.num_tables(), 2u);
     EXPECT_EQ(source.live(), 2u) << "a failed grow kept a table";
     Rcu::ReadGuard guard(rcu_);

@@ -96,7 +96,6 @@ int Directory::grow(uint64_t seen) {
         auto table = source_.new_table();
         if (!table) {
             for (auto& t : tables) source_.retire_table(*t);
-            grow_failures_.fetch_add(1, std::memory_order_acq_rel);
             return -ENOSPC;
         }
         tables.push_back(std::move(table));

@@ -353,16 +353,22 @@ private:
         uDepot* store;
         // A grow of this snapshot generation to run, if any.
         uint64_t grow = Directory::kAnyGeneration;
+        std::coroutine_handle<> handle{};
+        // That grow's result, as uDepot's put gets its grow()'s: set by the
+        // waker when the grow fails.
+        int result = 0;
         bool await_ready() noexcept { return false; }
         bool await_suspend(std::coroutine_handle<> h);
-        void await_resume() noexcept {}
+        int await_resume() noexcept { return result; }
     };
     void space_waker_loop();
     void stop_space_waker();
-    void resume_waiters(std::unique_lock<std::mutex>& lock);
+    // Resume every waiter; those that asked for a grow of `gen` get `rc`.
+    void resume_waiters(std::unique_lock<std::mutex>& lock,
+                        uint64_t gen = Directory::kAnyGeneration, int rc = 0);
     std::mutex space_mu_;
     std::condition_variable space_cv_;
-    std::vector<std::coroutine_handle<>> space_waiters_;  // space_mu_
+    std::vector<SpaceWait*> space_waiters_;  // space_mu_
     std::optional<uint64_t> grow_request_;                // space_mu_
     bool space_stop_ = false;                             // space_mu_
     std::thread space_waker_;

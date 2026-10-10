@@ -739,7 +739,6 @@ TEST_P(StoreIndexTest, AGrowWithoutASegmentFailsThePut) {
     uDepot<PosixIO>::index_segment_test_hook = nullptr;
     EXPECT_EQ(rc, -ENOSPC);
     EXPECT_EQ(store.directory().num_tables(), 1u);
-    EXPECT_GE(store.directory().grow_failures(), 1u);
     // With segments to be had again, the same put grows the directory.
     ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
     EXPECT_EQ(store.directory().num_tables(), 2u);
