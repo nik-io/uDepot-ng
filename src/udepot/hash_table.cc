@@ -46,21 +46,13 @@ HashTable::~HashTable() = default;
 
 HashEntry HashTable::lookup(uint64_t hash, uint32_t start_offset,
                             bool include_deleted) const noexcept {
-    uint64_t bucket = hash_to_bucket(hash);
-    uint8_t tag = hash_to_tag(hash);
-
-    for (uint32_t i = start_offset; i < HashEntry::kHopRange; ++i) {
-        HashEntry entry = HashEntry::load(slots_[bucket + i]);
-        if (entry.empty()) continue;
-        if (entry.bucket_offset() != i) continue;
-        if (entry.key_tag() != tag) continue;
-        if (entry.deleted() && !include_deleted) continue;
-        return entry;
-    }
-    return HashEntry{};
+    return scan(hash_to_bucket(hash), hash_to_tag(hash), start_offset,
+                include_deleted,
+                [this](uint64_t idx) { return HashEntry::load(slots_[idx]); });
 }
 
-HashTable::WriteLock HashTable::lock_for(uint64_t hash) {
+std::pair<uint64_t, uint64_t> HashTable::stripes_for(uint64_t hash) const
+    noexcept {
     uint64_t bucket = hash_to_bucket(hash);
     uint64_t lo = bucket > HashEntry::kHopRange ? bucket - HashEntry::kHopRange
                                                 : 0;
@@ -68,7 +60,13 @@ HashTable::WriteLock HashTable::lock_for(uint64_t hash) {
     uint64_t s1 = lo / slots_per_stripe_;
     uint64_t s2 = hi / slots_per_stripe_;
     assert(s2 - s1 <= 1);
-    return WriteLock(&stripes_[s1].mu, s2 != s1 ? &stripes_[s2].mu : nullptr);
+    return {s1, s2};
+}
+
+HashTable::WriteLock HashTable::lock_stripes(uint64_t first, uint64_t last) {
+    assert(last == first || last == first + 1);
+    return WriteLock(&stripes_[first].mu,
+                     last != first ? &stripes_[last].mu : nullptr);
 }
 
 int HashTable::insert(uint64_t hash, uint16_t kv_size, uint64_t pba) {

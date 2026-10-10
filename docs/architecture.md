@@ -73,7 +73,7 @@ caller's thread and finishes on an I/O backend's poller. Because only the
 sums matter, that is correct by construction, and each bump is a plain load
 and store on the bumping thread's own slot.
 
-**Writer path** (grow, close):
+**Writer path** (resize, GC, close):
 
 ```cpp
 void synchronize() {
@@ -108,9 +108,9 @@ a reader may still be reading (GC waits a grace period before handing a
 segment back). As in uDepot, the caller orders `close()` after every
 operation: none may race or follow it, so the store keeps no open flag on the
 operation path. The exceptions are waiting for free space (see *Space management*)
-and waiting for a directory grow: an operation leaves its section while it
-waits, so it can never hold up the grace period that GC or the grow needs to
-let it continue.
+and waiting for a directory resize to start (a full table): an operation
+leaves its section while it waits, so it can never hold up the grace period
+that GC or the resize needs to let it continue.
 
 `Rcu::call(fn)` (call_rcu) runs `fn` after a grace period on a reclaimer
 thread, batching callbacks behind one `synchronize()`; `Rcu::barrier()` waits
@@ -154,27 +154,52 @@ timestamp, then grain — otherwise it is rewritten, so recovery always
 reproduces the order writes were acknowledged in.
 
 **Directory.** As in uDepot's `hash_to_map`, a key's table is chosen by the
-top bits of its tag and its bucket by the low bits of its hash. `grow()`
-doubles the number of tables. Legacy excluded every operation for the grow
-(`rwpflock.write_enter()` + `write_wait_readers()`); uDepot-ng keeps that for
-writers only, using RCU:
+top bits of its tag and its bucket by the low bits of its hash. A full table
+doubles the number of tables, incrementally, as the paper's §4.3 describes
+(legacy's `uDepotDirMapOR` prototype was its unfinished first half; legacy
+itself excluded every operation for a whole-directory copy). Nothing stalls
+writers or readers while a resize runs.
 
-1. Set the snapshot's `frozen` flag. A writer checks it under its stripe
-   lock, inside its read section, and backs off if set.
-2. `synchronize()`: every writer that missed the flag has finished, so its
-   write is in the old tables, and none can start.
-3. Copy live and deleted entries into the new tables, holding no lock.
-4. Publish the new snapshot and wake the writers that backed off; they
-   retry on it.
-5. Free the old snapshot with `Rcu::call()` (call_rcu): once a grace period
-   has passed, on the RCU reclaimer thread, off the grow path.
-
-Readers never block: they keep reading the frozen tables during the copy.
-Grow is rare, so ordinary writes pay only a flag load under their stripe lock.
-Because `grow()` waits for a grace period it never runs inside a read section
-or on an I/O poller thread (which in-flight reads may be waiting on): a
-writer that finds its table full leaves its section and suspends, and the
-store's waker thread runs the grow.
+- **Geometry.** Old table t splits into new tables 2t and 2t + 1 by the next
+  tag bit, and an entry's bucket does not change, so stripe s of t migrates
+  into stripe s of both, each slot to the same slot of one of them (paper
+  Figure 4). A migration writes only empty slots and moves nothing.
+- **One snapshot.** The resizing snapshot carries the new tables, the old
+  ones, a migrated flag per (old table, stripe) and the paper's remaining
+  counter. Readers and writers load one pointer and see the pair and every
+  stripe's status together (PR #3 review, finding 4).
+- **Start.** A put that finds its table full suspends and asks the space
+  waker to `resize()`. The waker allocates the new tables (the paper's
+  "pre-allocated ... in a separate thread"), marks the old snapshot
+  superseded and publishes the resizing one. A writer still on the old
+  snapshot checks the flag under its stripe locks and retries at once.
+- **Writes.** While resizing, the old table's stripe locks guard both the
+  old and the new slots of their region (as in the paper and legacy). A
+  writer takes the key's one or two old stripes, migrates those not yet
+  migrated (copy, set the flag with release, decrement the counter) and
+  writes the new table. Only writes migrate: a region nothing writes stays
+  in the old table (paper; the waker does not sweep).
+- **Reads.** Lock-free. Each neighborhood slot is read from the new table if
+  its stripe has migrated, else from the old one; the flag is re-read
+  (acquire) when the scan enters the next stripe. A stripe migrates before
+  any write reaches its new slots, and entries still only move up, written
+  before cleared, so a scan never misses an entry. Outside a resize a read
+  costs one more branch.
+- **Finish.** The write that migrates the last stripe publishes the final
+  snapshot (new tables only) and hands the resizing snapshot to
+  `Rcu::call()`.
+- **Handover.** Writers still on the resizing snapshot hold the old stripe
+  locks, so for one grace period after the final snapshot is published its
+  writers take the old stripes too, before their own: two uncontended
+  mutexes per write, once per resize. A grace period later the old tables
+  are freed.
+- **A table full mid-resize.** The writer waits, and the waker finishes the
+  resize on demand (taking each remaining stripe's lock, like any writer)
+  and starts the next; a region nothing writes would otherwise keep the
+  writer waiting indefinitely. Ending a handover early waits for a grace
+  period, which is why this too runs on the waker, never on an I/O poller.
+- **Close and recovery** finish a pending resize first: the index is
+  persisted as one geometry, and recovery grows inline, alone.
 
 ### 3. Eager-Start C++23 Coroutines
 
@@ -627,8 +652,8 @@ decides, as the paper says: *"the persistent source of truth is the log"*.
   back to the log scan on its next open. Holding a segment per table only
   costs the index's size when a table fills its segment, as uDepot sizes
   them; uDepot-ng sizes tables by `index_bits` instead, so a small table
-  would hold a whole segment. This waits for the resize work, which
-  revisits table geometry.
+  would hold a whole segment. The incremental resize kept the table
+  geometry, so this is still open.
 
 ## Implementation Order
 

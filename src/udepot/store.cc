@@ -227,10 +227,9 @@ int uDepot<IO>::recover_record(uint64_t hash, std::span<const uint8_t> key,
         HashEntry match;
         uint16_t match_grains = 0;
         {
-            // Recovery runs alone, before any other thread: no grow can
+            // Recovery runs alone, before any other thread: no resize can
             // race it, and it holds no read section, so it may grow inline.
             auto locked = directory_->lock_for(hash);
-            assert(!locked.frozen());
             bool settled = probe_settled(*locked.table, hash, probe, &match);
             assert(settled);
             (void)settled;
@@ -240,6 +239,7 @@ int uDepot<IO>::recover_record(uint64_t hash, std::span<const uint8_t> key,
                     return 0;
                 uint64_t seen = locked.snapshot->generation;
                 locked.lock = HashTable::WriteLock{};
+                locked.old_lock = HashTable::WriteLock{};
                 if (directory_->grow(seen) != 0) return -ENOSPC;
                 continue;
             }
@@ -1026,6 +1026,9 @@ void uDepot<IO>::close() {
     stop_space_waker();
 
     if (scm_) {
+        // The index is persisted as one geometry: finish a resize still in
+        // progress (paper §4.3 migrates only what writes touch).
+        directory_->complete();
         // Before salsa's threads stop: GC may have to free the segments
         // the index goes to. If it cannot be written, the next open scans
         // the log, as after a crash.
@@ -1110,13 +1113,14 @@ bool uDepot<IO>::SpaceWait::await_suspend(std::coroutine_handle<> h) {
 }
 
 template <typename IO>
-CoroTask<int> uDepot<IO>::wait_for_grow(uint64_t gen, bool grow,
-                                        std::optional<Rcu::ReadGuard>& guard,
-                                        KeyProbe* probe) {
-    // The grow waits for read sections, so leave ours first.
+CoroTask<int> uDepot<IO>::wait_for_resize(uint64_t gen,
+                                          std::optional<Rcu::ReadGuard>& guard,
+                                          KeyProbe* probe) {
+    // Finishing a resize or ending a handover waits for read sections, so
+    // leave ours first.
     guard.reset();
     if (probe) probe->n = 0;
-    co_await SpaceWait{this, grow ? gen : Directory::kAnyGeneration};
+    co_await SpaceWait{this, gen};
     guard.emplace(rcu_);
     co_return 0;
 }
@@ -1139,13 +1143,15 @@ void uDepot<IO>::space_waker_loop() {
     std::unique_lock<std::mutex> lock(space_mu_);
     while (!space_stop_) {
         if (grow_request_) {
-            // Grows run here, never on an operation's thread: they wait for
-            // a grace period, which an I/O poller could be holding up. This
-            // thread holds no read section and no I/O is pending on it.
+            // Resizes start here, never on an operation's thread: this
+            // allocates the new tables, and finishing a resize on demand or
+            // ending a handover waits for a grace period, which an I/O
+            // poller could be holding up. This thread holds no read section
+            // and no I/O is pending on it.
             uint64_t gen = *grow_request_;
             grow_request_.reset();
             lock.unlock();
-            directory_->grow(gen);  // -ENOSPC: commit_put reports it
+            directory_->resize(gen);  // -ENOSPC: commit_put reports it
             lock.lock();
             resume_waiters(lock);
             continue;
@@ -1205,7 +1211,7 @@ int uDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
     // only because the copy goes out with pwrite_sync, which needs no
     // poller: a writer queued on these stripes on a poller thread cannot
     // hold up the write it is waiting for.
-    return with_table_blocking(hash, [&](HashTable& table) -> int {
+    return with_table(hash, [&](HashTable& table) -> int {
         // Only records the directory still points at matter; anything else
         // in the segment was overwritten, deleted or never committed.
         const HashEntry entry = table.entry_at(hash, grain);
@@ -1464,10 +1470,6 @@ int uDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
                            uint16_t kv_grains, uint64_t pba,
                            HashEntry* replaced, uint64_t* gen) {
     auto locked = directory_->lock_for(hash);
-    if (locked.frozen()) {
-        *gen = locked.snapshot->generation;
-        return kFrozen;
-    }
     HashTable& table = *locked.table;
 
     HashEntry match;
@@ -1487,7 +1489,10 @@ int uDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
 
     if (match.empty()) {
         if (table.insert_locked(hash, kv_grains, pba) == 0) return 0;
-        if (locked.snapshot->table_bits >= DirSnapshot::kMaxTableBits)
+        // At the maximum size only a resize still in progress can help
+        // (its tables are already at the maximum; finishing it does not).
+        if (locked.snapshot->table_bits >= DirSnapshot::kMaxTableBits &&
+            !locked.snapshot->resize)
             return -ENOSPC;
         *gen = locked.snapshot->generation;
         return kTableFull;
@@ -1620,10 +1625,11 @@ CoroTask<int> uDepot<IO>::put_record(std::span<const uint8_t> key_in,
                             static_cast<uint16_t>(grains_needed), grain,
                             &replaced, &gen);
             if (rc == kRetryProbe) continue;
-            if (rc != kTableFull && rc != kFrozen) break;
-            // As in uDepot: a full table grows the directory, and a write
-            // that meets a grow waits for it; either way it then retries.
-            rc = co_await wait_for_grow(gen, rc == kTableFull, guard, &probe);
+            if (rc != kTableFull) break;
+            // As in uDepot: a full table grows the directory. The write
+            // waits for the space waker to start the resize (or, mid-resize,
+            // to finish it and start the next) and retries.
+            rc = co_await wait_for_resize(gen, guard, &probe);
             if (rc != 0) break;
         }
 
@@ -1834,12 +1840,8 @@ CoroTask<int> uDepot<IO>::write_tombstone(
 template <typename IO>
 int uDepot<IO>::commit_del(uint64_t hash, const KeyProbe& probe,
                            uint64_t if_version, uint64_t tomb_pba,
-                           HashEntry* removed, uint64_t* gen) {
+                           HashEntry* removed) {
     auto locked = directory_->lock_for(hash);
-    if (locked.frozen()) {
-        *gen = locked.snapshot->generation;
-        return kFrozen;
-    }
     HashTable& table = *locked.table;
 
     HashEntry match;
@@ -1872,16 +1874,10 @@ CoroTask<int> uDepot<IO>::del(std::span<const uint8_t> key,
     KeyProbe probe;
     for (;;) {
         HashEntry removed;
-        uint64_t gen = 0;
         int rc = co_await probe_key(hash, key, probe);
-        if (rc == 0)
-            rc = commit_del(hash, probe, if_version, tomb, &removed, &gen);
+        if (rc == 0) rc = commit_del(hash, probe, if_version, tomb, &removed);
 
         if (rc == kRetryProbe) continue;
-        if (rc == kFrozen) {
-            rc = co_await wait_for_grow(gen, false, guard, &probe);
-            if (rc == 0) continue;
-        }
         if (rc == 0) {
             invalidate_grains(removed.pba(), removed.kv_size());
             release_grains(tomb, tomb_grains);  // stays valid, referenced

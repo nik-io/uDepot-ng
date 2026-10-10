@@ -5,7 +5,6 @@
 
 #include <atomic>
 #include <cassert>
-#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -16,8 +15,37 @@
 
 namespace udepot {
 
-// A snapshot of the directory: 2^table_bits hash tables. Immutable once
-// published; grow() creates a new one.
+// A resize in progress (paper §4.3): the previous geometry, half as many
+// tables, being migrated into the snapshot's tables one lock region
+// (stripe) at a time. Old table t splits into new tables 2t and 2t + 1 by
+// the next tag bit; buckets do not change, so stripe s of t migrates into
+// stripe s of both, slot for slot (paper Figure 4).
+struct Resize {
+    std::vector<std::shared_ptr<HashTable>> old;
+    uint64_t stripes;  // per table, the same in the old and the new tables
+    // Per (old table, stripe): migrated. Set, under the stripe's lock,
+    // after its slots are copied; never cleared.
+    std::unique_ptr<std::atomic<bool>[]> migrated;
+    // Stripes still to migrate (the paper's "resize" counter).
+    std::atomic<uint64_t> remaining;
+
+    bool is_migrated(uint32_t old_table, uint64_t stripe) const noexcept {
+        return migrated[old_table * stripes + stripe].load(
+            std::memory_order_acquire);
+    }
+};
+
+// The lock handover after a resize ends. Writers still on the resizing
+// snapshot hold the old tables' stripe locks; for one grace period after
+// the final snapshot is published, its writers take them too, before the
+// new tables' own.
+struct Handover {
+    std::vector<HashTable*> old;  // freed a grace period after !active
+    std::atomic<bool> active{true};
+};
+
+// A snapshot of the directory: 2^table_bits hash tables. Published once,
+// replaced whole: stable -> resizing -> stable (with a handover) -> ...
 //
 // As in uDepot's uDepotDirectoryMap::hash_to_map, a key's table is chosen by
 // the top bits of its tag, which every entry stores; the bucket comes from
@@ -26,21 +54,33 @@ namespace udepot {
 struct DirSnapshot {
     static constexpr uint32_t kMaxTableBits = 8;  // the tag's width
 
-    std::vector<std::unique_ptr<HashTable>> tables;
+    std::vector<std::shared_ptr<HashTable>> tables;
     uint32_t table_bits;
-    // Counts grows. Identifies a snapshot after it is freed, when its
-    // address may already belong to a newer one.
+    // Counts snapshots. Identifies one after it is freed, when its address
+    // may already belong to a newer one.
     uint64_t generation;
-    // Set by grow() before it copies this snapshot. Writers check it under
-    // their stripe lock and back off; readers ignore it.
-    std::atomic<bool> frozen{false};
+    // Set while the tables are being migrated into from `resize->old`.
+    std::unique_ptr<Resize> resize;
+    // Set on the snapshot a resize ends with.
+    std::shared_ptr<Handover> handover;
+    // Set before a resize replaces this (stable) snapshot. Its writers
+    // check it under their stripe locks, the ones the resize migrates
+    // under, and retry on the new snapshot.
+    std::atomic<bool> superseded{false};
 
+    // Fresh, empty tables.
     DirSnapshot(uint32_t table_bits, uint32_t index_bits, uint64_t generation)
         : table_bits(table_bits), generation(generation) {
         tables.reserve(1u << table_bits);
         for (uint32_t i = 0; i < (1u << table_bits); ++i)
-            tables.push_back(std::make_unique<HashTable>(index_bits));
+            tables.push_back(std::make_shared<HashTable>(index_bits));
     }
+    // Another snapshot's tables.
+    DirSnapshot(std::vector<std::shared_ptr<HashTable>> tables,
+                uint32_t table_bits, uint64_t generation)
+        : tables(std::move(tables)),
+          table_bits(table_bits),
+          generation(generation) {}
 
     uint32_t size() const noexcept {
         return static_cast<uint32_t>(tables.size());
@@ -59,20 +99,21 @@ struct DirSnapshot {
     }
 };
 
-// RCU-protected directory of hash tables.
+// RCU-protected directory of hash tables, resized incrementally (paper
+// §4.3).
 //
 // Readers load the snapshot pointer inside an RCU read-side section and
-// access tables without any lock, including while a grow copies them.
+// read without any lock. While a resize is in progress, each neighborhood
+// slot is read from the new table if its stripe has migrated, else from the
+// old one.
 //
 // Writers go through lock_for(), which returns the key's table in the
-// current snapshot with its stripes locked, or reports the snapshot frozen.
-// grow() takes the role of uDepot's rwpflock write side, for writers only:
-// it freezes the snapshot, waits a grace period (every writer that missed
-// the flag has finished and its write is in the old tables), copies with no
-// locks held, publishes the new snapshot and hands the old one to
-// Rcu::call() to be freed once no reader can still reach it. A writer that
-// finds the snapshot frozen leaves its read section, waits for the grow
-// (wait_for_grow) and retries on the new snapshot.
+// current snapshot with the stripes covering the key's writes held. While a
+// resize is in progress those are the old table's stripes, and lock_for()
+// first migrates any of them not yet migrated; the last migration publishes
+// the final snapshot. A full table asks the space waker for resize(): start
+// one, or, if one is in progress, finish it on demand and start the next.
+// Nothing stalls writers while a resize runs.
 class Directory {
 public:
     // initial_tables is rounded up to a power of two.
@@ -88,32 +129,23 @@ public:
 
     // Lock-free: the entry (live or deleted) for (hash, pba), or empty.
     // Caller must hold an RCU read lock.
-    HashEntry entry_at(uint64_t hash, uint64_t pba) const noexcept {
-        return current_.load(std::memory_order_acquire)
-            ->table_for_hash(hash).entry_at(hash, pba);
-    }
+    HashEntry entry_at(uint64_t hash, uint64_t pba) const noexcept;
 
     // The key's table in the current snapshot, with the stripes covering
-    // the key's writes held; or, if a grow has frozen the snapshot, no
-    // table and no lock (frozen()), and the caller must leave its read
-    // section and wait_for_grow(snapshot->generation) before retrying. Caller must hold
-    // an RCU read lock.
+    // the key's writes held: the old table's while a resize is in progress
+    // (old_lock, after migrating them), and also the old table's during a
+    // handover. Never fails; caller must hold an RCU read lock.
     struct Locked {
         HashTable* table;
         const DirSnapshot* snapshot;
+        HashTable::WriteLock old_lock;
         HashTable::WriteLock lock;
-
-        bool frozen() const noexcept { return table == nullptr; }
     };
     Locked lock_for(uint64_t hash);
 
-    // Block until the snapshot of `generation` is no longer current. Must
-    // not be called inside a read-side section (the grow waits for those).
-    void wait_for_grow(uint64_t generation);
-
-    // Single-step writes for callers that never race grow() (tests,
-    // recovery). Caller must hold an RCU read lock. insert() returns
-    // -ENOSPC if the table is full; the caller grows, outside its section.
+    // Single-step writes. Caller must hold an RCU read lock. insert()
+    // returns -ENOSPC if the table is full; the caller resizes, outside its
+    // section.
     int insert(uint64_t hash, uint16_t kv_size, uint64_t pba);
     bool update(uint64_t hash, uint64_t old_pba,
                 uint16_t new_kv_size, uint64_t new_pba);
@@ -121,29 +153,53 @@ public:
 
     static constexpr uint64_t kAnyGeneration = UINT64_MAX;
 
-    // Double the number of tables, unless the current snapshot is no longer
-    // the one of generation `seen` (another grow did it). Returns 0, or
-    // -ENOSPC at the maximum size. Waits for a grace period, so it must not be called inside a
-    // read-side section, nor on a thread whose progress in-flight
-    // operations depend on (an I/O poller).
+    // A table of snapshot `seen` is full. Unless that snapshot is no longer
+    // current: finish its resize if one is in progress, migrating every
+    // stripe still pending, and start the next, doubling the tables.
+    // Returns 0, or -ENOSPC at the maximum size. Allocates the new tables
+    // and may wait for a grace period (ending a handover), so it runs on
+    // the space waker, never inside a read section or on an I/O poller.
+    int resize(uint64_t seen = kAnyGeneration);
+
+    // resize(), then finish it: the tables doubled when it returns.
+    // Recovery and tests.
     int grow(uint64_t seen = kAnyGeneration);
 
+    // Finish a resize in progress and its handover. For close, before the
+    // index is persisted: no operation may be in flight.
+    void complete();
+
+    bool resizing() const noexcept;
     uint32_t num_tables() const noexcept;
     uint32_t index_bits() const noexcept;
 
-    // The current snapshot, for callers no grow or write can race:
-    // persisting the index at close() and restoring it at open().
+    // The current snapshot, for callers no resize or write can race:
+    // persisting the index at close() (after complete()) and restoring it
+    // at open().
     DirSnapshot& snapshot() noexcept {
-        return *current_.load(std::memory_order_acquire);
+        DirSnapshot* snap = current_.load(std::memory_order_acquire);
+        assert(!snap->resize);
+        return *snap;
     }
 
 private:
+    // Copy stripe s of old table `old_table` into the new tables, with its
+    // lock held. The last one publishes the final snapshot.
+    void migrate_stripe(DirSnapshot& snap, uint32_t old_table,
+                        uint64_t stripe);
+    void publish_final(DirSnapshot* resizing);
+    // With grow_mutex_ held and inside a read section: migrate every
+    // stripe still pending in `snap`.
+    void finish_migration(DirSnapshot* snap);
+    // With grow_mutex_ held, outside any read section: end the current
+    // snapshot's handover, waiting a grace period if it is still active.
+    void end_handover();
+
     Rcu& rcu_;
     uint32_t index_bits_;
     alignas(64) std::atomic<DirSnapshot*> current_;
-    alignas(64) std::mutex grow_mutex_;  // one grow at a time
-    std::mutex grown_mu_;
-    std::condition_variable grown_cv_;   // a grow published a snapshot
+    // One resize() or complete() at a time; writers never take it.
+    alignas(64) std::mutex grow_mutex_;
 };
 
 }  // namespace udepot

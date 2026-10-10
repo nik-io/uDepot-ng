@@ -92,9 +92,14 @@ Quotes below are from the paper; section numbers are the paper's.
   snapshot (see PR #3 review, finding 4).
 - Figure 4: lock region r of old table ht0 migrates to the same region r of the
   two new tables ht'00 and ht'10.
-- uDepot-ng status: not implemented yet. The current freeze-and-synchronize grow
-  is a stopgap; the incremental resize is its own PR. Legacy never finished it
-  (`uDepotDirMapOR`'s shadow directory is the started half).
+- uDepot-ng status: implemented as above (`src/udepot/directory.{h,cc}`,
+  `docs/architecture.md`), with three agreed additions: a one-grace-period
+  lock handover after a resize finishes (writers on the final snapshot also
+  take the old stripes), on-demand completion by the space waker when a table
+  fills mid-resize (then the next resize starts), and close/recovery
+  finishing a pending resize. As in the paper, only writes migrate regions;
+  the waker does not sweep. Legacy never finished it (`uDepotDirMapOR`'s
+  shadow directory is the started half).
 
 ## Metadata and persistence (§4.4)
 

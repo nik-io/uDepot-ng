@@ -330,16 +330,16 @@ private:
     // tell whether a tombstone can still matter.
     std::unique_ptr<std::atomic<bool>[]> seg_live_;
 
-    // Waiting for free space or for a directory grow. When salsa has no
-    // segment staged, or the key's directory snapshot is being grown, an
-    // operation suspends here instead of blocking its thread (which may be
-    // an I/O poller that in-flight I/O needs), outside its read-side
-    // section (GC needs a grace period to free a segment, and a grow to
-    // copy the tables). The waker thread runs requested grows and resumes
-    // waiters to retry, as uDepot's tasks yielded to the TRT scheduler.
+    // Waiting for free space or for a directory resize. When salsa has no
+    // segment staged, or the key's table is full, an operation suspends
+    // here instead of blocking its thread (which may be an I/O poller that
+    // in-flight I/O needs), outside its read-side section (GC needs a grace
+    // period to free a segment, and a resize may need one to finish). The
+    // waker thread runs requested resizes and resumes waiters to retry, as
+    // uDepot's tasks yielded to the TRT scheduler.
     struct SpaceWait {
         uDepot* store;
-        // A grow of this snapshot generation to run, if any.
+        // A resize to run for this snapshot generation, if any.
         uint64_t grow = Directory::kAnyGeneration;
         bool await_ready() noexcept { return false; }
         bool await_suspend(std::coroutine_handle<> h);
@@ -514,38 +514,29 @@ private:
     static constexpr int kRewrite = 2;     // our write is not newer than
                                            // the entry (reported out)
     static constexpr int kNeedTomb = 3;    // del: write the tombstone
-    static constexpr int kTableFull = 4;   // put: grow the directory
-    static constexpr int kFrozen = 5;      // a grow is copying the tables
+    static constexpr int kTableFull = 4;   // put: resize the directory
 
-    // On kTableFull or kFrozen, *gen is the snapshot's generation.
+    // On kTableFull, *gen is the snapshot's generation.
     int commit_put(uint64_t hash, const KeyProbe& probe, PutMode mode,
                    uint64_t if_version, uint16_t kv_grains, uint64_t pba,
                    HashEntry* replaced, uint64_t* gen);
     int commit_del(uint64_t hash, const KeyProbe& probe, uint64_t if_version,
-                   uint64_t tomb_pba, HashEntry* removed, uint64_t* gen);
+                   uint64_t tomb_pba, HashEntry* removed);
 
-    // Wait, outside the read section, until the snapshot of `gen` has been
-    // replaced, asking the waker to grow it if `grow`. As in
-    // allocate_or_wait, `guard` is released and `probe` cleared meanwhile.
-    CoroTask<int> wait_for_grow(uint64_t gen, bool grow,
-                                std::optional<Rcu::ReadGuard>& guard,
-                                KeyProbe* probe);
+    // Have the waker resize for the full snapshot of `gen` and wait for it,
+    // outside the read section. As in allocate_or_wait, `guard` is released
+    // and `probe` cleared meanwhile.
+    CoroTask<int> wait_for_resize(uint64_t gen,
+                                  std::optional<Rcu::ReadGuard>& guard,
+                                  KeyProbe* probe);
 
-    // For threads that may block (GC): fn(table) on the key's table with
-    // its stripes held, inside a read section, waiting out a grow first if
-    // one has frozen the snapshot.
+    // fn(table) on the key's table with its stripes held, inside a read
+    // section (GC). A resize never makes it wait.
     template <typename F>
-    auto with_table_blocking(uint64_t hash, F&& fn) {
-        for (;;) {
-            uint64_t frozen;
-            {
-                Rcu::ReadGuard guard(rcu_);
-                auto locked = directory_->lock_for(hash);
-                if (!locked.frozen()) return fn(*locked.table);
-                frozen = locked.snapshot->generation;
-            }
-            directory_->wait_for_grow(frozen);
-        }
+    auto with_table(uint64_t hash, F&& fn) {
+        Rcu::ReadGuard guard(rcu_);
+        auto locked = directory_->lock_for(hash);
+        return fn(*locked.table);
     }
 
     // Whether data at new_pba is newer than data at old_pba in the order

@@ -308,6 +308,96 @@ TEST_F(StoreGcTest, DirectoryGrowsUnderConcurrentPuts) {
     check();
 }
 
+// The same with tables of several stripes, so a resize migrates stripe by
+// stripe as puts touch them while gets read through the resizing directory
+// (each slot from the old or the new table). Every key a put has returned
+// for is readable with its value at all times.
+TEST_F(StoreGcTest, IncrementalResizeUnderConcurrentPutsAndGets) {
+    config_.initial_tables = 1;
+    config_.index_bits = 14;  // 4 stripes per table
+    ASSERT_EQ(store_.open(config_), 0);
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 6000;
+    std::atomic<int> errors{0}, misses{0};
+    std::atomic<int> done[kThreads] = {};
+    std::atomic<bool> stop{false};
+    auto key = [](int t, int i) {
+        return "r" + std::to_string(t) + "_" + std::to_string(i);
+    };
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int i = 0; i < kPerThread; ++i) {
+                if (store_.put(key(t, i), value_for(i, t, 100)).run_sync() != 0)
+                    errors.fetch_add(1);
+                done[t].store(i + 1, std::memory_order_release);
+            }
+        });
+    }
+    for (int r = 0; r < 2; ++r) {
+        threads.emplace_back([&, r] {
+            for (uint64_t n = r; !stop.load(std::memory_order_relaxed); ++n) {
+                const int t = static_cast<int>(n % kThreads);
+                const int upto = done[t].load(std::memory_order_acquire);
+                if (upto == 0) continue;
+                const int i = static_cast<int>((n * 7919) % upto);
+                if (get_or_empty(store_, key(t, i)) != value_for(i, t, 100))
+                    misses.fetch_add(1);
+            }
+        });
+    }
+    for (int t = 0; t < kThreads; ++t) threads[t].join();
+    stop.store(true);
+    for (size_t t = kThreads; t < threads.size(); ++t) threads[t].join();
+
+    ASSERT_EQ(errors.load(), 0);
+    EXPECT_EQ(misses.load(), 0);
+    EXPECT_GT(store_.directory().num_tables(), 1u);
+    int missing = 0;
+    for (int t = 0; t < kThreads; ++t)
+        for (int i = 0; i < kPerThread; ++i)
+            if (get_or_empty(store_, key(t, i)) != value_for(i, t, 100))
+                ++missing;
+    EXPECT_EQ(missing, 0);
+
+    // Random puts migrate every stripe within a few writes, so reads above
+    // rarely meet a resize in progress. Start one with nothing migrated and
+    // read everything while a slow writer migrates stripe by stripe.
+    ASSERT_EQ(store_.directory().resize(), 0);
+    ASSERT_TRUE(store_.directory().resizing());
+    std::atomic<bool> writing{true};
+    std::thread slow([&] {
+        for (int i = 0; i < 64; ++i) {
+            if (store_.put(key(9, i), value_for(i, 9, 100)).run_sync() != 0)
+                errors.fetch_add(1);
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+        }
+        writing.store(false);
+    });
+    int passes = 0;
+    while (writing.load() || passes == 0) {
+        for (int t = 0; t < kThreads; ++t)
+            for (int i = 0; i < kPerThread; i += 7)
+                if (get_or_empty(store_, key(t, i)) != value_for(i, t, 100))
+                    misses.fetch_add(1);
+        ++passes;
+    }
+    slow.join();
+    EXPECT_EQ(errors.load(), 0);
+    EXPECT_EQ(misses.load(), 0) << "passes: " << passes;
+
+    reopen();  // close finishes a resize still in progress
+    missing = 0;
+    for (int t = 0; t < kThreads; ++t)
+        for (int i = 0; i < kPerThread; ++i)
+            if (get_or_empty(store_, key(t, i)) != value_for(i, t, 100))
+                ++missing;
+    for (int i = 0; i < 64; ++i)
+        if (get_or_empty(store_, key(9, i)) != value_for(i, 9, 100)) ++missing;
+    EXPECT_EQ(missing, 0);
+}
+
 // A put that finds its table full while running on the AIO poller (where
 // its coroutine resumes after the data write) must not grow the directory
 // there: the grow waits for a grace period, which reads in flight on that

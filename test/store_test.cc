@@ -279,6 +279,44 @@ TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
 }
 #endif
 
+// A put whose table is full while a resize is in progress (with nothing
+// migrated: the paper migrates only what writes touch) has the space waker
+// finish that resize on demand and start the next, then succeeds. 33 keys
+// share a bucket and a table of the resizing geometry; a neighborhood holds
+// 32.
+TEST_F(StoreTest, TableFullMidResizeFinishesItOnDemand) {
+    store_.close();
+    config_.initial_tables = 1;
+    config_.index_bits = 14;  // 4 stripes per table
+    ASSERT_EQ(store_.open(config_), 0);
+    ASSERT_EQ(store_.directory().resize(), 0);
+    ASSERT_TRUE(store_.directory().resizing());
+    ASSERT_EQ(store_.directory().num_tables(), 2u);
+
+    std::vector<std::string> keys;
+    uint64_t want = 0;
+    for (int n = 0; keys.size() < 33 && n < 20000000; ++n) {
+        std::string k = "full_" + std::to_string(n);
+        const uint64_t h = CityHash64(k.data(), k.size());
+        const uint64_t sig = (h & ((1ULL << 14) - 1)) | ((h >> 63) << 14);
+        if (keys.empty()) want = sig;
+        if (sig == want) keys.push_back(k);
+    }
+    ASSERT_EQ(keys.size(), 33u);
+
+    for (size_t i = 0; i < keys.size(); ++i)
+        ASSERT_EQ(store_.put(keys[i], "v" + std::to_string(i)).run_sync(), 0)
+            << i;
+    EXPECT_GE(store_.directory().num_tables(), 4u);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::string out(16, '\0');
+        size_t n = 0;
+        ASSERT_EQ(store_.get(keys[i], reinterpret_cast<uint8_t*>(out.data()),
+                             out.size(), &n).run_sync(), 0) << i;
+        EXPECT_EQ(out.substr(0, n), "v" + std::to_string(i));
+    }
+}
+
 // --- Tag collision tests ---
 // Two keys that hash to the same bucket with the same 8-bit tag but are
 // different keys.  The store must find each one via disk verification,
