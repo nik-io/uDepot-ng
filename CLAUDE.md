@@ -124,6 +124,10 @@ ctest --test-dir build
 - A failing test must fail the build — never silently exit 0
 - SPDK tests require `UDEPOT_BUILD_SPDK=ON` and a configured SPDK environment
 - Non-SPDK tests must always pass
+- A test or benchmark that mirrors one of legacy uDepot's starts from the
+  legacy one's setup -- buffers, concurrency, sizes, what is timed -- and
+  differs only where a difference is agreed. The zero-copy bench went round
+  twice by not doing this (see "Zero-copy perf invariant")
 
 ### CI
 
