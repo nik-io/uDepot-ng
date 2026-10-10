@@ -124,6 +124,10 @@ ctest --test-dir build
 - A failing test must fail the build — never silently exit 0
 - SPDK tests require `UDEPOT_BUILD_SPDK=ON` and a configured SPDK environment
 - Non-SPDK tests must always pass
+- A test or benchmark that mirrors one of legacy uDepot's starts from the
+  legacy one's setup -- buffers, concurrency, sizes, what is timed -- and
+  differs only where a difference is agreed. The zero-copy bench went round
+  twice by not doing this (see "Zero-copy perf invariant")
 
 ### CI
 
@@ -167,11 +171,16 @@ zero-copy/copy ratios; the gate is the median of 5 such runs. Zero copy is
 uDepot's property, not the caller's: given a buffer it handed out
 (`alloc_put_buffer()`, `alloc_get_buffer()`), put and get do their I/O on
 it directly, and given other memory they copy through one of their own. So
-the bench sets both modes up as a caller would, outside the timing: every
-buffer allocated and every value written up front, plain memory for the
-copying API and uDepot's buffers for the zero-copy one, the same values in
-both. The timed loops only issue operations; gets are checked afterwards.
-An earlier version allocated a `PutBuffer` per put inside the timed loop. The two
+the bench sets both modes up as legacy's `udepot-test` does: one buffer per
+mode, allocated before timing and reused for every operation, plain memory
+for copy and uDepot's buffers for zero copy. Each put writes its key's
+8-byte tag into the value and each get checks it.
+
+Two earlier versions measured the wrong thing: one allocated a `PutBuffer`
+per put inside the timed loop; the next gave every op of a batch its own
+cache-cold buffer, which the copy path hides behind its own hot record
+buffer and zero copy cannot, so on `/dev/shm` zero copy read 2-12% slower
+on some CPUs and failed `main`. The two
 batches of a round share whatever drifts (the runner, GC, a network
 target), so the ratio isolates the copies zero copy avoids. It used to
 compare separate runs of each, by median: absolute throughput differs by up
