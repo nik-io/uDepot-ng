@@ -300,9 +300,10 @@ public:
     inline static std::atomic<FooterHook> index_footer_test_hook{nullptr};
 
     // Test seam, never set in production: called before allocating an
-    // index segment for a new table; returning false fails the allocation,
-    // as on a device with no segment free for one.
-    using IndexSegmentHook = bool (*)();
+    // index segment for a new table; returning -errno fails the allocation
+    // with it, as on a device with no segment to give (-ENOSPC) or none
+    // free yet (-EAGAIN). 0 lets it go on.
+    using IndexSegmentHook = int (*)();
     inline static std::atomic<IndexSegmentHook> index_segment_test_hook{
         nullptr};
 
@@ -448,8 +449,8 @@ private:
     class IndexTables final : public TableSource {
     public:
         explicit IndexTables(uDepot* store) : store_(store) {}
-        std::unique_ptr<HashTable> new_table() override {
-            return store_->new_index_table();
+        int new_table(std::unique_ptr<HashTable>* table) override {
+            return store_->new_index_table(table);
         }
         void retire_table(HashTable& table) override {
             store_->retire_index_table(table);
@@ -464,7 +465,7 @@ private:
     // tables then live in memory alone, and get their segments once the
     // walk has freed the dead ones (assign_index_segments).
     bool index_unbacked_ = false;
-    std::unique_ptr<HashTable> new_index_table();
+    int new_index_table(std::unique_ptr<HashTable>* table);
     void retire_index_table(HashTable& table);
     int assign_index_segments();
     // The directory with its first table (uDepot's init: grow() from none).
@@ -476,7 +477,13 @@ private:
     // -errno; on failure no complete index is left, and the next open
     // scans the log.
     int flush_index();
+    // One attempt: 0, -EAGAIN (no segment staged yet; GC may free one), or
+    // -ENOSPC.
     int allocate_index_segment(uint64_t net_grains, u64* grain);
+    // At open, where nothing else can go on until the index has its
+    // segments: retry -EAGAIN for a while, then give up with -ENOSPC.
+    template <typename F>
+    int retry_at_open(F&& attempt);
     // Restore the newest complete index, if there is one (*restored), and
     // invalidate every valid index footer on the device either way, so a
     // later crash cannot bring back an index older than the log. Returns

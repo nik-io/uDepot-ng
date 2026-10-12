@@ -4,11 +4,13 @@
 #include "udepot/store.h"
 #include "udepot/io/posix.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -729,7 +731,7 @@ TEST_P(StoreIndexTest, AGrowWithoutASegmentFailsThePut) {
     config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
     uDepot<PosixIO> store;
     ASSERT_EQ(store.open(config()), 0);
-    uDepot<PosixIO>::index_segment_test_hook = [] { return false; };
+    uDepot<PosixIO>::index_segment_test_hook = [] { return -ENOSPC; };
     int i = 0;
     int rc = 0;
     for (; i < 5000; ++i) {
@@ -745,6 +747,134 @@ TEST_P(StoreIndexTest, AGrowWithoutASegmentFailsThePut) {
     for (int j = 0; j <= i; ++j)
         ASSERT_EQ(get_value(store, make_key(j)), make_val(j)) << make_key(j);
     store.close();
+}
+
+// A grow that finds no index segment free yet (-EAGAIN) is not a failure:
+// as uDepot's grow() loops on EAGAIN, the waker tries again, letting every
+// other waiter go on meanwhile, and the put that needed it succeeds.
+TEST_P(StoreIndexTest, AGrowThatMustWaitForASegmentGoesOn) {
+    config_.size = 16 * 1024 * 1024 + 4096;
+    config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
+    static std::atomic<int> calls;
+    calls = 0;
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(config()), 0);
+    uDepot<PosixIO>::index_segment_test_hook = [] {
+        return calls.fetch_add(1) < 50 ? -EAGAIN : 0;
+    };
+    int i = 0;
+    for (; store.directory().num_tables() < 2; ++i) {
+        ASSERT_LT(i, 5000);
+        ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0) << i;
+    }
+    uDepot<PosixIO>::index_segment_test_hook = nullptr;
+    EXPECT_GT(calls.load(), 50);
+    for (int j = 0; j < i; ++j)
+        ASSERT_EQ(get_value(store, make_key(j)), make_val(j)) << make_key(j);
+    store.close();
+}
+
+// Every writer waiting on a grow that failed gets the failure, however
+// many there are; none waits forever, and once segments can be had again
+// the directory grows.
+TEST_P(StoreIndexTest, WritersWaitingOnAFailedGrowAllGetENOSPC) {
+    config_.size = 16 * 1024 * 1024 + 4096;
+    config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(config()), 0);
+    uDepot<PosixIO>::index_segment_test_hook = [] { return -ENOSPC; };
+    constexpr int kThreads = 4;
+    std::vector<int> last_rc(kThreads, 0), written(kThreads, 0);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t)
+        threads.emplace_back([&, t] {
+            for (int i = 0; i < 5000; ++i) {
+                const std::string key = make_key(t * 100000 + i);
+                last_rc[t] = store.put(key, make_val(i)).run_sync();
+                if (last_rc[t] != 0) return;
+                written[t] = i + 1;
+            }
+        });
+    for (auto& th : threads) th.join();
+    uDepot<PosixIO>::index_segment_test_hook = nullptr;
+    for (int t = 0; t < kThreads; ++t)
+        EXPECT_EQ(last_rc[t], -ENOSPC) << "writer " << t;
+    EXPECT_EQ(store.directory().num_tables(), 1u);
+    for (int t = 0; t < kThreads; ++t) {
+        ASSERT_EQ(store.put(make_key(t * 100000 + written[t]),
+                            make_val(written[t])).run_sync(), 0);
+        for (int i = 0; i <= written[t]; ++i)
+            ASSERT_EQ(get_value(store, make_key(t * 100000 + i)), make_val(i));
+    }
+    EXPECT_GE(store.directory().num_tables(), 2u);
+    store.close();
+}
+
+// A grow frees the old tables' segments: churned enough, the device puts
+// data where they were. (They used to be invalidated nowhere a test saw.)
+TEST_P(StoreIndexTest, RetiredTablesFreeTheirSegments) {
+    config_.size = 4 * 1024 * 1024 + 4096;
+    config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(config()), 0);
+    const uint64_t seg = config_.segment_size;
+    std::set<uint64_t> retired;  // segment indexes
+    std::set<uint64_t> current;
+    auto table_segs = [&] {
+        std::set<uint64_t> s;
+        for (auto& t : store.directory().snapshot().tables)
+            s.insert(t->region().grain() / seg);
+        return s;
+    };
+    current = table_segs();
+    int i = 0;
+    for (; store.directory().num_tables() < 4; ++i) {
+        ASSERT_LT(i, 5000);
+        ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        std::set<uint64_t> now = table_segs();
+        for (uint64_t s : current)
+            if (!now.count(s)) retired.insert(s);
+        current = now;
+    }
+    ASSERT_EQ(retired.size(), 3u);  // 1 -> 2 -> 4 tables
+    // Churn a few keys until one's record lands in a retired segment.
+    bool reused = false;
+    for (int round = 0; round < 40000 && !reused; ++round) {
+        const std::string key = "churn" + std::to_string(round % 64);
+        ASSERT_EQ(store.put(key, make_val(round)).run_sync(), 0);
+        const uint64_t hash = store.hash_key(uDepot<PosixIO>::as_bytes(key));
+        uint32_t idx = store.rcu().read_lock();
+        const uint64_t pba = store.directory().lookup(hash).pba();
+        store.rcu().read_unlock(idx);
+        reused = retired.count(pba / seg) != 0;
+    }
+    EXPECT_TRUE(reused) << "no retired table segment was ever reused";
+    store.close();
+}
+
+// After a crash, recovery may need more tables than the session had (the
+// log brings back records an index had rejected). If the device has no
+// segment for them all, open fails with -ENOSPC, every time, and leaves
+// the store for an operator to give it space; it does not open without a
+// persistable index.
+TEST_P(StoreIndexTest, CrashRecoveryWithNoRoomForItsIndexDoesNotOpen) {
+    config_.size = 4 * 1024 * 1024;
+    config_.segment_size = 64;  // 32 KiB
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        for (int i = 0; i < 3000; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        for (int i = 3000; i < 6500; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i),
+                                udepot::PutMode::kReplace).run_sync(),
+                      -ENOENT);
+        crash(store);
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        uDepot<PosixIO> store;
+        EXPECT_EQ(store.open(reopen_config()), -ENOSPC) << attempt;
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(Index, StoreIndexTest,

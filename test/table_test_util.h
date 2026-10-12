@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -33,16 +34,28 @@ inline std::unique_ptr<HashTable> make_table(uint32_t bits) {
 }
 
 // Tables of 2^bits buckets in memory, at most `budget` of them out at once
-// (a store with that many free index segments).
+// (a store with that many free index segments: then -ENOSPC).
+// again(n, after) lets `after` more requests through, then fails the n
+// next with -EAGAIN (none free yet).
 class MemTables final : public TableSource {
 public:
     explicit MemTables(uint32_t bits, size_t budget = SIZE_MAX)
         : bits_(bits), budget_(budget) {}
 
-    std::unique_ptr<HashTable> new_table() override {
-        if (live_ >= budget_) return nullptr;
+    int new_table(std::unique_ptr<HashTable>* table) override {
+        ++requests_;
+        if (pass_ > 0) {
+            --pass_;
+        } else if (again_ > 0) {
+            --again_;
+            return -EAGAIN;
+        }
+        if (live_ >= budget_) return -ENOSPC;
+        *table = make_table(bits_);
+        if (!*table) return -ENOMEM;
         ++live_;
-        return make_table(bits_);
+        ++made_;
+        return 0;
     }
     void retire_table(HashTable&) override {
         --live_;
@@ -51,19 +64,29 @@ public:
 
     // n new tables, for a directory to start with.
     std::vector<std::unique_ptr<HashTable>> initial(uint32_t n) {
-        std::vector<std::unique_ptr<HashTable>> tables;
-        for (uint32_t i = 0; i < n; ++i) tables.push_back(new_table());
+        std::vector<std::unique_ptr<HashTable>> tables(n);
+        for (auto& t : tables) new_table(&t);
         return tables;
     }
 
+    void again(int n, int after = 0) {
+        again_ = n;
+        pass_ = after;
+    }
     size_t live() const { return live_; }
+    size_t made() const { return made_; }
     size_t retired() const { return retired_; }
+    size_t requests() const { return requests_; }
 
 private:
     uint32_t bits_;
     size_t budget_;
+    int again_ = 0;
+    int pass_ = 0;
     size_t live_ = 0;
+    size_t made_ = 0;
     size_t retired_ = 0;
+    size_t requests_ = 0;
 };
 
 }  // namespace udepot::test

@@ -309,3 +309,31 @@ TEST_F(DirectoryTest, GrowRetiresTheOldTables) {
     EXPECT_EQ(source.retired(), 6u);
     EXPECT_EQ(source.live(), 8u);
 }
+
+// As uDepot's grow() retrying on EAGAIN: with no table to be had yet, the
+// grow says so (-EAGAIN), changes nothing, and keeps the tables it did get
+// for the next attempt, which asks only for the rest.
+TEST_F(DirectoryTest, GrowThatMustWaitKeepsTheTablesItGot) {
+    MemTables source(8);
+    Directory dir(rcu_, source, source.initial(2));
+    {
+        Rcu::ReadGuard guard(rcu_);
+        for (uint64_t i = 0; i < 100; ++i)
+            ASSERT_EQ(dir.insert(make_hash(i, static_cast<uint8_t>(i), 8), 1,
+                                 i),
+                      0);
+    }
+    source.again(1, /*after=*/2);  // two of the four, then none for now
+    EXPECT_EQ(dir.grow(), -EAGAIN);
+    EXPECT_EQ(dir.num_tables(), 2u);
+    EXPECT_EQ(source.retired(), 0u) << "a grow that must wait gave up tables";
+
+    ASSERT_EQ(dir.grow(), 0);
+    EXPECT_EQ(dir.num_tables(), 4u);
+    EXPECT_EQ(source.made(), 2u + 4u) << "the retry made tables again";
+    EXPECT_EQ(source.retired(), 2u);  // the old two
+    Rcu::ReadGuard guard(rcu_);
+    for (uint64_t i = 0; i < 100; ++i)
+        EXPECT_EQ(dir.lookup(make_hash(i, static_cast<uint8_t>(i), 8)).pba(),
+                  i);
+}

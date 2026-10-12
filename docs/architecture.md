@@ -628,8 +628,10 @@ persistent source of truth is the log"*.
   the end of the net segment. Slots are `HashEntry`'s raw 64 bits, which use
   uDepot's bitfield layout.
 - **Close.** GC stops first: it relocates records, updating the tables,
-  which are then written back as they stand. Each table's header and slots
-  go to its segment, and only once every table is there its footer, which
+  which are then written back as they stand. Each table's header and every
+  slot go to its segment (with grains over 512 B the last slots share the
+  footer's grain, and are written with the rest as well), and only once
+  every table is there its footer, which
   carries a checksum bound to the device seed and the flush's timestamp,
   newer than any index seen on the device. An index is complete when, for
   its timestamp, every table has a valid footer; only the newest index is
@@ -643,18 +645,33 @@ persistent source of truth is the log"*.
 - **Invalidation.** Every valid footer found at open is cleared before
   anything is written, restored or not, as uDepot's `invalidate_ftr()`:
   otherwise a crash later in the session could restore an index older than
-  the log.
+  the log. Only the footer's 512 bytes: its grain is read, cleared there and
+  written back, so slots sharing it stay on the device (uDepot writes the
+  mapped slots back with it).
 - **Crash recovery** walks the log segment by segment, restoring each and
   invalidating its dead grains as it goes. Its tables live in memory alone
-  until the walk is done, then take their segments once salsa's threads
-  run. uDepot instead restores every data segment before its first grow, so
-  the grow cannot take one whose records are unread; on a full device that
-  provisions more than salsa's capacity, which salsa drops (only an assert
-  checks it), and the walk's invalidations then underflow salsa's used
-  count, so every later allocation fails.
-- **A grow with no segment free** fails: the write whose table was full
-  gets -ENOSPC, as uDepot's put does when its grow fails, rather than
-  waiting forever; the next write that finds its table full asks again.
+  until the walk is done (a segment taken earlier could be one whose
+  records are still to be read), then take their segments once salsa's
+  threads run. uDepot instead restores every data segment before its first
+  grow; on a full device that provisions more than salsa's capacity at
+  once. The walk can still do so when the log brings back more live data
+  than the device holds (rejected writes come back after a crash, as the
+  paper accepts): it restores a segment before invalidating its dead
+  grains, salsa drops the excess (only an assert checks it), and its used
+  count underflows. That is so on `main` too, and is not fixed here.
+- **No room for the index after a crash: open fails, by decision.** Those
+  same records can need more tables than the session had. If the device has
+  no segment for every one, `open()` fails with -ENOSPC, every time, with a
+  message saying so, and the store is left for an operator to give space.
+  It does not open with an index it could not persist. (uDepot would not
+  open either: its grow waits for a segment.)
+- **A grow that finds no index segment free yet** (salsa: EAGAIN) is
+  retried, as uDepot's `grow()` loops on EAGAIN, but by the space waker, not
+  inline: between attempts it resumes every waiter, and the grow keeps the
+  tables it did get for the next attempt. With no segment to be had
+  (-ENOSPC), it fails, and the writes that asked for it get -ENOSPC, as
+  uDepot's put gets its grow's return code. At open, where nothing else can
+  go on, an EAGAIN is retried for 10 s.
 - **No periodic flush, deliberately.** The paper also flushes *"periodically
   to speed recovery"*. uDepot gets that only from the kernel writing back
   its mmap'd tables, and its footers are valid only after a clean shutdown,

@@ -22,8 +22,10 @@ namespace udepot {
 class TableSource {
 public:
     virtual ~TableSource() = default;
-    // A new, cleared table, or nullptr if there is no space for one.
-    virtual std::unique_ptr<HashTable> new_table() = 0;
+    // A new, cleared table into *table: 0, -EAGAIN if there is no space
+    // for one yet but may soon be (GC), or another -errno (-ENOSPC: none
+    // to be had).
+    virtual int new_table(std::unique_ptr<HashTable>* table) = 0;
     // `table` has left the directory (or never entered it): no writer
     // reaches it, though readers may until a grace period ends. Release
     // what backs it on the device; its memory goes with the table.
@@ -135,10 +137,12 @@ public:
     static constexpr uint64_t kAnyGeneration = UINT64_MAX;
 
     // Double the number of tables, unless the current snapshot is no longer
-    // the one of generation `seen` (another grow did it). Returns 0, or
-    // -ENOSPC at the maximum size or if the source has no space for the
-    // new tables. Waits for a grace period, so it must not be called inside
-    // a read-side section, nor on a thread whose progress in-flight
+    // the one of generation `seen` (another grow did it). Returns 0;
+    // -EAGAIN if the source has no space for the new tables yet, keeping
+    // those it got for the next attempt (as uDepot's grow() retries); or
+    // -ENOSPC at the maximum size or if the source has no space to give.
+    // Waits for a grace period, so it must not be called inside a
+    // read-side section, nor on a thread whose progress in-flight
     // operations depend on (an I/O poller).
     int grow(uint64_t seen = kAnyGeneration);
 
@@ -153,6 +157,9 @@ public:
 private:
     Rcu& rcu_;
     TableSource& source_;
+    // Tables a grow got before the source ran out for now (-EAGAIN), for
+    // the next attempt; all tables are alike. Under grow_mutex_.
+    std::vector<std::unique_ptr<HashTable>> spare_;
     alignas(64) std::atomic<DirSnapshot*> current_;
     alignas(64) std::mutex grow_mutex_;  // one grow at a time
     std::mutex grown_mu_;

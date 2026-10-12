@@ -743,6 +743,16 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
             ASSERT_EQ(store_.put(key, val).run_sync(), 0);
         }
     }
+    // A tombstone goes only with a victim older than every segment still
+    // on disk, and a freed segment stays on disk, with its old timestamp,
+    // until it is reused: GC usually frees older segments than it keeps,
+    // so the chances come in windows, and about one run in thirty of the
+    // workload above meets none. (It passed anyway while close() flushed
+    // the index with GC still running, which gave GC more time.) Keep
+    // writing, other keys only, until GC has had one.
+    for (int i = 0; i < 200000 && drops.load() == 0; ++i)
+        ASSERT_EQ(store_.put("f" + std::to_string(i % kKeys), val).run_sync(),
+                  0);
     store_.close();
     uDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
 

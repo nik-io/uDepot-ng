@@ -25,6 +25,8 @@ Directory::Directory(Rcu& rcu, TableSource& source,
       current_(new DirSnapshot(std::move(tables), 0)) {}
 
 Directory::~Directory() {
+    // Spare tables are dropped with their segments unwritten: no index
+    // footer names them, so the next open finds those segments free.
     // Snapshots retired by grow() are freed by RCU callbacks.
     rcu_.barrier();
     delete current_.load(std::memory_order_relaxed);
@@ -90,15 +92,25 @@ int Directory::grow(uint64_t seen) {
 
     // Allocated before freezing: writers stall only for the copy. As
     // uDepot's grow(), each new table gets a segment of its own.
-    std::vector<std::unique_ptr<HashTable>> tables;
-    tables.reserve(2 * old_snap->size());
-    for (uint32_t i = 0; i < 2 * old_snap->size(); ++i) {
-        auto table = source_.new_table();
-        if (!table) {
+    std::vector<std::unique_ptr<HashTable>> tables = std::move(spare_);
+    spare_.clear();
+    while (tables.size() < 2 * old_snap->size()) {
+        std::unique_ptr<HashTable> table;
+        if (int rc = source_.new_table(&table); rc != 0) {
+            if (rc == -EAGAIN) {
+                spare_ = std::move(tables);  // the next attempt goes on
+                return -EAGAIN;
+            }
             for (auto& t : tables) source_.retire_table(*t);
-            return -ENOSPC;
+            return rc;
         }
         tables.push_back(std::move(table));
+    }
+    // A grow keeps what it needs; any more (a larger earlier attempt's)
+    // waits for the next.
+    while (tables.size() > 2 * old_snap->size()) {
+        spare_.push_back(std::move(tables.back()));
+        tables.pop_back();
     }
     auto* new_snap = new DirSnapshot(std::move(tables),
                                      old_snap->generation + 1);

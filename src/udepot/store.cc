@@ -455,52 +455,56 @@ void uDepot<IO>::index_seg_md_callback(uint64_t md_grain) {
                          index_ctlr_->get_ctlr_id());
 }
 
-// salsa's allocate_grains() waits for a segment without a bound, and on a
-// device GC cannot free a segment of, a grow would hang. Retry for a while
-// instead; the grow then fails and the write reports -ENOSPC.
+// Never salsa's allocate_grains(), which waits for a segment without a
+// bound: a grow runs on the space waker, which must keep resuming the
+// other waiters meanwhile, so it retries a -EAGAIN itself (as uDepot's
+// grow() loops on EAGAIN).
 template <typename IO>
 int uDepot<IO>::allocate_index_segment(uint64_t net_grains, u64* grain) {
     auto hook = index_segment_test_hook.load(std::memory_order_relaxed);
-    if (hook && !hook()) return -ENOSPC;
+    if (hook) {
+        if (int rc = hook(); rc != 0) return rc;
+    }
+    int rc = index_ctlr_->allocate_grains_no_wait(net_grains, grain);
+    if (rc == 0) return 0;
+    return rc == EAGAIN ? -EAGAIN : -ENOSPC;
+}
+
+template <typename IO>
+template <typename F>
+int uDepot<IO>::retry_at_open(F&& attempt) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
     for (;;) {
-        int rc = index_ctlr_->allocate_grains_no_wait(net_grains, grain);
-        if (rc != EAGAIN) return rc == 0 ? 0 : -ENOSPC;
+        int rc = attempt();
+        if (rc != -EAGAIN) return rc;
         if (std::chrono::steady_clock::now() > deadline) return -ENOSPC;
         std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
 }
 
 template <typename IO>
-std::unique_ptr<HashTable> uDepot<IO>::new_index_table() {
+int uDepot<IO>::new_index_table(std::unique_ptr<HashTable>* table) {
     const uint64_t net_grains = get_seg_size() - seg_md_grains_;
-    if (index_unbacked_) {
-        TableRegion region = TableRegion::map(
-            get_seg_size() * grain_size_,
-            static_cast<size_t>(net_grains) * grain_size_,
-            TableRegion::kNoSegment);
-        if (!region.valid()) return nullptr;
-        auto table = std::make_unique<HashTable>(std::move(region));
-        table->clear();
-        return table;
+    u64 grain = TableRegion::kNoSegment;
+    if (!index_unbacked_) {
+        if (int rc = allocate_index_segment(net_grains, &grain); rc != 0)
+            return rc;
     }
-    u64 grain = 0;
-    if (allocate_index_segment(net_grains, &grain) != 0) return nullptr;
     // As uDepot's grow(): map the whole segment, then release the
     // allocation; its grains stay valid until the table is retired.
     TableRegion region =
         TableRegion::map(get_seg_size() * grain_size_,
                          static_cast<size_t>(net_grains) * grain_size_, grain);
-    if (!region.valid()) {
-        index_ctlr_->invalidate_grains(grain, net_grains, false);
+    if (!index_unbacked_) {
+        if (!region.valid())
+            index_ctlr_->invalidate_grains(grain, net_grains, false);
         index_ctlr_->release_grains(grain, net_grains);
-        return nullptr;
     }
-    auto table = std::make_unique<HashTable>(std::move(region));
-    table->clear();
-    index_ctlr_->release_grains(grain, net_grains);
-    return table;
+    if (!region.valid()) return -ENOMEM;
+    *table = std::make_unique<HashTable>(std::move(region));
+    (*table)->clear();
+    return 0;
 }
 
 template <typename IO>
@@ -518,7 +522,19 @@ int uDepot<IO>::assign_index_segments() {
     for (auto& table : snap.tables) {
         if (table->region().grain() != TableRegion::kNoSegment) continue;
         u64 grain = 0;
-        if (allocate_index_segment(net_grains, &grain) != 0) return -ENOSPC;
+        int rc = retry_at_open(
+            [&] { return allocate_index_segment(net_grains, &grain); });
+        if (rc != 0) {
+            // As uDepot would not open either (its grow() would wait for a
+            // segment forever): left to the operator, with the reason.
+            std::fprintf(stderr,
+                         "udepot: crash recovery rebuilt the index as %zu "
+                         "tables, but the device has no free segment for "
+                         "them all; the store cannot open until it has "
+                         "more space (%s)\n",
+                         snap.tables.size(), std::strerror(-rc));
+            return rc;
+        }
         table->set_segment(grain);
         index_ctlr_->release_grains(grain, net_grains);
     }
@@ -533,8 +549,10 @@ int uDepot<IO>::create_directory() {
     if (HashTable::index_bits_for(net_bytes) == 0 ||
         net_bytes < 2 * align_up(kIndexMdBytes, grain_size_))
         return -EINVAL;
-    auto table = new_index_table();
-    if (!table) return -ENOSPC;
+    std::unique_ptr<HashTable> table;
+    if (int rc = retry_at_open([&] { return new_index_table(&table); });
+        rc != 0)
+        return rc;
     std::vector<std::unique_ptr<HashTable>> tables;
     tables.push_back(std::move(table));
     directory_ = new Directory(rcu_, index_tables_, std::move(tables));
@@ -573,9 +591,11 @@ int uDepot<IO>::flush_index() {
         hdr.csum = index_md_csum(hdr);
         std::memset(r.base(), 0, kIndexMdBytes);
         std::memcpy(r.base(), &hdr, sizeof(hdr));
-        const size_t end = std::min(align_up(table.used_bytes(), grain_size_),
-                                    r.net_bytes() - md_chunk);
-        if (int rc = write_back(r, 0, end); rc != 0) return rc;
+        // Every slot, even those sharing a grain with the footer (grains
+        // over 512 B), so none depends on the footer's write landing.
+        if (int rc = write_back(r, 0, align_up(table.used_bytes(), grain_size_));
+            rc != 0)
+            return rc;
     }
 
     // Footers last: an index is complete only once all of it is written.
@@ -797,13 +817,21 @@ int uDepot<IO>::restore_index(bool* restored) {
 
     // Clear every valid footer before anything is written: neither the
     // index restored here nor one passed over may be restored again once
-    // the log moves on.
-    std::memset(md_buf.data, 0, md_chunk);
+    // the log moves on. Only the footer: with grains over 512 B its grain
+    // holds slots too, which stay as they are (uDepot's invalidate_ftr()
+    // writes the mapped slots back with it).
     for (const Found& f : found) {
-        ssize_t w = pwrite_internal(md_buf.data, md_chunk,
-                                    grain_to_offset(f.grain) +
-                                        static_cast<off_t>(net_bytes - md_chunk));
-        if (w != static_cast<ssize_t>(md_chunk)) return -EIO;
+        const off_t pos = grain_to_offset(f.grain) +
+                          static_cast<off_t>(net_bytes - md_chunk);
+        if (pread_internal(md_buf.data, md_chunk, pos) !=
+            static_cast<ssize_t>(md_chunk))
+            return -EIO;
+        std::memset(static_cast<uint8_t*>(md_buf.data) + md_chunk -
+                        kIndexMdBytes,
+                    0, kIndexMdBytes);
+        if (pwrite_internal(md_buf.data, md_chunk, pos) !=
+            static_cast<ssize_t>(md_chunk))
+            return -EIO;
     }
     if (!ok) return 0;
 
@@ -1177,11 +1205,24 @@ void uDepot<IO>::space_waker_loop() {
             uint64_t gen = *grow_request_;
             grow_request_.reset();
             lock.unlock();
-            // -ENOSPC at the maximum size (commit_put reports that itself),
-            // or for want of an index segment: the waiters that asked for
-            // this grow get it, and with them answered, so is the request.
             int rc = directory_->grow(gen);
             lock.lock();
+            if (rc == -EAGAIN) {
+                // No index segment free yet; GC may free one. As uDepot's
+                // grow() loops on EAGAIN, try again, but let every waiter
+                // retry meanwhile, as below (those whose table is full
+                // just ask again).
+                if (!grow_request_ || *grow_request_ < gen) grow_request_ = gen;
+                lock.unlock();
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                lock.lock();
+                resume_waiters(lock);
+                continue;
+            }
+            // -ENOSPC at the maximum size (commit_put reports that itself),
+            // or with no index segment to be had: the waiters that asked
+            // for this grow get it, and with them answered, so is the
+            // request.
             if (grow_request_ == gen) grow_request_.reset();
             resume_waiters(lock, gen, rc);
             continue;
