@@ -465,6 +465,7 @@ private:
     // tables then live in memory alone, and get their segments once the
     // walk has freed the dead ones (assign_index_segments).
     bool index_unbacked_ = false;
+    uint32_t overprovision_ = 0;  // per mille, as the store was opened
     int new_index_table(std::unique_ptr<HashTable>* table);
     void retire_index_table(HashTable& table);
     int assign_index_segments();
@@ -500,8 +501,11 @@ private:
 
     // Full crash recovery: scan all segments, rebuild directory.
     int crash_recovery();
+    // Index one record found in the log; `valid` tallies, per segment, the
+    // grains of the records the index ends up pointing to.
     int recover_record(uint64_t hash, std::span<const uint8_t> key,
-                       uint64_t grain, uint16_t kv_grains, bool tombstone);
+                       uint64_t grain, uint16_t kv_grains, bool tombstone,
+                       std::vector<uint64_t>& valid);
 
     size_t kv_total_bytes(size_t key_size, size_t val_size) const {
         return sizeof(KvHeader) + key_size + val_size + sizeof(KvSuffix);

@@ -877,5 +877,91 @@ TEST_P(StoreIndexTest, CrashRecoveryWithNoRoomForItsIndexDoesNotOpen) {
     }
 }
 
+// After a crash, the store charges salsa only for what the log still holds
+// live, so it takes as much new data as a fresh store less that. uDepot's
+// crash path charged every segment in full before invalidating the dead
+// grains: past the logical capacity salsa dropped the excess, and on a
+// churned device with little live data the used count underflowed, so
+// every write failed with -ENOSPC.
+TEST_P(StoreIndexTest, CrashRecoveryChargesOnlyLiveData) {
+    config_.size = 4 * 1024 * 1024 + 4096;
+    config_.segment_size = 64;  // 32 KiB
+    auto fill = [](uDepot<PosixIO>& store, const std::string& prefix) {
+        int n = 0;
+        for (;; ++n) {
+            int rc = store.put(prefix + std::to_string(n), "v").run_sync();
+            if (rc == -ENOSPC) return n;
+            EXPECT_EQ(rc, 0);
+            if (rc != 0) return -1;
+        }
+    };
+    int fresh = 0;
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        fresh = fill(store, "fresh");
+        store.close();
+    }
+    ASSERT_GT(fresh, 1000);
+    constexpr int kLive = 100;
+    constexpr int kRounds = 200;
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);  // a new store
+        // About 2.5 times the device: every segment carries valid
+        // metadata at the crash, and charged in full they exceed the
+        // logical capacity.
+        for (int round = 0; round < kRounds; ++round)
+            for (int i = 0; i < kLive; ++i)
+                ASSERT_EQ(store.put(make_key(i),
+                                    make_val(i + round * kLive)).run_sync(),
+                          0);
+        crash(store);
+    }
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(reopen_config()), 0);
+    ASSERT_FALSE(store.index_restored());
+    for (int i = 0; i < kLive; ++i)
+        ASSERT_EQ(get_value(store, make_key(i)),
+                  make_val(i + (kRounds - 1) * kLive));
+    const int after = fill(store, "after");
+    // The live keys take about what kLive fresh ones do; allow GC some
+    // slack either way.
+    EXPECT_GT(after, (fresh - kLive) * 9 / 10) << "capacity lost";
+    EXPECT_LT(after, fresh + fresh / 10) << "capacity counted twice";
+    store.close();
+}
+
+// Rejected writes come back after a crash (paper §4.5). When the log then
+// holds more live data than the store may, the device is full: the open
+// fails with -ENOSPC, every time. (It used to trip an assert in salsa, or
+// without asserts open with a broken used count.)
+TEST_P(StoreIndexTest, CrashRecoveryBeyondCapacityDoesNotOpen) {
+    config_.size = 4 * 1024 * 1024;
+    config_.segment_size = 64;  // 32 KiB
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        for (int i = 0; i < 3000; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        for (int i = 3000; i < 7000; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i),
+                                udepot::PutMode::kReplace).run_sync(),
+                      -ENOENT);
+        crash(store);
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        uDepot<PosixIO> store;
+        testing::internal::CaptureStderr();
+        const int rc = store.open(reopen_config());
+        const std::string err = testing::internal::GetCapturedStderr();
+        EXPECT_EQ(rc, -ENOSPC) << attempt;
+        EXPECT_NE(err.find("grains of live data, more than the store's "
+                           "capacity"),
+                  std::string::npos)
+            << "failed for another reason: " << err;
+    }
+}
+
 INSTANTIATE_TEST_SUITE_P(Index, StoreIndexTest,
                          ::testing::Values(Shutdown::kClean));

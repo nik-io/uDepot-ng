@@ -655,17 +655,27 @@ persistent source of truth is the log"*.
   the log. Only the footer's 512 bytes: its grain is read, cleared there and
   written back, so slots sharing it stay on the device (uDepot writes the
   mapped slots back with it).
-- **Crash recovery** walks the log segment by segment, restoring each and
-  invalidating its dead grains as it goes. Its tables live in memory alone
-  until the walk is done (a segment taken earlier could be one whose
-  records are still to be read), then take their segments once salsa's
-  threads run. uDepot instead restores every data segment before its first
-  grow; on a full device that provisions more than salsa's capacity at
-  once. The walk can still do so when the log brings back more live data
-  than the device holds (rejected writes come back after a crash, as the
-  paper accepts): it restores a segment before invalidating its dead
-  grains, salsa drops the excess (only an assert checks it), and its used
-  count underflows. That is so on `main` too, and is not fixed here.
+- **Crash recovery** reads the whole log once (a crash should be rare, and
+  then a full read is the price), building the index, and only then charges
+  salsa, as uDepot's `restore()` does after a clean shutdown (its
+  `validity_map`): each segment with the grains of the records the index
+  points to. Dead grains, and an open segment's unwritten tail, are never
+  charged, and a segment with none live stays free. Index segments are
+  skipped: the index is rebuilt. Its tables live in memory alone until the
+  walk is done (a segment taken earlier could be one whose records are
+  still to be read), then take their segments once salsa's threads run.
+  uDepot's crash path instead charged every segment with valid metadata in
+  full (`prep_crash_recovery`), and invalidated the dead grains after; as
+  a freed segment keeps its metadata until reused, on a churned device
+  that is every segment, past the logical capacity (overprovisioning):
+  salsa dropped the excess, checked by an assert only, and the
+  invalidations underflowed its used count, so every write then failed.
+  salsa's `restore_grain_range` now charges first and refuses a range that
+  does not fit.
+- **More live data than the store may hold after a crash: open fails.**
+  Rejected writes come back after a crash (§4.5), and can take the log
+  past the logical capacity. The device is then full: `open()` fails with
+  -ENOSPC, every time, with a message saying so, left to an operator.
 - **No room for the index after a crash: open fails, by decision.** Those
   same records can need more tables than the session had. If the device has
   no segment for every one, `open()` fails with -ENOSPC, every time, with a

@@ -96,7 +96,9 @@ public:
 	}
 
 	void invalidate_grains(const u64 grain, const u64 len, const bool is_reloc);
-	void restore_grain_range(u64 grain, u64 len, u8 ctlr_id);
+	// 0, or ENOSPC if the range does not fit the capacity (EINVAL if the
+	// segment is not free); then nothing is restored.
+	int restore_grain_range(u64 grain, u64 len, u8 ctlr_id);
 	u64 seg_to_grain(gc_io_work_parent *work) const;
 	u64 grain_to_seg_idx(u64 grain) const;
 	ScmSegmentIterator begin();

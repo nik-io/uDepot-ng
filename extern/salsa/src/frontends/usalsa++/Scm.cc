@@ -225,28 +225,34 @@ Scm::grain_to_seg_idx(const u64 grain) const
 	return scm_grain_to_seg_idx(scm_, grain);
 }
 
-void
+int
 Scm::restore_grain_range(const u64 grain, const u64 len, const u8 ctlr_id)
 {
 	segment *const seg = scm_grain_to_segment(scm_, grain);
 	assert(seg == scm_grain_to_segment(scm_, grain + len));
 	assert(0 < len);
-	segment_getn(seg, len);
-	if (SEG_FREE == segment_get_state(seg) || SEG_FREE_REL == segment_get_state(seg)) {
-		scm_detach_free_seg(scm_, seg);
-		segment_putn(seg, get_seg_size());
-		assert(0 < segment_valid_nr(seg));
-		segment_set_ctlr(seg, ctlr_id);
-		// hand it over to the GC
-		gc_seg_destaged(scm_->gc, seg);
-		int __attribute__((unused)) rc = provision_grains(len, true);
-		assert(0 == rc);
-	} else {
+	if (SEG_FREE != segment_get_state(seg) && SEG_FREE_REL != segment_get_state(seg)) {
 		ERR("restore grain range g=%lu len=%lu ctlr_id=%u failed",
                         grain, len, ctlr_id);
-        }
+		return EINVAL;
+	}
+	// Charge the capacity first: a range that does not fit is refused, and
+	// the segment stays free. (It used to be restored uncounted, checked by
+	// an assert only, and the grains later invalidated in it underflowed
+	// the used count.)
+	const int rc = provision_grains(len, true);
+	if (0 != rc)
+		return rc;
+	segment_getn(seg, len);
+	scm_detach_free_seg(scm_, seg);
+	segment_putn(seg, get_seg_size());
+	assert(0 < segment_valid_nr(seg));
+	segment_set_ctlr(seg, ctlr_id);
+	// hand it over to the GC
+	gc_seg_destaged(scm_->gc, seg);
 
 	assert(segment_valid_nr(seg) <= get_seg_size());
+	return 0;
 }
 
 int

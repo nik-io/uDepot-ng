@@ -214,7 +214,8 @@ bool uDepot<IO>::read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md) {
 template <typename IO>
 int uDepot<IO>::recover_record(uint64_t hash, std::span<const uint8_t> key,
                                uint64_t grain, uint16_t kv_grains,
-                               bool tombstone) {
+                               bool tombstone, std::vector<uint64_t>& valid) {
+    auto seg_of = [&](uint64_t pba) { return scm_->grain_to_seg_idx(pba); };
     // Same lookup as a put or del (legacy try_restore_entry ran
     // lookup_mbuff_put): every tag-matching entry, live or deleted, is
     // verified against the key, so another key with the same tag earlier in
@@ -236,27 +237,26 @@ int uDepot<IO>::recover_record(uint64_t hash, std::span<const uint8_t> key,
             (void)settled;
             uint16_t new_kv = tombstone ? 0 : kv_grains;
             if (match.empty()) {
-                if (locked.table->insert_locked(hash, new_kv, grain) == 0)
+                if (locked.table->insert_locked(hash, new_kv, grain) == 0) {
+                    valid[seg_of(grain)] += kv_grains;
                     return 0;
+                }
                 uint64_t seen = locked.snapshot->generation;
                 locked.lock = HashTable::WriteLock{};
                 if (directory_->grow(seen) != 0) return -ENOSPC;
                 continue;
             }
             // Two records of one key: the newer one wins, as at run time.
-            if (!newer_than(grain, match.pba())) {
-                match = HashEntry{};
-            } else {
+            if (newer_than(grain, match.pba())) {
                 match_grains = match.deleted()
                     ? static_cast<uint16_t>(kv_total_grains(key.size(), 0))
                     : match.kv_size();
                 locked.table->update_locked(hash, match.pba(), new_kv, grain);
+                assert(valid[seg_of(match.pba())] >= match_grains);
+                valid[seg_of(match.pba())] -= match_grains;
+                valid[seg_of(grain)] += kv_grains;
             }
         }
-        if (match.empty())
-            invalidate_grains(grain, kv_grains);
-        else
-            invalidate_grains(match.pba(), match_grains);
         return 0;
     }
 }
@@ -287,6 +287,9 @@ int uDepot<IO>::crash_recovery() {
     uint64_t data_grains = seg_size - seg_md_grains_;
     uint64_t max_timestamp = 0;
     IoBuffer seg_buf;
+    // Per segment, the grains of the records the index points to.
+    std::vector<uint64_t> valid(num_segments_, 0);
+    std::vector<uint64_t> data_segs;
 
     // uDepot's init: grow() to the first table, then crash_recovery(). Its
     // tables take no segment until the walk is done (index_unbacked_): a
@@ -314,11 +317,7 @@ int uDepot<IO>::crash_recovery() {
         if (ts > max_timestamp)
             max_timestamp = ts;
 
-        // Mark the segment's data grains in use, as uDepot's crash_recovery
-        // does (the net size: the metadata grains at the tail hold no
-        // records and must not count as valid); grains that hold no valid
-        // record are invalidated as the walk passes them.
-        scm_->restore_grain_range(seg_base, data_grains, get_ctlr_id());
+        data_segs.push_back(seg_base);
 
         // As uDepot (which maps the segment): one read of the net segment,
         // then walk it in memory.
@@ -327,10 +326,7 @@ int uDepot<IO>::crash_recovery() {
         const auto* seg = static_cast<const uint8_t*>(seg_buf.data);
 
         uint64_t grain = seg_base;
-        auto skip = [&](uint64_t n) {
-            invalidate_grains(grain, n);
-            grain += n;
-        };
+        auto skip = [&](uint64_t n) { grain += n; };
         while (grain < seg_base + data_grains) {
             const uint8_t* ep = seg + (grain - seg_base) * grain_size_;
             KvHeader hdr;
@@ -360,9 +356,38 @@ int uDepot<IO>::crash_recovery() {
             std::span<const uint8_t> key(ep + sizeof(KvHeader), hdr.key_size);
             int rc = recover_record(hash_key(key), key, grain,
                                     static_cast<uint16_t>(entry_grains),
-                                    is_tombstone(hdr));
+                                    is_tombstone(hdr), valid);
             if (rc != 0) return rc;
             grain += entry_grains;
+        }
+    }
+
+    // Only now, with the whole log read, charge salsa for what is live: as
+    // uDepot's restore() after a clean shutdown (its validity_map), each
+    // segment with the grains of the records the index points to. Dead
+    // grains, and an open segment's unwritten tail, are never charged; a
+    // segment with none live stays free. (uDepot's crash path charged every
+    // segment in full first, and invalidated the dead grains after; past
+    // the logical capacity salsa dropped the excess, checked by an assert
+    // only, and the invalidations underflowed its used count.)
+    for (uint64_t seg_base : data_segs) {
+        const uint64_t n = valid[scm_->grain_to_seg_idx(seg_base)];
+        if (n == 0) continue;
+        if (int rc = scm_->restore_grain_range(seg_base, n, get_ctlr_id());
+            rc != 0) {
+            // The log holds more live data than the store may: rejected
+            // writes come back after a crash (paper §4.5). The device is
+            // full; left to an operator.
+            uint64_t total = 0;
+            for (uint64_t v : valid) total += v;
+            std::fprintf(stderr,
+                         "udepot: crash recovery found %lu grains of live "
+                         "data, more than the store's capacity (%u per mille "
+                         "overprovisioned); the store cannot open until it "
+                         "has more space (%s)\n",
+                         static_cast<unsigned long>(total), overprovision_,
+                         std::strerror(rc));
+            return -ENOSPC;
         }
     }
 
@@ -839,17 +864,21 @@ int uDepot<IO>::restore_index(bool* restored) {
     // restore() restores the directory's segment ranges; any other index
     // segment is free.
     directory_ = new Directory(rcu_, index_tables_, std::move(tables));
+    // The live data and the tables it was persisted with fitted the store
+    // when it shut down, so they fit now; a failure means a corrupt index.
     for (const Found* f : set)
-        scm_->restore_grain_range(f->grain, net_grains,
-                                  index_ctlr_->get_ctlr_id());
+        if (scm_->restore_grain_range(f->grain, net_grains,
+                                      index_ctlr_->get_ctlr_id()) != 0)
+            return -EIO;
     for (uint64_t seg = 0; seg < num_segments_; ++seg) {
         if (data_ts[seg] == 0) continue;
         seg_timestamps_[seg].store(data_ts[seg], std::memory_order_relaxed);
         seg_md_ok_[seg].store(true, std::memory_order_relaxed);
         seg_live_[seg].store(true, std::memory_order_relaxed);
-        if (valid[seg] != 0)
+        if (valid[seg] != 0 &&
             scm_->restore_grain_range(seg * seg_size, valid[seg],
-                                      get_ctlr_id());
+                                      get_ctlr_id()) != 0)
+            return -EIO;
     }
     if (max_data_ts > 0) restore_seg_alloc_nr(max_data_ts);
     *restored = true;
@@ -976,6 +1005,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
         }
 
         scm_ = new salsa::Scm();
+        overprovision_ = config.overprovision;
         rc = scm_->init(argc, argv, config.overprovision);
         if (rc == 0) break;
 
