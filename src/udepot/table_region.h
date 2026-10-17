@@ -19,13 +19,16 @@ namespace udepot {
 // metadata sits in the tail past it, inside the mapping but never written
 // from it.
 //
-// As uDepot (0e0b0a0, "map the full segment on huge pages"): the mapping
-// always spans the whole segment, on huge pages when the segment's size is
-// a 2 MiB multiple (segments tile the device from offset 0, so such a
-// segment is also 2 MiB-aligned there), falling back to 4 KiB pages when
-// no huge page is available; any other segment size maps on 4 KiB pages.
-// The mapping is anonymous, as uDepot's on its AIO and SPDK backends: the
-// table is read from its segment on restore and written back at close.
+// As uDepot (0e0b0a0, "map the full segment on huge pages"), the mapping
+// always spans the whole segment. It is on huge pages whenever the segment
+// is 2 MiB or more, rounded up to a 2 MiB multiple: the mapping is
+// anonymous, as uDepot's on its AIO and SPDK backends (the table is read
+// from its segment on restore and written back at close, never mapped
+// from the device), so it need not match the segment's size or where it
+// sits on the device. uDepot took huge pages only for a segment that is a
+// 2 MiB multiple, and every such segment's table filled half of it (see
+// fitted_segment_size). Falls back to 4 KiB pages, mapping the segment
+// exactly, when no huge page is available or the segment is smaller.
 class TableRegion {
 public:
     static constexpr size_t kMdBytes = 512;  // uDepot's dirmap_hdr/_ftr
@@ -41,9 +44,10 @@ public:
     TableRegion(const TableRegion&) = delete;
     TableRegion& operator=(const TableRegion&) = delete;
 
-    // Map seg_bytes for a table using the first net_bytes, backed by the
-    // segment starting at `grain` (kNoSegment for none yet). The memory is
-    // zero. Returns an invalid region if the mapping fails.
+    // Map seg_bytes (rounded up to 2 MiB on huge pages) for a table using
+    // the first net_bytes, backed by the segment starting at `grain`
+    // (kNoSegment for none yet). The memory is zero. Returns an invalid
+    // region if the mapping fails.
     static TableRegion map(size_t seg_bytes, size_t net_bytes,
                            uint64_t grain);
 

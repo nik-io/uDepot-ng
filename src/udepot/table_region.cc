@@ -29,14 +29,18 @@ TableRegion TableRegion::map(size_t seg_bytes, size_t net_bytes,
     constexpr int kProt = PROT_READ | PROT_WRITE;
     constexpr int kFlags = MAP_PRIVATE | MAP_ANONYMOUS;
     void* p = MAP_FAILED;
+    size_t map_bytes = seg_bytes;
     bool huge = false;
-    if (seg_bytes % kHugePage == 0) {
-        p = ::mmap(nullptr, seg_bytes, kProt, kFlags | MAP_HUGETLB, -1, 0);
+    if (seg_bytes >= kHugePage) {
+        const size_t huge_bytes = (seg_bytes + kHugePage - 1) / kHugePage *
+                                  kHugePage;
+        p = ::mmap(nullptr, huge_bytes, kProt, kFlags | MAP_HUGETLB, -1, 0);
         huge = p != MAP_FAILED;
+        if (huge) map_bytes = huge_bytes;
     }
     if (!huge) p = ::mmap(nullptr, seg_bytes, kProt, kFlags, -1, 0);
     if (p == MAP_FAILED) return {};
-    return TableRegion(static_cast<uint8_t*>(p), seg_bytes, net_bytes, grain,
+    return TableRegion(static_cast<uint8_t*>(p), map_bytes, net_bytes, grain,
                        huge);
 }
 

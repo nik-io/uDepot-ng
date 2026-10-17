@@ -48,7 +48,11 @@
     consequences already decided: empty values are valid (tombstones need their
     own encoding); each directory table maps to an index segment of its own
     for its life, as large as the segment allows (smaller tables come from a
-    smaller segment size, never from a separate setting), is written back
+    smaller segment size, never from a separate setting; the default
+    segment and its halvings are fitted to a power-of-two table,
+    `fitted_segment_size`, and a table of 2 MiB or more maps on huge pages
+    rounded up to 2 MiB: agreed in PR #9, diverging from uDepot, whose
+    power-of-two segments left every table half full), is written back
     there at close and restored from it on a clean start, with the log scan
     only after a crash; the directory grows
     by freeze-and-copy, not the paper's incremental resize (tried in PR #8,

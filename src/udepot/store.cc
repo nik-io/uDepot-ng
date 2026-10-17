@@ -427,6 +427,14 @@ int uDepot<IO>::crash_recovery() {
 // table is on the device, and the open that restores them clears the
 // footers again.
 
+uint64_t fitted_segment_size(uint64_t table_bytes, uint32_t grain_size) {
+    const uint64_t md_bytes = align_up(sizeof(salsa::salsa_seg_md), grain_size);
+    const uint64_t room = 2 * TableRegion::kMdBytes +
+                          HashEntry::kHopRange * sizeof(uint64_t) + md_bytes;
+    const uint64_t page = std::max<uint64_t>(4096, grain_size);
+    return align_up(table_bytes + room, page) / grain_size;
+}
+
 namespace {
 
 constexpr size_t kIndexMdBytes = TableRegion::kMdBytes;
@@ -959,8 +967,15 @@ int uDepot<IO>::open(const StoreConfig& config) {
                 (static_cast<uint64_t>(ts.tv_sec) << 20);
     }
 
-    if (segment_size == 0)
-        segment_size = (1ULL << 29) / grain_size_ + 2;
+    // The default as uDepot's, a segment for a 2^29-byte table (it adds 2
+    // grains, too few for what the table needs besides its buckets), and
+    // halved as a table size so that every halving fills its segment too.
+    // 0 once the size is the caller's or no longer a fitted one.
+    uint64_t fitted_table = 0;  // bytes
+    if (segment_size == 0) {
+        fitted_table = uint64_t{1} << 29;
+        segment_size = fitted_segment_size(fitted_table, grain_size_);
+    }
 
     // Relocating GC with uDepot's non-memcache parameters
     // (uDepotSalsa::init: init_local(14, 2, 4)).
@@ -986,9 +1001,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
     };
     // As uDepot's KV_conf::validate_and_sanitize_parameters, for a store's
     // own segment size (a restored store keeps the one it was made with).
-    // It also makes the default segment (2^29 bytes + 2 grains) a 2 MiB
-    // multiple wherever a page holds more than two grains, so the
-    // directory's tables map on huge pages (TableRegion).
+    // Fitted sizes are whole pages already.
     if (!restored) segment_size = sanitize(segment_size);
 
     // Halving retry loop (matches uDepot): if the segment size is too
@@ -998,6 +1011,21 @@ int uDepot<IO>::open(const StoreConfig& config) {
             if (restored) {
                 io_.close();
                 return -EINVAL;
+            }
+            if (fitted_table != 0) {
+                // A smaller fitted segment, not the least-waste size below
+                // this one: that is a plain one, half of whose table
+                // would go unused.
+                fitted_table /= 2;
+                segment_size = fitted_table >= 4096
+                                   ? fitted_segment_size(fitted_table,
+                                                         grain_size_)
+                                   : 0;
+                if (segment_size <= 1) {
+                    io_.close();
+                    return -EINVAL;
+                }
+                continue;
             }
             const uint64_t net = dev_size - grain_size_;
             uint64_t best = 0;
@@ -1045,7 +1073,14 @@ int uDepot<IO>::open(const StoreConfig& config) {
 
         delete scm_;
         scm_ = nullptr;
-        segment_size /= 2;
+        if (fitted_table != 0) {
+            fitted_table /= 2;
+            segment_size = fitted_table >= 4096
+                               ? fitted_segment_size(fitted_table, grain_size_)
+                               : 0;
+        } else {
+            segment_size /= 2;
+        }
         if (segment_size <= 1) {
             io_.close();
             return -EINVAL;

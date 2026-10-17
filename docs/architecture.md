@@ -635,24 +635,41 @@ persistent source of truth is the log"*.
   plus one neighborhood, that fits between the header and the footer
   (`HashTable::index_bits_for`). The segment size is the only knob; tests
   get small tables from small segments. The directory starts with one
-  table, as uDepot's `init()` grows from none. A table's memory is all
-  touched at open, so the default segment (2^29 bytes) means up to 512 MiB
-  per table; the Python and JNI bindings open with 2 MiB segments instead,
-  the smallest that still map on huge pages (a table of 2^17 buckets).
+  table, as uDepot's `init()` grows from none.
+- **Fitted segments.** Besides its buckets a table needs its header and
+  footer, the last neighborhood's overflow slots and, past the footer, the
+  segment's salsa metadata: about 1.8 KiB. A segment of a power of two of
+  bytes falls just that short of its next table size, so its table filled
+  half of it — in uDepot as well (`tot-entries=2097184`, 2^21 buckets, in a
+  32 MiB segment). `fitted_segment_size(table_bytes, grain)` is the segment
+  whose table holds exactly `table_bytes` of buckets: the table plus that
+  room, rounded up to a page (512 MiB + 4 KiB for a 2^26-bucket table at
+  512 B grains). The default segment is the fitted one for a 2^29-byte
+  table (uDepot's default, 2^29 bytes + 2 grains, meant this and fell
+  short), and halving it for a small device halves the table and refits,
+  including where a fitted size leaves no tail for the device metadata. A
+  segment size the caller sets is used as given. A table's memory is all
+  touched at open, so the default means up to 512 MiB per table; the
+  Python and JNI bindings use fitted segments for 2 MiB tables (2^18
+  buckets).
 - **Memory** (`TableRegion`). An anonymous mapping of the whole segment,
   uDepot's mapping on its AIO and SPDK backends: read from the segment on
   restore, written back at close. As uDepot's fix for the shutdown overrun
   (0e0b0a0), the mapping always spans the full segment
-  (`get_seg_size() * grain`), on huge pages when that is a 2 MiB multiple
-  (segments tile the device from offset 0, so such a segment is 2 MiB
-  aligned as well), falling back to 4 KiB pages if no huge page is free;
-  any other size maps on 4 KiB pages. The footer at the end of the net
-  region is then always inside the mapping, and the segment's salsa
-  metadata in the tail past it is never written from it. As uDepot's
-  `KV_conf::sanitize_segment_size`, a store's segment size is whole pages,
-  which makes the default (2^29 bytes + 2 grains) a 2 MiB multiple for
-  grains under 2 KiB. Verified: with huge pages reserved, strace shows the
-  table's segment mapped `MAP_HUGETLB`, and the store suites pass on it.
+  (`get_seg_size() * grain`), so the footer at the end of the net region
+  is always inside it, and the segment's salsa metadata past the footer is
+  never written from it. A segment of 2 MiB or more maps on huge pages,
+  rounded up to a 2 MiB multiple: the mapping is anonymous, so it need not
+  match the segment's size or where it sits on the device, and a fitted
+  segment is never a 2 MiB multiple. (uDepot took huge pages only for a
+  segment that is a 2 MiB multiple, which is what left its tables half
+  full.) The rounding costs under 2 MiB of memory per table and nothing on
+  the device. Without a huge page free, or for a smaller segment, 4 KiB
+  pages map the segment exactly. As uDepot's
+  `KV_conf::sanitize_segment_size`, a store's segment size is whole pages.
+  Verified: with huge pages reserved, strace shows a fitted 8 MiB + 4 KiB
+  segment's table mapped `MAP_HUGETLB` as 10 MiB, and the store suites
+  pass on it.
 - **Layout**, as uDepot lays out a directory segment:
   `[IndexHdr 512 B | slots, 8 B each | ... | IndexFtr 512 B]`, the footer at
   the end of the net segment. Slots are `HashEntry`'s raw 64 bits, which use

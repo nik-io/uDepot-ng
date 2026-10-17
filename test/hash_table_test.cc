@@ -433,10 +433,10 @@ TEST(HashTable, ClearMarksEverySlotUnused) {
 
 // As uDepot (0e0b0a0): a table maps its whole segment, metadata tail
 // included, so the footer at the end of the net region is always inside
-// the mapping; on huge pages only when the segment is a 2 MiB multiple.
+// the mapping. A segment under 2 MiB maps on 4 KiB pages, exactly.
 TEST(TableRegion, MapsTheWholeSegment) {
     using udepot::TableRegion;
-    const size_t seg = (3 << 20) + 4096;  // not a 2 MiB multiple
+    const size_t seg = (1 << 20) + 4096;  // under 2 MiB
     const size_t net = seg - 512;
     TableRegion r = TableRegion::map(seg, net, 42);
     ASSERT_TRUE(r.valid());
@@ -455,18 +455,25 @@ TEST(TableRegion, MapsTheWholeSegment) {
     EXPECT_EQ(moved.base()[seg - 1], 1);
 }
 
-TEST(TableRegion, HugePagesWhenTheSegmentIsA2MiBMultiple) {
+// A segment of 2 MiB or more maps on huge pages, rounded up to a 2 MiB
+// multiple: the mapping is anonymous, so it need not match the segment,
+// and a segment sized for its table (fitted_segment_size) is a power of
+// two plus a page or two, never a 2 MiB multiple. Without a huge page to
+// give, 4 KiB pages map the segment exactly.
+TEST(TableRegion, HugePagesForASegmentOf2MiBOrMore) {
     using udepot::TableRegion;
-    // Whether the system has a huge page to give.
-    void* probe = mmap(nullptr, TableRegion::kHugePage, PROT_READ | PROT_WRITE,
+    // Whether the system has two huge pages to give.
+    void* probe = mmap(nullptr, 2 * TableRegion::kHugePage,
+                       PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
     const bool available = probe != MAP_FAILED;
-    if (available) munmap(probe, TableRegion::kHugePage);
+    if (available) munmap(probe, 2 * TableRegion::kHugePage);
 
-    TableRegion r =
-        TableRegion::map(TableRegion::kHugePage, TableRegion::kHugePage - 512,
-                         TableRegion::kNoSegment);
-    ASSERT_TRUE(r.valid());  // on 4 KiB pages if there is no huge page
+    const size_t seg = TableRegion::kHugePage + 4096;
+    TableRegion r = TableRegion::map(seg, seg - 512, TableRegion::kNoSegment);
+    ASSERT_TRUE(r.valid());
     EXPECT_EQ(r.huge(), available);
-    EXPECT_EQ(r.map_bytes(), TableRegion::kHugePage);
+    EXPECT_EQ(r.map_bytes(), available ? 2 * TableRegion::kHugePage : seg);
+    EXPECT_EQ(r.net_bytes(), seg - 512);
+    r.base()[seg - 1] = 1;  // the whole segment is inside the mapping
 }

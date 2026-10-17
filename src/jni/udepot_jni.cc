@@ -44,11 +44,11 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_init(
     config.path = path;
     config.size = static_cast<size_t>(size);
     config.grain_size = 512;
-    // 2 MiB segments. Each directory table fills one segment, and all of
-    // its memory is touched at open (clear()): with the default segment
-    // (512 MiB) that is up to 512 MiB per table, here 2 MiB for 2^17
-    // buckets. 2 MiB is the smallest segment that still maps on huge pages.
-    config.segment_size = (size_t{2} << 20) / config.grain_size;
+    // Segments for 2 MiB tables (2^18 buckets). Each directory table fills
+    // one segment, and all of its memory is touched at open (clear()):
+    // with the default segment that is up to 512 MiB per table.
+    config.segment_size =
+        udepot::fitted_segment_size(size_t{2} << 20, config.grain_size);
 
     int rc = g_store.open(config);
     env->ReleaseStringUTFChars(fname, path);

@@ -71,8 +71,9 @@ struct StoreConfig {
     size_t size = 0;
     uint32_t grain_size = 512;
     // Segment size in grains, sanitized to whole pages as uDepot's
-    // KV_conf::sanitize_segment_size. 0 = auto (uDepot default:
-    // (1<<29)/grain_size + 2, halved until it fits the device). It also
+    // KV_conf::sanitize_segment_size. 0 = auto: fitted_segment_size() of
+    // a 2^29-byte table (uDepot's default, 2^29 bytes + 2 grains, meant
+    // the same), halved as a table size until it fits the device. It also
     // sizes the directory's hash tables: each fills one index segment, as
     // in uDepot, so smaller segments make smaller tables.
     uint64_t segment_size = 0;
@@ -88,6 +89,15 @@ struct StoreConfig {
     // 0 = the backend's default.
     unsigned queue_depth = 0;
 };
+
+// The segment size, in grains, whose directory table holds table_bytes of
+// buckets (a power of two of 8-byte slots) and fills it: the buckets plus
+// the table's header, footer and last neighborhood, and the segment's
+// salsa metadata, rounded up to whole pages. A segment of a power of two
+// of bytes falls ~2 KiB short of its next table size, so half of it would
+// go unused. Its table maps on huge pages once it is 2 MiB or more
+// (TableRegion).
+uint64_t fitted_segment_size(uint64_t table_bytes, uint32_t grain_size);
 
 // Condition a put() must satisfy, checked atomically with the write.
 enum class PutMode {
