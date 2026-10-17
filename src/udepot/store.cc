@@ -1077,28 +1077,31 @@ void uDepot<IO>::close() {
     stop_space_waker();
 
     if (scm_) {
-        // GC first: it relocates records, updating the tables, which are
-        // written back as they stand once it has stopped. (They hold their
-        // segments already; nothing needs GC to free one.) If they cannot
+        // As uDepot's shutdown(): GC first, then the data controller, then
+        // the directory written back (map_m.shutdown()), then the index's
+        // own controller. GC relocates records, updating the tables, so they
+        // are written back only once it has stopped; they hold their
+        // segments already, so nothing needs GC to free one. If they cannot
         // be written, the next open scans the log, as after a crash.
         scm_->exit_threads();
+        // GC is stopped, so no more segments get deferred; return the
+        // deferred ones to salsa before its controllers shut down.
+        rcu_.barrier();
+
+        // The device metadata (geometry and seed, as written at create)
+        // reads the data controller's segment size, so before it goes.
+        persist_dev_md();
+
+        salsa::SalsaCtlr::shutdown();
+
         int frc = flush_index();
         if (frc != 0)
             std::fprintf(stderr, "udepot: index not persisted (%s); the "
                          "next open recovers from the log\n",
                          std::strerror(-frc));
 
-        // GC is stopped, so no more segments get deferred; return the
-        // deferred ones to salsa before it shuts down.
-        rcu_.barrier();
-
-        // Persist device metadata before shutdown so the next open can
-        // recover.
-        persist_dev_md();
-
         index_ctlr_->shutdown();
         index_ctlr_.reset();
-        salsa::SalsaCtlr::shutdown();
         // Shutting the controllers down can free (so defer) segments too;
         // their callbacks return them to scm_, so they must have run.
         rcu_.barrier();
