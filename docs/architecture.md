@@ -243,6 +243,18 @@ What remains lives in `io/`:
   waiting thread instead. Measured against uDepot (v0 gate, below), that
   made them 15–87% slower than uDepot; reaped on the submitting thread they
   are faster on every operation.
+
+  An io_uring poll that finds nothing completed yields the CPU
+  (`sched_yield`) where uDepot's poller only yielded to the TRT scheduler.
+  A request the kernel cannot do inline (every one on tmpfs, buffered
+  writes, a device without nowait) runs on an io-wq kernel worker, and the
+  scheduler wakes that worker on the submitting thread's own CPU (traced:
+  every wakeup). A thread spinning on its CQ then held off the very worker
+  it waited for until preemption, so an operation took a scheduler slice
+  rather than the I/O's time, and which of copy and zero copy won depended
+  on the CPU (zero-copy GET 11% slower on a CI EPYC 7763). Yielding roughly
+  doubled io_uring throughput on tmpfs. AIO needs none: `io_submit` does
+  that work before returning.
 - **Awaitable** that bridges I/O completion to coroutine resume.
 - **Buffer allocation** utilities (tagged by backend).
 

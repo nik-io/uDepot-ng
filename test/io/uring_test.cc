@@ -3,9 +3,14 @@
 
 #include "udepot/io/uring.h"
 
+#include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <thread>
 #include <vector>
+
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -195,4 +200,43 @@ TEST_F(UringIOTest, CloseCompletesInFlightIo) {
     if (stranded == 0) {
         for (auto& t : tasks) EXPECT_EQ(t.run_sync(), ssize_t{kBlock});
     }
+}
+
+// A thread's ring is torn down when the thread exits, and the kernel may
+// map the next io_uring_queue_init's ring at the same addresses. Nothing
+// the program does orders the old thread's ring accesses before the new
+// thread's -- the kernel does -- so TSAN reported races on the SQEs and the
+// CQ head. Here each thread
+// starts only once the previous one is gone from the kernel, a wait TSAN
+// cannot see, and none is joined before the last has run; the kernel reuses
+// the address often enough that one of the generations hits it.
+TEST_F(UringIOTest, ANewThreadsRingMayReuseAnExitedThreadsRing) {
+    constexpr int kGenerations = 32;
+    UringIO io;
+    ASSERT_EQ(io.open(path_.c_str(), 4096), 0);
+    auto buf = io.alloc_buffer(4096);
+    ASSERT_NE(buf.data, nullptr);
+    std::memset(buf.data, 0x5a, 4096);
+    ASSERT_EQ(io.pwrite(buf.data, 4096, 0).run_sync(), ssize_t{4096});
+
+    struct Generation {
+        ssize_t rc = 0;
+        std::atomic<pid_t> tid{0};
+    };
+    std::vector<Generation> gens(kGenerations);
+    std::vector<std::thread> threads;
+    for (Generation& g : gens) {
+        threads.emplace_back([&io, &buf, &g] {
+            g.rc = io.pread(buf.data, 4096, 0).run_sync();
+            g.tid.store(gettid(), std::memory_order_relaxed);
+        });
+        pid_t tid;
+        while ((tid = g.tid.load(std::memory_order_relaxed)) == 0)
+            std::this_thread::yield();
+        // Gone from the kernel: its thread-local ring has been torn down.
+        while (syscall(SYS_tgkill, getpid(), tid, 0) == 0)
+            std::this_thread::yield();
+    }
+    for (std::thread& t : threads) t.join();
+    for (const Generation& g : gens) EXPECT_EQ(g.rc, ssize_t{4096});
 }

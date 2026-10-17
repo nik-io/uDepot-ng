@@ -18,7 +18,12 @@ static inline int sys_io_setup(unsigned nr, aio_context_t* ctx) {
     return static_cast<int>(syscall(SYS_io_setup, nr, ctx));
 }
 
+// The context is the address of its completion ring, mapped and unmapped by
+// the kernel. A context another thread destroyed can come back at the same
+// address from io_setup, so the old thread's ring accesses are ordered
+// before the new one's by the kernel, which TSAN cannot see.
 static inline int sys_io_destroy(aio_context_t ctx) {
+    tsan_release_to_kernel(reinterpret_cast<void*>(ctx));
     return static_cast<int>(syscall(SYS_io_destroy, ctx));
 }
 
@@ -102,6 +107,7 @@ struct AioThread {
     int setup(unsigned n) {
         aio_context_t c = 0;
         if (sys_io_setup(n, &c) < 0) return -errno;
+        tsan_acquire_from_kernel(reinterpret_cast<void*>(c));
         if (ctx != 0) sys_io_destroy(ctx);
         ctx = c;
         depth = n;

@@ -36,7 +36,8 @@ struct UringThread {
     int setup(unsigned n) {
         struct io_uring r{};
         if (int rc = io_uring_queue_init(n, &r, 0); rc < 0) return rc;
-        if (initialized) io_uring_queue_exit(&ring);
+        handoff(r, tsan_acquire_from_kernel);
+        if (initialized) exit_ring();
         ring = r;
         initialized = true;
         depth = n;
@@ -50,7 +51,22 @@ struct UringThread {
     // down under them.
     ~UringThread() {
         while (pending > 0) UringIO::poll_thread();
-        if (initialized) io_uring_queue_exit(&ring);
+        if (initialized) exit_ring();
+    }
+
+    // The kernel maps the ring and liburing unmaps it with raw syscalls, so
+    // a ring another thread tore down can come back at the same addresses
+    // from io_uring_queue_init, its accesses ordered before the new ring's
+    // by the kernel, which TSAN cannot see. Annotated on each mapping, as
+    // either may be reused without the other.
+    static void handoff(struct io_uring& r, void (*edge)(void*) noexcept) {
+        edge(r.sq.ring_ptr);
+        edge(r.cq.ring_ptr);
+        edge(r.sq.sqes);
+    }
+    void exit_ring() {
+        handoff(ring, tsan_release_to_kernel);
+        io_uring_queue_exit(&ring);
     }
 };
 
@@ -214,6 +230,13 @@ bool UringIO::poll_thread() {
     static constexpr unsigned kMaxCqes = 64;
     struct io_uring_cqe* cqes[kMaxCqes];
     const unsigned n = io_uring_peek_batch_cqe(&t.ring, cqes, kMaxCqes);
+    // Nothing done: give up the CPU. The io-wq worker running a request the
+    // kernel could not do inline is woken on this thread's CPU, and spinning
+    // here holds it off until preemption (docs/architecture.md).
+    if (n == 0) {
+        std::this_thread::yield();
+        return true;
+    }
     UringRequest* done[kMaxCqes];
     for (unsigned i = 0; i < n; ++i) {
         done[i] = static_cast<UringRequest*>(io_uring_cqe_get_data(cqes[i]));

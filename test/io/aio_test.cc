@@ -3,9 +3,14 @@
 
 #include "udepot/io/aio.h"
 
+#include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <thread>
 #include <vector>
+
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -132,6 +137,45 @@ TEST_F(AioIOTest, MultipleSequentialOps) {
         std::memcpy(&readback, rbuf.data, sizeof(readback));
         EXPECT_EQ(readback, val);
     }
+}
+
+// A thread's context is destroyed when the thread exits, and the kernel
+// may hand its ring's address to the next io_setup. Nothing the program
+// does orders the old thread's ring accesses before the new thread's -- the
+// kernel does -- so under TSAN this reported a race on the ring head,
+// intermittently, whenever the reuse happened under load. Here each thread
+// starts only once the previous one is gone from the kernel, a wait TSAN
+// cannot see, and none is joined before the last has run; the kernel reuses
+// the address often enough that one of the generations hits it.
+TEST_F(AioIOTest, ANewThreadsContextMayReuseAnExitedThreadsRing) {
+    constexpr int kGenerations = 32;
+    AioIO io;
+    ASSERT_EQ(io.open(path_.c_str(), 4096), 0);
+    auto buf = io.alloc_buffer(4096);
+    ASSERT_NE(buf.data, nullptr);
+    std::memset(buf.data, 0x5a, 4096);
+    ASSERT_EQ(io.pwrite(buf.data, 4096, 0).run_sync(), ssize_t{4096});
+
+    struct Generation {
+        ssize_t rc = 0;
+        std::atomic<pid_t> tid{0};
+    };
+    std::vector<Generation> gens(kGenerations);
+    std::vector<std::thread> threads;
+    for (Generation& g : gens) {
+        threads.emplace_back([&io, &buf, &g] {
+            g.rc = io.pread(buf.data, 4096, 0).run_sync();
+            g.tid.store(gettid(), std::memory_order_relaxed);
+        });
+        pid_t tid;
+        while ((tid = g.tid.load(std::memory_order_relaxed)) == 0)
+            std::this_thread::yield();
+        // Gone from the kernel: its thread-local context has been destroyed.
+        while (syscall(SYS_tgkill, getpid(), tid, 0) == 0)
+            std::this_thread::yield();
+    }
+    for (std::thread& t : threads) t.join();
+    for (const Generation& g : gens) EXPECT_EQ(g.rc, ssize_t{4096});
 }
 
 // close() with I/O in flight from the closing thread must complete it
