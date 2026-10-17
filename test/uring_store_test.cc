@@ -4,9 +4,11 @@
 #include "udepot/store.h"
 #include "udepot/io/uring.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -28,8 +30,6 @@ protected:
         config_.path = path_.c_str();
         config_.size = kStoreSize;
         config_.grain_size = 512;
-        config_.initial_tables = 2;
-        config_.index_bits = 10;
         config_.force_destroy = true;
 
         ASSERT_EQ(store_.open(config_), 0);
@@ -173,4 +173,71 @@ TEST_F(UringStoreTest, ZeroCopyRoundTrip) {
     udepot::GetBuffer gb;
     ASSERT_EQ(store_.get(zc_bytes("zkey"), &gb).run_sync(), 0);
     EXPECT_EQ(zc_text(gb.value()), val);
+}
+
+// The index goes to its segments and comes back through O_DIRECT, with a
+// grain of its own for the footer (512 B) and with the footer sharing its
+// grain with the table's last slots (4 KiB, the segment chosen for it).
+// Opening clears only the footer: those slots stay on the device.
+TEST_F(UringStoreTest, IndexSurvivesACleanReopen) {
+    struct Case {
+        uint32_t grain;
+        uint64_t segment;  // grains
+    };
+    for (Case c : {Case{512, 64}, Case{4096, 10}}) {
+        const auto path = std::filesystem::temp_directory_path() /
+                          ("udepot_uring_index_" + std::to_string(c.grain));
+        StoreConfig cfg = config_;
+        cfg.path = path.c_str();
+        cfg.size = 16 * 1024 * 1024 + 4096;
+        cfg.grain_size = c.grain;
+        cfg.segment_size = c.segment;
+        cfg.force_destroy = true;
+        {
+            uDepot<UringIO> store;
+            ASSERT_EQ(store.open(cfg), 0) << c.grain;
+            for (int i = 0; i < 3000; ++i)
+                ASSERT_EQ(store.put("ix" + std::to_string(i),
+                                    "v" + std::to_string(i)).run_sync(), 0);
+            store.close();
+        }
+        cfg.force_destroy = false;
+        uDepot<UringIO> store;
+        ASSERT_EQ(store.open(cfg), 0) << c.grain;
+        EXPECT_TRUE(store.index_restored()) << c.grain;
+        for (int i = 0; i < 3000; ++i) {
+            uint8_t val[64];
+            size_t n = 0;
+            ASSERT_EQ(store.get("ix" + std::to_string(i), val, sizeof(val), &n)
+                          .run_sync(), 0);
+            ASSERT_EQ(std::string(reinterpret_cast<char*>(val), n),
+                      "v" + std::to_string(i));
+        }
+        // The footer's grain as the device holds it: footer cleared, any
+        // slots in it as the table has them.
+        const auto& table = *store.directory().snapshot().tables[0];
+        const auto& r = table.region();
+        const size_t from = r.net_bytes() - c.grain;
+        if (c.grain == 4096) {
+            ASSERT_GT(table.used_bytes(), from) << "no slots share the grain";
+        }
+        std::string disk(c.grain, '\0');
+        {
+            std::ifstream f(path, std::ios::binary);
+            f.seekg(static_cast<std::streamoff>(r.grain() * c.grain + from));
+            ASSERT_TRUE(f.read(disk.data(), c.grain));
+        }
+        const size_t slots_end = std::min(table.used_bytes(), r.net_bytes());
+        for (size_t b = from; b < r.net_bytes(); ++b) {
+            const auto got = static_cast<uint8_t>(disk[b - from]);
+            if (b >= r.footer_offset()) {
+                ASSERT_EQ(got, 0) << "grain " << c.grain << " footer byte " << b;
+            } else if (b < slots_end) {
+                ASSERT_EQ(got, r.base()[b])
+                    << "grain " << c.grain << " slot byte " << b;
+            }
+        }
+        store.close();
+        std::filesystem::remove(path);
+    }
 }

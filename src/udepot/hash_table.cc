@@ -4,6 +4,8 @@
 #include "udepot/hash_table.h"
 
 #include <algorithm>
+#include <bit>
+#include <cstring>
 
 namespace udepot {
 
@@ -23,14 +25,24 @@ HashTable::WriteLock::WriteLock(std::mutex* first, std::mutex* second)
     if (second) second_ = std::unique_lock<std::mutex>(*second);
 }
 
-HashTable::HashTable(uint32_t index_bits)
-    : index_bits_(index_bits),
-      num_buckets_(1ULL << index_bits),
+uint32_t HashTable::index_bits_for(size_t net_bytes) noexcept {
+    if (net_bytes < 2 * TableRegion::kMdBytes) return 0;
+    const uint64_t slots =
+        (net_bytes - 2 * TableRegion::kMdBytes) / sizeof(uint64_t);
+    if (slots <= HashEntry::kHopRange + 1) return 0;
+    return static_cast<uint32_t>(
+        std::bit_width(slots - HashEntry::kHopRange) - 1);
+}
+
+HashTable::HashTable(TableRegion region)
+    : region_(std::move(region)),
+      index_bits_(index_bits_for(region_.net_bytes())),
+      num_buckets_(1ULL << index_bits_),
       bucket_mask_(num_buckets_ - 1),
-      slots_(std::make_unique<std::atomic<uint64_t>[]>(
-          num_buckets_ + HashEntry::kHopRange)) {
-    for (uint64_t i = 0; i < total_slots(); ++i)
-        slots_[i].store(HashEntry::kEmpty, std::memory_order_relaxed);
+      slots_(reinterpret_cast<uint64_t*>(region_.base() +
+                                         TableRegion::kMdBytes)) {
+    assert(region_.valid() && index_bits_ != 0);
+    static_assert(std::atomic_ref<uint64_t>::is_always_lock_free);
 
     // As uDepot's uDepotMap::restore(): halve the stripe count until each
     // stripe covers a write's whole reach, so a write needs at most two.
@@ -42,6 +54,11 @@ HashTable::HashTable(uint32_t index_bits)
     stripes_ = std::make_unique<Stripe[]>(num_stripes_);
 }
 
+void HashTable::clear() noexcept {
+    static_assert(HashEntry::kEmpty == ~uint64_t{0});
+    std::memset(slots_, 0xff, total_slots() * sizeof(uint64_t));
+}
+
 HashTable::~HashTable() = default;
 
 HashEntry HashTable::lookup(uint64_t hash, uint32_t start_offset,
@@ -50,7 +67,7 @@ HashEntry HashTable::lookup(uint64_t hash, uint32_t start_offset,
     uint8_t tag = hash_to_tag(hash);
 
     for (uint32_t i = start_offset; i < HashEntry::kHopRange; ++i) {
-        HashEntry entry = HashEntry::load(slots_[bucket + i]);
+        HashEntry entry = HashEntry::load(slot(bucket + i));
         if (entry.empty()) continue;
         if (entry.bucket_offset() != i) continue;
         if (entry.key_tag() != tag) continue;
@@ -99,7 +116,7 @@ int HashTable::insert_locked(uint64_t hash, uint16_t kv_size, uint64_t pba) {
     }
 
     uint8_t offset = static_cast<uint8_t>(free_idx - bucket);
-    HashEntry::store(slots_[free_idx],
+    HashEntry::store(slot(free_idx),
                      HashEntry::make(offset, tag, kv_size, pba));
     return 0;
 }
@@ -108,7 +125,7 @@ uint64_t HashTable::find_pba(uint64_t hash, uint64_t pba) const noexcept {
     uint64_t bucket = hash_to_bucket(hash);
     uint8_t tag = hash_to_tag(hash);
     for (uint32_t i = 0; i < HashEntry::kHopRange; ++i) {
-        HashEntry entry = HashEntry::load(slots_[bucket + i],
+        HashEntry entry = HashEntry::load(slot(bucket + i),
                                           std::memory_order_relaxed);
         if (entry.empty()) continue;
         if (entry.bucket_offset() != i) continue;
@@ -124,7 +141,7 @@ bool HashTable::update_locked(uint64_t hash, uint64_t old_pba,
     uint64_t idx = find_pba(hash, old_pba);
     if (idx >= total_slots()) return false;
     uint64_t bucket = hash_to_bucket(hash);
-    HashEntry::store(slots_[idx],
+    HashEntry::store(slot(idx),
                      HashEntry::make(static_cast<uint8_t>(idx - bucket),
                                      hash_to_tag(hash), new_kv_size, new_pba));
     return true;
@@ -133,14 +150,14 @@ bool HashTable::update_locked(uint64_t hash, uint64_t old_pba,
 bool HashTable::remove_locked(uint64_t hash, uint64_t pba) {
     uint64_t idx = find_pba(hash, pba);
     if (idx >= total_slots()) return false;
-    HashEntry::clear(slots_[idx]);
+    HashEntry::clear(slot(idx));
     return true;
 }
 
 uint64_t HashTable::find_free_slot(uint64_t bucket) const noexcept {
     uint64_t limit = std::min(bucket + kSearchEnd, total_slots());
     for (uint64_t idx = bucket; idx < limit; ++idx) {
-        if (HashEntry::load(slots_[idx], std::memory_order_relaxed).empty())
+        if (HashEntry::load(slot(idx), std::memory_order_relaxed).empty())
             return idx;
     }
     return total_slots();
@@ -154,7 +171,7 @@ bool HashTable::displace_toward(uint64_t target, uint64_t& free_idx) {
         uint64_t candidate_idx = free_idx - dist;
         if (candidate_idx < target) break;
 
-        HashEntry entry = HashEntry::load(slots_[candidate_idx],
+        HashEntry entry = HashEntry::load(slot(candidate_idx),
                                           std::memory_order_relaxed);
         if (entry.empty()) continue;
 
@@ -166,8 +183,8 @@ bool HashTable::displace_toward(uint64_t target, uint64_t& free_idx) {
         // Move: write entry at new position first, then clear old.
         HashEntry moved = HashEntry::make(new_offset, entry.key_tag(),
                                           entry.kv_size(), entry.pba());
-        HashEntry::store(slots_[free_idx], moved);
-        HashEntry::clear(slots_[candidate_idx]);
+        HashEntry::store(slot(free_idx), moved);
+        HashEntry::clear(slot(candidate_idx));
 
         free_idx = candidate_idx;
         return true;

@@ -34,8 +34,6 @@ protected:
         config_.path = "SPDK";
         config_.size = 0;
         config_.grain_size = 4096;
-        config_.initial_tables = 2;
-        config_.index_bits = 10;
 
         ASSERT_EQ(store_.open(config_), 0);
     }

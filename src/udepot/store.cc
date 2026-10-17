@@ -178,6 +178,8 @@ int uDepot<IO>::persist_seg_md(uint64_t grain_start, uint64_t timestamp,
     std::memset(buf.data, 0, md_bytes);
     std::memcpy(buf.data, &md, sizeof(md));
 
+    if (internal_io_fault(true, grain_to_offset(grain_start), md_bytes) != 0)
+        return -EIO;
     ssize_t w = io_.pwrite_sync(buf.data, md_bytes, grain_to_offset(grain_start));
     return (w == static_cast<ssize_t>(md_bytes)) ? 0 : -EIO;
 }
@@ -197,16 +199,17 @@ bool uDepot<IO>::validate_seg_md(const salsa::salsa_seg_md& md) const {
 }
 
 template <typename IO>
-bool uDepot<IO>::read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md) {
+int uDepot<IO>::read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md) {
     uint64_t md_grain = seg_base + get_seg_size() - seg_md_grains_;
     size_t md_bytes = static_cast<size_t>(seg_md_grains_) * grain_size_;
     IoBuffer md_buf = io_.alloc_buffer(md_bytes);
-    if (!md_buf.data) return false;
+    if (!md_buf.data) return -ENOMEM;
     ssize_t r = pread_internal(md_buf.data, md_bytes,
                                grain_to_offset(md_grain));
-    if (r < static_cast<ssize_t>(sizeof(salsa::salsa_seg_md))) return false;
+    if (r < 0) return static_cast<int>(r);
+    if (r != static_cast<ssize_t>(md_bytes)) return -EIO;
     std::memcpy(md, md_buf.data, sizeof(*md));
-    return validate_seg_md(*md);
+    return validate_seg_md(*md) ? 0 : -ENODATA;
 }
 
 // ── Crash recovery ─────────────────────────────────────────────────────────
@@ -214,7 +217,8 @@ bool uDepot<IO>::read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md) {
 template <typename IO>
 int uDepot<IO>::recover_record(uint64_t hash, std::span<const uint8_t> key,
                                uint64_t grain, uint16_t kv_grains,
-                               bool tombstone) {
+                               bool tombstone, std::vector<uint64_t>& valid) {
+    auto seg_of = [&](uint64_t pba) { return scm_->grain_to_seg_idx(pba); };
     // Same lookup as a put or del (legacy try_restore_entry ran
     // lookup_mbuff_put): every tag-matching entry, live or deleted, is
     // verified against the key, so another key with the same tag earlier in
@@ -236,27 +240,26 @@ int uDepot<IO>::recover_record(uint64_t hash, std::span<const uint8_t> key,
             (void)settled;
             uint16_t new_kv = tombstone ? 0 : kv_grains;
             if (match.empty()) {
-                if (locked.table->insert_locked(hash, new_kv, grain) == 0)
+                if (locked.table->insert_locked(hash, new_kv, grain) == 0) {
+                    valid[seg_of(grain)] += kv_grains;
                     return 0;
+                }
                 uint64_t seen = locked.snapshot->generation;
                 locked.lock = HashTable::WriteLock{};
                 if (directory_->grow(seen) != 0) return -ENOSPC;
                 continue;
             }
             // Two records of one key: the newer one wins, as at run time.
-            if (!newer_than(grain, match.pba())) {
-                match = HashEntry{};
-            } else {
+            if (newer_than(grain, match.pba())) {
                 match_grains = match.deleted()
                     ? static_cast<uint16_t>(kv_total_grains(key.size(), 0))
                     : match.kv_size();
                 locked.table->update_locked(hash, match.pba(), new_kv, grain);
+                assert(valid[seg_of(match.pba())] >= match_grains);
+                valid[seg_of(match.pba())] -= match_grains;
+                valid[seg_of(grain)] += kv_grains;
             }
         }
-        if (match.empty())
-            invalidate_grains(grain, kv_grains);
-        else
-            invalidate_grains(match.pba(), match_grains);
         return 0;
     }
 }
@@ -287,6 +290,17 @@ int uDepot<IO>::crash_recovery() {
     uint64_t data_grains = seg_size - seg_md_grains_;
     uint64_t max_timestamp = 0;
     IoBuffer seg_buf;
+    // Per segment, the grains of the records the index points to.
+    std::vector<uint64_t> valid(num_segments_, 0);
+    std::vector<uint64_t> data_segs;
+
+    // uDepot's init: grow() to the first table, then crash_recovery(). Its
+    // tables take no segment until the walk is done (index_unbacked_): a
+    // segment taken now could be one whose records are still to be read.
+    // (uDepot restores every data segment first instead; on a full device
+    // that provisions more than salsa's capacity, and salsa drops it.)
+    index_unbacked_ = true;
+    if (int rc = create_directory(); rc != 0) return rc;
 
     for (auto it = scm_->begin(); it != scm_->end(); ++it) {
         salsa::GrainRange range = *it;
@@ -294,10 +308,14 @@ int uDepot<IO>::crash_recovery() {
         uint64_t seg_idx = scm_->grain_to_seg_idx(seg_base);
 
         // Read segment metadata from tail. Index segments hold no records.
+        // A segment that cannot be read fails the open: skipped, its
+        // records would be lost and the segment reused.
         salsa::salsa_seg_md seg_md;
-        if (!read_seg_md(seg_base, &seg_md) ||
-            seg_md.ctlr_type != get_ctlr_id())
+        if (int rc = read_seg_md(seg_base, &seg_md); rc == -ENODATA)
             continue;
+        else if (rc != 0)
+            return rc;
+        if (seg_md.ctlr_type != get_ctlr_id()) continue;
 
         uint64_t ts = seg_md.timestamp;
         seg_timestamps_[seg_idx].store(ts, std::memory_order_relaxed);
@@ -306,11 +324,7 @@ int uDepot<IO>::crash_recovery() {
         if (ts > max_timestamp)
             max_timestamp = ts;
 
-        // Mark the segment's data grains in use, as uDepot's crash_recovery
-        // does (the net size: the metadata grains at the tail hold no
-        // records and must not count as valid); grains that hold no valid
-        // record are invalidated as the walk passes them.
-        scm_->restore_grain_range(seg_base, data_grains, get_ctlr_id());
+        data_segs.push_back(seg_base);
 
         // As uDepot (which maps the segment): one read of the net segment,
         // then walk it in memory.
@@ -319,10 +333,7 @@ int uDepot<IO>::crash_recovery() {
         const auto* seg = static_cast<const uint8_t*>(seg_buf.data);
 
         uint64_t grain = seg_base;
-        auto skip = [&](uint64_t n) {
-            invalidate_grains(grain, n);
-            grain += n;
-        };
+        auto skip = [&](uint64_t n) { grain += n; };
         while (grain < seg_base + data_grains) {
             const uint8_t* ep = seg + (grain - seg_base) * grain_size_;
             KvHeader hdr;
@@ -352,48 +363,85 @@ int uDepot<IO>::crash_recovery() {
             std::span<const uint8_t> key(ep + sizeof(KvHeader), hdr.key_size);
             int rc = recover_record(hash_key(key), key, grain,
                                     static_cast<uint16_t>(entry_grains),
-                                    is_tombstone(hdr));
+                                    is_tombstone(hdr), valid);
             if (rc != 0) return rc;
             grain += entry_grains;
         }
+    }
+
+    // Only now, with the whole log read, restore the segments to salsa: as
+    // uDepot's restore() after a clean shutdown (its validity_map), each
+    // segment with the grains of the records the index points to as its
+    // valid grains, which salsa provisions (counts as used). Dead grains,
+    // and an open segment's unwritten tail, are never restored as valid; a
+    // segment with none live stays free. (uDepot's crash path restored
+    // every segment in full first, and invalidated the dead grains after;
+    // past the logical capacity salsa dropped the excess, checked by an
+    // assert only, and the invalidations underflowed its used count.)
+    //
+    // The log can hold more live data than the store may: rejected writes
+    // come back after a crash (paper §4.5). The device is then full; left
+    // to an operator. Checked against the capacity user writes get, not
+    // the larger one restore_grain_range() allows (it provisions as GC
+    // relocation does).
+    uint64_t live = 0;
+    for (uint64_t v : valid) live += v;
+    if (live > scm_->get_max_capacity()) {
+        std::fprintf(stderr,
+                     "udepot: crash recovery found %lu grains of live data, "
+                     "more than the store's capacity of %lu (%u per mille "
+                     "overprovisioned); the store cannot open until it has "
+                     "more space\n",
+                     static_cast<unsigned long>(live),
+                     static_cast<unsigned long>(scm_->get_max_capacity()),
+                     overprovision_);
+        return -ENOSPC;
+    }
+    for (uint64_t seg_base : data_segs) {
+        const uint64_t n = valid[scm_->grain_to_seg_idx(seg_base)];
+        if (n == 0) continue;
+        // Within the capacity, a failure is a broken count or segment.
+        if (int rc = scm_->restore_grain_range(seg_base, n, get_ctlr_id());
+            rc != 0)
+            return -EIO;
     }
 
     // Restore seg_alloc_nr so future allocations get higher timestamps.
     if (max_timestamp > 0)
         restore_seg_alloc_nr(max_timestamp);
 
+    // The tables take their segments once salsa's threads run (open).
     return 0;
 }
 
 // ── Index segments (paper §4.4) ────────────────────────────────────────────
 //
-// One table (or, if it is larger than a segment, one part of it) per index
-// segment, as uDepot's uDepotDirectoryMap lays out a directory segment:
+// As uDepot's uDepotDirectoryMap, every hash table has an index segment of
+// its own for its whole life, and lives in a mapping of it (TableRegion):
 //
 //   [ IndexHdr, 512 B | the table's slots, 8 B each | ... | IndexFtr, 512 B ]
 //
 // with the footer at the very end of the net segment, ahead of the per-
 // segment metadata. Slots are HashEntry's raw 64 bits, uDepot's layout.
-// The footer is written only after every table is on the device, and is
-// cleared again by the open that restores it.
+// close() writes every table back to its segment, footers only once every
+// table is on the device, and the open that restores them clears the
+// footers again.
 
 namespace {
 
-constexpr size_t kIndexMdBytes = 512;  // uDepot's dirmap_hdr / dirmap_ftr
+constexpr size_t kIndexMdBytes = TableRegion::kMdBytes;
+constexpr size_t kIndexIoChunk = size_t{4} << 20;
 
-// uDepot's dirmap_hdr fields first; the rest are uDepot-ng's. uDepot sized
-// each table to fill its segment; here index_bits gives the table's size,
-// and a table larger than a segment spans `parts` of them.
+// uDepot's dirmap_hdr fields first; the rest are uDepot-ng's, checked
+// against the table geometry the segment size gives.
 struct __attribute__((packed)) IndexHdr {
     uint16_t dir_size;
     uint16_t idx;
     uint32_t csum;
     uint64_t ts;
     uint32_t index_bits;
-    uint32_t part;
-    uint32_t parts;
     uint32_t reserved;
-    uint64_t slot_nr;  // slots in this segment
+    uint64_t slot_nr;  // slots in the table
 };
 
 // uDepot's dirmap_ftr fields first (uDepot-ng tracks no byte counts, so
@@ -406,8 +454,6 @@ struct __attribute__((packed)) IndexFtr {
     uint64_t used_bytes_kv;
     uint64_t tot_bytes_kv;
     uint32_t index_bits;
-    uint32_t part;
-    uint32_t parts;
     uint32_t reserved;
     uint64_t slot_nr;
 };
@@ -418,8 +464,7 @@ static_assert(sizeof(IndexFtr) <= kIndexMdBytes);
 template <typename T>
 bool same_identity(const IndexHdr& h, const T& f) {
     return h.dir_size == f.dir_size && h.idx == f.idx && h.ts == f.ts &&
-           h.index_bits == f.index_bits && h.part == f.part &&
-           h.parts == f.parts && h.slot_nr == f.slot_nr;
+           h.index_bits == f.index_bits && h.slot_nr == f.slot_nr;
 }
 
 }  // namespace
@@ -437,138 +482,194 @@ uint32_t uDepot<IO>::index_md_csum(const T& md) const {
 
 template <typename IO>
 void uDepot<IO>::index_seg_md_callback(uint64_t md_grain) {
-    // Whatever this segment held is about to be overwritten: no record in
-    // it can come back.
+    const bool ok = persist_seg_md(md_grain, get_seg_alloc_nr(),
+                                   index_ctlr_->get_ctlr_id()) == 0;
     uint64_t seg_idx = scm_->grain_to_seg_idx(md_grain);
-    if (seg_idx < num_segments_) {
-        seg_md_ok_[seg_idx].store(false, std::memory_order_release);
-        seg_live_[seg_idx].store(false, std::memory_order_release);
-    }
-    // A failed write leaves the segment without valid metadata, and the
-    // next open without this index: it scans the log.
-    (void)persist_seg_md(md_grain, get_seg_alloc_nr(),
-                         index_ctlr_->get_ctlr_id());
+    if (seg_idx >= num_segments_) return;
+    // allocate_index_segment() hands the segment out only if this landed.
+    seg_md_ok_[seg_idx].store(ok, std::memory_order_release);
+    // Once the index's metadata is on the device, no record the segment
+    // held can come back. Until then, or if the write failed, its old
+    // metadata and records may still be there: seg_live_ stays as it was,
+    // so GC keeps every tombstone they could need.
+    if (ok) seg_live_[seg_idx].store(false, std::memory_order_release);
 }
 
-// salsa's allocate_grains() waits for a segment without a bound, and on a
-// device GC cannot free a segment of, close() would hang. Retry for a while
-// instead; giving up costs only a log scan at the next open.
+// Never salsa's allocate_grains(), which waits for a segment without a
+// bound: a grow runs on the space waker, which must keep resuming the
+// other waiters meanwhile, so it retries a -EAGAIN itself (as uDepot's
+// grow() loops on EAGAIN).
 template <typename IO>
 int uDepot<IO>::allocate_index_segment(uint64_t net_grains, u64* grain) {
+    auto hook = index_segment_test_hook.load(std::memory_order_relaxed);
+    if (hook) {
+        if (int rc = hook(); rc != 0) return rc;
+    }
+    int rc = index_ctlr_->allocate_grains_no_wait(net_grains, grain);
+    if (rc != 0) return rc == EAGAIN ? -EAGAIN : -ENOSPC;
+    // As for user writes (try_allocate_grains): a segment whose metadata
+    // could not be written is not used. (Salsa runs the metadata callback
+    // inside the allocation: an index allocation fills a segment, so each
+    // one stages a new segment.)
+    if (!seg_md_ok_[scm_->grain_to_seg_idx(*grain)].load(
+            std::memory_order_acquire)) {
+        index_ctlr_->invalidate_grains(*grain, net_grains, false);
+        index_ctlr_->release_grains(*grain, net_grains);
+        return -EIO;
+    }
+    return 0;
+}
+
+template <typename IO>
+template <typename F>
+int uDepot<IO>::retry_at_open(F&& attempt) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
     for (;;) {
-        int rc = index_ctlr_->allocate_grains_no_wait(net_grains, grain);
-        if (rc != EAGAIN) return rc == 0 ? 0 : -ENOSPC;
+        int rc = attempt();
+        if (rc != -EAGAIN) return rc;
         if (std::chrono::steady_clock::now() > deadline) return -ENOSPC;
         std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
 }
 
 template <typename IO>
+int uDepot<IO>::new_index_table(std::unique_ptr<HashTable>* table) {
+    const uint64_t net_grains = get_seg_size() - seg_md_grains_;
+    u64 grain = TableRegion::kNoSegment;
+    if (!index_unbacked_) {
+        if (int rc = allocate_index_segment(net_grains, &grain); rc != 0)
+            return rc;
+    }
+    // As uDepot's grow(): map the whole segment, then release the
+    // allocation; its grains stay valid until the table is retired.
+    TableRegion region =
+        TableRegion::map(get_seg_size() * grain_size_,
+                         static_cast<size_t>(net_grains) * grain_size_, grain);
+    if (!index_unbacked_) {
+        if (!region.valid())
+            index_ctlr_->invalidate_grains(grain, net_grains, false);
+        index_ctlr_->release_grains(grain, net_grains);
+    }
+    if (!region.valid()) return -ENOMEM;
+    *table = std::make_unique<HashTable>(std::move(region));
+    (*table)->clear();
+    return 0;
+}
+
+template <typename IO>
+void uDepot<IO>::retire_index_table(HashTable& table) {
+    // As uDepot's grow() for the old directory: its segment is free.
+    if (table.region().grain() == TableRegion::kNoSegment) return;
+    index_ctlr_->invalidate_grains(table.region().grain(),
+                                   get_seg_size() - seg_md_grains_, false);
+}
+
+template <typename IO>
+int uDepot<IO>::assign_index_segments() {
+    const uint64_t net_grains = get_seg_size() - seg_md_grains_;
+    DirSnapshot& snap = directory_->snapshot();
+    for (auto& table : snap.tables) {
+        if (table->region().grain() != TableRegion::kNoSegment) continue;
+        u64 grain = 0;
+        int rc = retry_at_open(
+            [&] { return allocate_index_segment(net_grains, &grain); });
+        if (rc != 0) {
+            // As uDepot would not open either (its grow() would wait for a
+            // segment forever): left to the operator, with the reason.
+            std::fprintf(stderr,
+                         "udepot: crash recovery rebuilt the index as %zu "
+                         "tables, but the device has no free segment for "
+                         "them all; the store cannot open until it has "
+                         "more space (%s)\n",
+                         snap.tables.size(), std::strerror(-rc));
+            return rc;
+        }
+        table->set_segment(grain);
+        index_ctlr_->release_grains(grain, net_grains);
+    }
+    return 0;
+}
+
+template <typename IO>
+int uDepot<IO>::create_directory() {
+    const size_t net_bytes =
+        static_cast<size_t>(get_seg_size() - seg_md_grains_) * grain_size_;
+    // A table needs its header, its footer and at least one bucket.
+    if (HashTable::index_bits_for(net_bytes) == 0 ||
+        net_bytes < 2 * align_up(kIndexMdBytes, grain_size_))
+        return -EINVAL;
+    std::unique_ptr<HashTable> table;
+    if (int rc = retry_at_open([&] { return new_index_table(&table); });
+        rc != 0)
+        return rc;
+    std::vector<std::unique_ptr<HashTable>> tables;
+    tables.push_back(std::move(table));
+    directory_ = new Directory(rcu_, index_tables_, std::move(tables));
+    return 0;
+}
+
+template <typename IO>
 int uDepot<IO>::flush_index() {
     DirSnapshot& snap = directory_->snapshot();
-    const uint64_t net_grains = get_seg_size() - seg_md_grains_;
-    const size_t net_bytes = static_cast<size_t>(net_grains) * grain_size_;
     const size_t md_chunk = align_up(kIndexMdBytes, grain_size_);
-    if (net_bytes < 2 * md_chunk + sizeof(uint64_t)) return -ENOSPC;
-    const uint64_t cap = (net_bytes - 2 * kIndexMdBytes) / sizeof(uint64_t);
-    const uint64_t total_slots = snap.tables[0]->total_slots();
-    const uint32_t parts = static_cast<uint32_t>((total_slots + cap - 1) / cap);
     const uint64_t ts = std::max(index_ts_, get_seg_alloc_nr()) + 1;
 
-    struct Placed {
-        uint64_t grain;
-        IndexHdr hdr;
-    };
-    std::vector<Placed> placed;
-
-    // The bytes of [pos, pos + len) of a segment laid out as `hdr` says;
-    // the footer region is left zero.
-    auto fill = [&](uint8_t* dst, size_t pos, size_t len, const IndexHdr& hdr) {
-        std::memset(dst, 0, len);
-        if (pos < sizeof(hdr))
-            std::memcpy(dst, reinterpret_cast<const uint8_t*>(&hdr) + pos,
-                        std::min(len, sizeof(hdr) - pos));
-        const HashTable& table = *snap.tables[hdr.idx];
-        const uint64_t first = static_cast<uint64_t>(hdr.part) * cap;
-        const size_t slots_end = kIndexMdBytes + hdr.slot_nr * sizeof(uint64_t);
-        size_t b = std::max(pos, kIndexMdBytes);
-        for (; b < std::min(pos + len, slots_end); b += sizeof(uint64_t)) {
-            uint64_t raw =
-                table.load_slot(first + (b - kIndexMdBytes) / sizeof(uint64_t))
-                    .raw();
-            std::memcpy(dst + (b - pos), &raw, sizeof(raw));
+    // Write [from, to) of a table's region to its segment.
+    auto write_back = [&](const TableRegion& r, size_t from, size_t to) {
+        for (size_t off = from; off < to; off += kIndexIoChunk) {
+            const size_t n = std::min(kIndexIoChunk, to - off);
+            ssize_t w = pwrite_internal(
+                r.base() + off, n,
+                grain_to_offset(r.grain()) + static_cast<off_t>(off));
+            if (w != static_cast<ssize_t>(n)) return -EIO;
         }
+        return 0;
     };
 
-    constexpr size_t kChunk = size_t{4} << 20;
-    const size_t chunk = std::min(net_bytes, align_up(kChunk, grain_size_));
-    IoBuffer buf = io_.alloc_buffer(chunk);
-    if (!buf.data) return -ENOMEM;
-    auto* dst = static_cast<uint8_t*>(buf.data);
-
-    int rc = 0;
-    for (uint32_t idx = 0; idx < snap.size() && rc == 0; ++idx) {
-        for (uint32_t part = 0; part < parts && rc == 0; ++part) {
-            u64 grain = 0;
-            if (allocate_index_segment(net_grains, &grain) != 0) {
-                rc = -ENOSPC;
-                break;
-            }
-            IndexHdr hdr{};
-            hdr.dir_size = static_cast<uint16_t>(snap.size());
-            hdr.idx = static_cast<uint16_t>(idx);
-            hdr.ts = ts;
-            hdr.index_bits = snap.tables[idx]->index_bits();
-            hdr.part = part;
-            hdr.parts = parts;
-            hdr.slot_nr = std::min(cap, total_slots - part * cap);
-            hdr.csum = index_md_csum(hdr);
-            placed.push_back({grain, hdr});
-
-            // Everything but the footer, which stays zero for now.
-            for (size_t off = 0; off < net_bytes && rc == 0; off += chunk) {
-                size_t n = std::min(chunk, net_bytes - off);
-                fill(dst, off, n, hdr);
-                ssize_t w = pwrite_internal(
-                    dst, n, grain_to_offset(grain) + static_cast<off_t>(off));
-                if (w != static_cast<ssize_t>(n)) rc = -EIO;
-            }
-        }
+    // Header and slots, as uDepot's shutdown() writes each table back; the
+    // footer stays clear.
+    for (uint32_t idx = 0; idx < snap.size(); ++idx) {
+        const HashTable& table = *snap.tables[idx];
+        const TableRegion& r = table.region();
+        IndexHdr hdr{};
+        hdr.dir_size = static_cast<uint16_t>(snap.size());
+        hdr.idx = static_cast<uint16_t>(idx);
+        hdr.ts = ts;
+        hdr.index_bits = table.index_bits();
+        hdr.slot_nr = table.total_slots();
+        hdr.csum = index_md_csum(hdr);
+        std::memset(r.base(), 0, kIndexMdBytes);
+        std::memcpy(r.base(), &hdr, sizeof(hdr));
+        // Every slot, even those sharing a grain with the footer (grains
+        // over 512 B), so none depends on the footer's write landing.
+        if (int rc = write_back(r, 0, align_up(table.used_bytes(), grain_size_));
+            rc != 0)
+            return rc;
     }
 
     // Footers last: an index is complete only once all of it is written.
-    for (const Placed& p : placed) {
-        if (rc != 0) break;
+    for (uint32_t idx = 0; idx < snap.size(); ++idx) {
         auto hook = index_footer_test_hook.load(std::memory_order_relaxed);
-        if (hook && !hook()) {
-            rc = -EINTR;
-            break;
-        }
-        const size_t pos = net_bytes - md_chunk;
-        fill(dst, pos, md_chunk, p.hdr);
+        if (hook && !hook()) return -EINTR;
+        const HashTable& table = *snap.tables[idx];
+        const TableRegion& r = table.region();
         IndexFtr ftr{};
-        ftr.dir_size = p.hdr.dir_size;
-        ftr.idx = p.hdr.idx;
-        ftr.ts = p.hdr.ts;
-        ftr.index_bits = p.hdr.index_bits;
-        ftr.part = p.hdr.part;
-        ftr.parts = p.hdr.parts;
-        ftr.slot_nr = p.hdr.slot_nr;
+        ftr.dir_size = static_cast<uint16_t>(snap.size());
+        ftr.idx = static_cast<uint16_t>(idx);
+        ftr.ts = ts;
+        ftr.index_bits = table.index_bits();
+        ftr.slot_nr = table.total_slots();
         ftr.csum = index_md_csum(ftr);
-        std::memcpy(dst + md_chunk - kIndexMdBytes, &ftr, sizeof(ftr));
-        ssize_t w = pwrite_internal(
-            dst, md_chunk, grain_to_offset(p.grain) + static_cast<off_t>(pos));
-        if (w != static_cast<ssize_t>(md_chunk)) rc = -EIO;
+        uint8_t* f = r.base() + r.footer_offset();
+        std::memset(f, 0, kIndexMdBytes);
+        std::memcpy(f, &ftr, sizeof(ftr));
+        if (int rc = write_back(r, r.net_bytes() - md_chunk, r.net_bytes());
+            rc != 0)
+            return rc;
     }
-
-    for (const Placed& p : placed) {
-        if (rc != 0) index_ctlr_->invalidate_grains(p.grain, net_grains, false);
-        index_ctlr_->release_grains(p.grain, net_grains);
-    }
-    if (rc == 0) index_ts_ = ts;
-    return rc;
+    index_ts_ = ts;
+    return 0;
 }
 
 template <typename IO>
@@ -594,7 +695,11 @@ int uDepot<IO>::restore_index(bool* restored) {
     const uint64_t net_grains = seg_size - seg_md_grains_;
     const size_t net_bytes = static_cast<size_t>(net_grains) * grain_size_;
     const size_t md_chunk = align_up(kIndexMdBytes, grain_size_);
-    if (net_bytes < 2 * md_chunk + sizeof(uint64_t)) return 0;
+    // The tables' geometry follows from the segment size, as in uDepot.
+    const uint32_t index_bits = HashTable::index_bits_for(net_bytes);
+    if (index_bits == 0 || net_bytes < 2 * md_chunk) return 0;
+    const uint64_t total_slots =
+        (uint64_t{1} << index_bits) + HashEntry::kHopRange;
 
     struct Found {
         uint64_t grain;
@@ -611,16 +716,23 @@ int uDepot<IO>::restore_index(bool* restored) {
         ssize_t r = pread_internal(md_buf.data, md_chunk,
                                    grain_to_offset(grain) +
                                        static_cast<off_t>(pos));
-        if (r != static_cast<ssize_t>(md_chunk)) return false;
+        if (r < 0) return static_cast<int>(r);
+        if (r != static_cast<ssize_t>(md_chunk)) return -EIO;
         std::memcpy(out, static_cast<uint8_t*>(md_buf.data) + at, len);
-        return true;
+        return 0;
     };
 
+    // A read error fails the open. A segment passed over could hold a
+    // valid footer, which would then not be invalidated below, and a later
+    // crash would restore that index over everything written since.
     for (auto it = scm_->begin(); it != scm_->end(); ++it) {
         const uint64_t seg_base = (*it).grain_start;
         const uint64_t seg_idx = scm_->grain_to_seg_idx(seg_base);
         salsa::salsa_seg_md seg_md;
-        if (!read_seg_md(seg_base, &seg_md)) continue;
+        if (int rc = read_seg_md(seg_base, &seg_md); rc == -ENODATA)
+            continue;
+        else if (rc != 0)
+            return rc;
         if (seg_md.ctlr_type == get_ctlr_id()) {
             data_ts[seg_idx] = seg_md.timestamp;
             max_data_ts = std::max(max_data_ts, seg_md.timestamp);
@@ -630,12 +742,14 @@ int uDepot<IO>::restore_index(bool* restored) {
 
         IndexHdr hdr;
         IndexFtr ftr;
-        if (!read_md(seg_base, 0, &hdr, sizeof(hdr), 0)) continue;
+        if (int rc = read_md(seg_base, 0, &hdr, sizeof(hdr), 0); rc != 0)
+            return rc;
         bool hdr_ok = hdr.csum == index_md_csum(hdr);
         if (hdr_ok) index_ts_ = std::max(index_ts_, hdr.ts);
-        if (!read_md(seg_base, net_bytes - md_chunk, &ftr, sizeof(ftr),
-                     md_chunk - kIndexMdBytes))
-            continue;
+        if (int rc = read_md(seg_base, net_bytes - md_chunk, &ftr,
+                             sizeof(ftr), md_chunk - kIndexMdBytes);
+            rc != 0)
+            return rc;
         if (ftr.csum != index_md_csum(ftr)) continue;
         index_ts_ = std::max(index_ts_, ftr.ts);
         // A valid footer is cleared below whatever happens; only those
@@ -652,78 +766,55 @@ int uDepot<IO>::restore_index(bool* restored) {
     for (const Found& f : found)
         if (ts != 0 && f.hdr.ts == ts) set.push_back(&f);
 
-    // Is the newest index complete and consistent?
-    std::unique_ptr<Directory> dir;
+    // Is the newest index complete, and of this segment size's tables?
     bool ok = !set.empty();
-    uint32_t dir_size = 0, index_bits = 0, parts = 0;
-    uint64_t cap = (net_bytes - 2 * kIndexMdBytes) / sizeof(uint64_t);
+    uint32_t dir_size = 0;
     if (ok) {
-        const IndexHdr& h0 = set[0]->hdr;
-        dir_size = h0.dir_size;
-        index_bits = h0.index_bits;
-        parts = h0.parts;
+        dir_size = set[0]->hdr.dir_size;
         ok = dir_size != 0 && std::has_single_bit(dir_size) &&
              dir_size <= (1u << DirSnapshot::kMaxTableBits) &&
-             index_bits >= 1 && index_bits <= 40 && parts != 0 &&
-             set.size() == static_cast<size_t>(dir_size) * parts;
+             set.size() == dir_size;
     }
-    uint64_t total_slots = 0;
     if (ok) {
-        total_slots = (uint64_t{1} << index_bits) + HashEntry::kHopRange;
-        ok = parts == (total_slots + cap - 1) / cap;
-        std::vector<bool> seen(static_cast<size_t>(dir_size) * parts, false);
+        std::vector<bool> seen(dir_size, false);
         for (const Found* f : set) {
             const IndexHdr& h = f->hdr;
-            if (h.dir_size != dir_size || h.index_bits != index_bits ||
-                h.parts != parts || h.idx >= dir_size || h.part >= parts ||
-                h.slot_nr != std::min(cap, total_slots - h.part * cap) ||
-                seen[h.idx * parts + h.part]) {
+            if (h.dir_size != dir_size || h.idx >= dir_size ||
+                h.index_bits != index_bits || h.slot_nr != total_slots ||
+                seen[h.idx]) {
                 ok = false;
                 break;
             }
-            seen[h.idx * parts + h.part] = true;
+            seen[h.idx] = true;
         }
     }
 
-    // Load the tables.
+    // Load each table into a mapping of its segment, as uDepot's restore()
+    // maps them in place.
+    std::vector<std::unique_ptr<HashTable>> tables(dir_size);
     if (ok) {
-        dir = std::make_unique<Directory>(rcu_, dir_size, index_bits);
-        DirSnapshot& snap = dir->snapshot();
-        constexpr size_t kChunk = size_t{4} << 20;
-        IoBuffer buf;
+        const size_t used = align_up(
+            kIndexMdBytes + total_slots * sizeof(uint64_t), grain_size_);
         for (const Found* f : set) {
-            const IndexHdr& h = f->hdr;
-            HashTable& table = *snap.tables[h.idx];
-            const uint64_t first = static_cast<uint64_t>(h.part) * cap;
-            const size_t bytes = h.slot_nr * sizeof(uint64_t);
-            // Grain-aligned reads covering [kIndexMdBytes, + bytes).
-            const size_t start = kIndexMdBytes / grain_size_ * grain_size_;
-            const size_t end = align_up(kIndexMdBytes + bytes, grain_size_);
-            for (size_t off = start; off < end && ok;
-                 off += align_up(kChunk, grain_size_)) {
-                size_t n = std::min(align_up(kChunk, grain_size_), end - off);
-                if (!buf.data || buf.capacity < n) {
-                    buf = io_.alloc_buffer(n);
-                    if (!buf.data) return -ENOMEM;
-                }
+            TableRegion region = TableRegion::map(
+                static_cast<size_t>(seg_size) * grain_size_, net_bytes,
+                f->grain);
+            if (!region.valid()) {
+                ok = false;
+                break;
+            }
+            for (size_t off = 0; off < used && ok; off += kIndexIoChunk) {
+                const size_t n = std::min(kIndexIoChunk, used - off);
                 ssize_t r = pread_internal(
-                    buf.data, n,
+                    region.base() + off, n,
                     grain_to_offset(f->grain) + static_cast<off_t>(off));
-                if (r != static_cast<ssize_t>(n)) {
-                    ok = false;
-                    break;
-                }
-                const auto* src = static_cast<const uint8_t*>(buf.data);
-                size_t b = std::max(off, kIndexMdBytes);
-                for (; b < std::min(off + n, kIndexMdBytes + bytes);
-                     b += sizeof(uint64_t)) {
-                    uint64_t raw;
-                    std::memcpy(&raw, src + (b - off), sizeof(raw));
-                    table.restore_slot(
-                        first + (b - kIndexMdBytes) / sizeof(uint64_t), raw);
-                }
+                if (r != static_cast<ssize_t>(n)) ok = false;
             }
             if (!ok) break;
+            // Cleared on the device below; the next flush writes a new one.
+            std::memset(region.base() + region.footer_offset(), 0,
+                        kIndexMdBytes);
+            tables[f->hdr.idx] = std::make_unique<HashTable>(std::move(region));
         }
     }
 
@@ -732,7 +823,6 @@ int uDepot<IO>::restore_index(bool* restored) {
     // tombstone's, read from the tombstone's header.
     std::vector<uint64_t> valid(num_segments_, 0);
     if (ok) {
-        DirSnapshot& snap = dir->snapshot();
         std::vector<std::pair<uint64_t, uint64_t>> tombs;  // (pba, seg)
         auto account = [&](uint64_t pba, uint64_t grains) {
             const uint64_t seg = scm_->grain_to_seg_idx(pba);
@@ -741,8 +831,8 @@ int uDepot<IO>::restore_index(bool* restored) {
                    pba + grains <= seg_base + net_grains &&
                    (valid[seg] += grains, true);
         };
-        for (uint32_t t = 0; t < snap.size() && ok; ++t) {
-            const HashTable& table = *snap.tables[t];
+        for (uint32_t t = 0; t < dir_size && ok; ++t) {
+            const HashTable& table = *tables[t];
             for (uint64_t i = 0; i < table.total_slots(); ++i) {
                 HashEntry e = table.load_slot(i);
                 if (e.empty()) continue;
@@ -786,27 +876,43 @@ int uDepot<IO>::restore_index(bool* restored) {
 
     // Clear every valid footer before anything is written: neither the
     // index restored here nor one passed over may be restored again once
-    // the log moves on.
-    std::memset(md_buf.data, 0, md_chunk);
+    // the log moves on. Only the footer: with grains over 512 B its grain
+    // holds slots too, which stay as they are (uDepot's invalidate_ftr()
+    // writes the mapped slots back with it).
     for (const Found& f : found) {
-        ssize_t w = pwrite_internal(md_buf.data, md_chunk,
-                                    grain_to_offset(f.grain) +
-                                        static_cast<off_t>(net_bytes - md_chunk));
-        if (w != static_cast<ssize_t>(md_chunk)) return -EIO;
+        const off_t pos = grain_to_offset(f.grain) +
+                          static_cast<off_t>(net_bytes - md_chunk);
+        if (pread_internal(md_buf.data, md_chunk, pos) !=
+            static_cast<ssize_t>(md_chunk))
+            return -EIO;
+        std::memset(static_cast<uint8_t*>(md_buf.data) + md_chunk -
+                        kIndexMdBytes,
+                    0, kIndexMdBytes);
+        if (pwrite_internal(md_buf.data, md_chunk, pos) !=
+            static_cast<ssize_t>(md_chunk))
+            return -EIO;
     }
     if (!ok) return 0;
 
-    // Commit. Index segments are not restored: salsa sees them as free.
-    delete directory_;
-    directory_ = dir.release();
+    // Commit. The tables keep their segments for the session, as uDepot's
+    // restore() restores the directory's segment ranges; any other index
+    // segment is free.
+    directory_ = new Directory(rcu_, index_tables_, std::move(tables));
+    // The live data and the tables it was persisted with fitted the store
+    // when it shut down, so they fit now; a failure means a corrupt index.
+    for (const Found* f : set)
+        if (scm_->restore_grain_range(f->grain, net_grains,
+                                      index_ctlr_->get_ctlr_id()) != 0)
+            return -EIO;
     for (uint64_t seg = 0; seg < num_segments_; ++seg) {
         if (data_ts[seg] == 0) continue;
         seg_timestamps_[seg].store(data_ts[seg], std::memory_order_relaxed);
         seg_md_ok_[seg].store(true, std::memory_order_relaxed);
         seg_live_[seg].store(true, std::memory_order_relaxed);
-        if (valid[seg] != 0)
+        if (valid[seg] != 0 &&
             scm_->restore_grain_range(seg * seg_size, valid[seg],
-                                      get_ctlr_id());
+                                      get_ctlr_id()) != 0)
+            return -EIO;
     }
     if (max_data_ts > 0) restore_seg_alloc_nr(max_data_ts);
     *restored = true;
@@ -856,11 +962,6 @@ int uDepot<IO>::open(const StoreConfig& config) {
     if (segment_size == 0)
         segment_size = (1ULL << 29) / grain_size_ + 2;
 
-    // Start with 1 table for recovery (will grow as entries are inserted),
-    // config.initial_tables for fresh.
-    uint32_t initial_tables = restored ? 1 : config.initial_tables;
-    directory_ = new Directory(rcu_, initial_tables, config.index_bits);
-
     // Relocating GC with uDepot's non-memcache parameters
     // (uDepotSalsa::init: init_local(14, 2, 4)).
     static constexpr uint32_t kGcType = 14;
@@ -883,14 +984,18 @@ int uDepot<IO>::open(const StoreConfig& config) {
         const uint64_t step = grain_size_ < 4096 ? 4096 / grain_size_ : 1;
         return std::max<uint64_t>(1, seg / step * step);
     };
+    // As uDepot's KV_conf::validate_and_sanitize_parameters, for a store's
+    // own segment size (a restored store keeps the one it was made with).
+    // It also makes the default segment (2^29 bytes + 2 grains) a 2 MiB
+    // multiple wherever a page holds more than two grains, so the
+    // directory's tables map on huge pages (TableRegion).
+    if (!restored) segment_size = sanitize(segment_size);
 
     // Halving retry loop (matches uDepot): if the segment size is too
     // large for the device, halve and try again.
     while (true) {
         if (!has_tail(segment_size)) {
             if (restored) {
-                delete directory_;
-                directory_ = nullptr;
                 io_.close();
                 return -EINVAL;
             }
@@ -908,8 +1013,6 @@ int uDepot<IO>::open(const StoreConfig& config) {
                 if (ns == 1) break;
             }
             if (best == 0 || best >= segment_size) {
-                delete directory_;
-                directory_ = nullptr;
                 io_.close();
                 return -EINVAL;
             }
@@ -936,6 +1039,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
         }
 
         scm_ = new salsa::Scm();
+        overprovision_ = config.overprovision;
         rc = scm_->init(argc, argv, config.overprovision);
         if (rc == 0) break;
 
@@ -943,8 +1047,6 @@ int uDepot<IO>::open(const StoreConfig& config) {
         scm_ = nullptr;
         segment_size /= 2;
         if (segment_size <= 1) {
-            delete directory_;
-            directory_ = nullptr;
             io_.close();
             return -EINVAL;
         }
@@ -955,8 +1057,6 @@ int uDepot<IO>::open(const StoreConfig& config) {
     if (rc != 0) {
         delete scm_;
         scm_ = nullptr;
-        delete directory_;
-        directory_ = nullptr;
         io_.close();
         return -rc;
     }
@@ -969,6 +1069,8 @@ int uDepot<IO>::open(const StoreConfig& config) {
         if (index_ctlr_ && index_ctlr_->get_scm()) index_ctlr_->shutdown();
         index_ctlr_.reset();
         salsa::SalsaCtlr::shutdown();
+        // Deferred segments go back to scm_ in RCU callbacks.
+        rcu_.barrier();
         delete scm_;
         scm_ = nullptr;
         delete directory_;
@@ -990,15 +1092,17 @@ int uDepot<IO>::open(const StoreConfig& config) {
     }
 
     index_ts_ = 0;
+    index_restored_ = false;
+    index_unbacked_ = false;
     if (restored) {
         // As uDepot's init: the persisted index after a clean shutdown,
         // the log otherwise.
-        bool index_restored = false;
-        rc = restore_index(&index_restored);
-        if (rc == 0 && !index_restored) rc = crash_recovery();
+        rc = restore_index(&index_restored_);
+        if (rc == 0 && !index_restored_) rc = crash_recovery();
         if (rc != 0) return fail(rc);
     } else {
         rc = persist_dev_md();
+        if (rc == 0) rc = create_directory();
         if (rc != 0) return fail(rc);
     }
 
@@ -1010,6 +1114,17 @@ int uDepot<IO>::open(const StoreConfig& config) {
 
     rc = scm_->init_threads();
     if (rc != 0) return fail(-rc);
+
+    if (index_unbacked_) {
+        // Crash recovery's tables take their segments now: the walk has
+        // freed the dead segments, and GC can free more.
+        index_unbacked_ = false;
+        rc = assign_index_segments();
+        if (rc != 0) {
+            scm_->exit_threads();
+            return fail(rc);
+        }
+    }
 
     {
         std::lock_guard<std::mutex> lock(space_mu_);
@@ -1026,27 +1141,31 @@ void uDepot<IO>::close() {
     stop_space_waker();
 
     if (scm_) {
-        // Before salsa's threads stop: GC may have to free the segments
-        // the index goes to. If it cannot be written, the next open scans
-        // the log, as after a crash.
+        // As uDepot's shutdown(): GC first, then the data controller, then
+        // the directory written back (map_m.shutdown()), then the index's
+        // own controller. GC relocates records, updating the tables, so they
+        // are written back only once it has stopped; they hold their
+        // segments already, so nothing needs GC to free one. If they cannot
+        // be written, the next open scans the log, as after a crash.
+        scm_->exit_threads();
+        // GC is stopped, so no more segments get deferred; return the
+        // deferred ones to salsa before its controllers shut down.
+        rcu_.barrier();
+
+        // The device metadata (geometry and seed, as written at create)
+        // reads the data controller's segment size, so before it goes.
+        persist_dev_md();
+
+        salsa::SalsaCtlr::shutdown();
+
         int frc = flush_index();
         if (frc != 0)
             std::fprintf(stderr, "udepot: index not persisted (%s); the "
                          "next open recovers from the log\n",
                          std::strerror(-frc));
 
-        scm_->exit_threads();
-        // GC is stopped, so no more segments get deferred; return the
-        // deferred ones to salsa before it shuts down.
-        rcu_.barrier();
-
-        // Persist device metadata before shutdown so the next open can
-        // recover.
-        persist_dev_md();
-
         index_ctlr_->shutdown();
         index_ctlr_.reset();
-        salsa::SalsaCtlr::shutdown();
         // Shutting the controllers down can free (so defer) segments too;
         // their callbacks return them to scm_, so they must have run.
         rcu_.barrier();
@@ -1104,7 +1223,8 @@ bool uDepot<IO>::SpaceWait::await_suspend(std::coroutine_handle<> h) {
     if (grow != Directory::kAnyGeneration)
         store->grow_request_ =
             std::max(store->grow_request_.value_or(0), grow);
-    store->space_waiters_.push_back(h);
+    handle = h;
+    store->space_waiters_.push_back(this);
     store->space_cv_.notify_one();
     return true;
 }
@@ -1116,18 +1236,25 @@ CoroTask<int> uDepot<IO>::wait_for_grow(uint64_t gen, bool grow,
     // The grow waits for read sections, so leave ours first.
     guard.reset();
     if (probe) probe->n = 0;
-    co_await SpaceWait{this, grow ? gen : Directory::kAnyGeneration};
+    // As uDepot's put on a failed grow (no index segment was free for the
+    // new tables): the write fails rather than retrying. A later write
+    // that finds its table full asks for another grow.
+    int rc = co_await SpaceWait{this, grow ? gen : Directory::kAnyGeneration};
     guard.emplace(rcu_);
-    co_return 0;
+    co_return rc;
 }
 
 // Resume every waiter, with space_mu_ released. Called with it held.
 template <typename IO>
-void uDepot<IO>::resume_waiters(std::unique_lock<std::mutex>& lock) {
+void uDepot<IO>::resume_waiters(std::unique_lock<std::mutex>& lock,
+                                uint64_t gen, int rc) {
     auto waiters = std::move(space_waiters_);
     space_waiters_.clear();
     lock.unlock();
-    for (auto h : waiters) h.resume();
+    for (SpaceWait* w : waiters) {
+        if (rc != 0 && w->grow == gen) w->result = rc;
+        w->handle.resume();  // `w` lives in the resumed frame: done with it
+    }
     // Resumed operations may have submitted I/O from this thread; on a
     // backend that completes on the submitting thread, see it through.
     while (poll_this_thread()) {}
@@ -1145,9 +1272,26 @@ void uDepot<IO>::space_waker_loop() {
             uint64_t gen = *grow_request_;
             grow_request_.reset();
             lock.unlock();
-            directory_->grow(gen);  // -ENOSPC: commit_put reports it
+            int rc = directory_->grow(gen);
             lock.lock();
-            resume_waiters(lock);
+            if (rc == -EAGAIN) {
+                // No index segment free yet; GC may free one. As uDepot's
+                // grow() loops on EAGAIN, try again, but let every waiter
+                // retry meanwhile, as below (those whose table is full
+                // just ask again).
+                if (!grow_request_ || *grow_request_ < gen) grow_request_ = gen;
+                lock.unlock();
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                lock.lock();
+                resume_waiters(lock);
+                continue;
+            }
+            // -ENOSPC at the maximum size (commit_put reports that itself),
+            // or with no index segment to be had: the waiters that asked
+            // for this grow get it, and with them answered, so is the
+            // request.
+            if (grow_request_ == gen) grow_request_.reset();
+            resume_waiters(lock, gen, rc);
             continue;
         }
         if (space_waiters_.empty()) {
@@ -1382,14 +1526,20 @@ void uDepot<IO>::seg_md_callback(u64 grain_start, u64 /*grain_nr*/,
         hook(ts);
     uint64_t seg_idx = scm_->grain_to_seg_idx(grain_start);
     if (seg_idx >= num_segments_) return;
-    seg_timestamps_[seg_idx].store(ts, std::memory_order_release);
     // As uDepot's persist_seg_md: written before salsa stages the segment,
     // so it is on the device before any grain of it is handed out. This
     // may run on whichever thread found the stage queue empty, including an
     // I/O poller, hence the blocking write.
     bool ok = persist_seg_md(grain_start, ts, get_ctlr_id()) == 0;
+    if (ok) {
+        seg_timestamps_[seg_idx].store(ts, std::memory_order_release);
+        seg_live_[seg_idx].store(true, std::memory_order_release);
+    }
+    // If the write failed, no grain of the segment is handed out
+    // (try_allocate_grains, relocate), and the device still holds its old
+    // metadata and records: it keeps their timestamp, so GC keeps every
+    // tombstone they could need.
     seg_md_ok_[seg_idx].store(ok, std::memory_order_release);
-    seg_live_[seg_idx].store(true, std::memory_order_release);
 }
 
 template <typename IO>

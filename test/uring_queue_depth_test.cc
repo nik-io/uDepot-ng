@@ -61,8 +61,6 @@ TEST(UringSubmit, RefusedSubmissionsAreRetriedByThePoller) {
 
     udepot::StoreConfig config;
     config.grain_size = 512;
-    config.initial_tables = 4;
-    config.index_bits = 14;
     config.force_destroy = true;
     config.queue_depth = 4;  // a 4-entry submission queue
     UringTraits::configure(config);

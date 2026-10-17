@@ -95,6 +95,7 @@ int sto_capacity_mgr_ctr(
 
 	os_atomic32_zero(&scm->ctlr_nr);
 	os_atomic32_zero(&scm->waiting_nr);
+	os_atomic32_zero(&scm->threads_running);
 	os_atomic64_set(&scm->thin_prov_segs, seg_nr);
 	os_mutex_init(&scm->mtx);
 	DBG("segs=%lu", (uintptr_t)scm->segs);
@@ -153,8 +154,10 @@ int sto_capacity_mgr_dtr(struct sto_capacity_mgr *const scm)
 {
 	int err = 0;
 	ERR_CHK_SET_GOTO(NULL == scm, err, EINVAL, fail0);
+	// A manager whose threads never started (its owner failed to open
+	// before init_threads) needs no exit fn first.
 	if (0 != os_atomic32_read(&scm->ctlr_nr) ||
-		0 == os_atomic32_read(&scm->exit)) {
+		0 != os_atomic32_read(&scm->threads_running)) {
 		err = EPERM;
 		ERR("Trying to destroy capacity manager before destroying" \
 			" the storage ctlrs and/or calling the exit fn.");
@@ -173,6 +176,7 @@ int sto_capacity_mgr_init_threads(struct sto_capacity_mgr *const scm)
 {
 	int err = 0;
 	os_atomic32_zero(&scm->exit);
+	os_atomic32_set(&scm->threads_running, 1);
 	err = gc_init_threads(scm->gc);
 	ERR_CHK_PRNT(0 != err, "gc_init_threads failed with %d", err);
 	return err;
@@ -186,6 +190,7 @@ int sto_capacity_mgr_exit_threads(struct sto_capacity_mgr *const scm)
 	scm_throttle_exit(&scm->scmt);
 	err = gc_exit_threads(scm->gc);
 	assert(0 == err);
+	os_atomic32_zero(&scm->threads_running);
 	return err;
 }
 

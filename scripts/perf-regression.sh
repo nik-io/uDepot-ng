@@ -6,7 +6,13 @@
 # PUT, GET, EXISTS, and DEL, and fails if uDepot-ng is slower than uDepot
 # on any operation (within a tolerance band).
 #
-# Usage: perf-regression.sh [ops] [iters] [tolerance-percent]
+# Usage: perf-regression.sh [ops] [iters] [tolerance-percent] [backend] [qd]
+#
+# backend: posix (default), aio, uring or spdk. uDepot runs the last three
+# on TRT, as its udepot-test does; spdk uses the NVMe-oF namespace that
+# UDEPOT_NVMEF names (scripts/spdk-nvmef-test.sh starts one), on both sides.
+# qd: operations each side keeps in flight (default 1); uDepot's TRT tasks,
+# udepot-test's --trt-ntasks, whose default is 128.
 #
 # Requires:
 #   - build/udepot_ng_bench     (cmake --build build)
@@ -21,28 +27,57 @@ set -uo pipefail
 OPS="${1:-5000}"
 ITERS="${2:-9}"
 TOL="${3:-5}"
+BACKEND="${4:-posix}"
+QD="${5:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NG_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-NG_BIN="${NG_ROOT}/build/udepot_ng_bench"
-LEGACY_BIN="${NG_ROOT}/build/udepot_legacy_bench"
+# SPDK needs uDepot-ng built with -DUDEPOT_BUILD_SPDK=ON (Release), and
+# uDepot built with BUILD_SPDK=1; NG_BUILD overrides the build directory.
+LEGACY_SPDK=0
+if [ "$BACKEND" = "spdk" ]; then
+    LEGACY_SPDK=1
+    NG_BUILD="${NG_BUILD:-${NG_ROOT}/build-spdk-rel}"
+    [ -n "${UDEPOT_NVMEF:-}" ] || {
+        echo "FATAL: spdk needs UDEPOT_NVMEF (run via scripts/spdk-nvmef-test.sh <build> regression)" >&2
+        exit 2
+    }
+fi
+NG_BUILD="${NG_BUILD:-${NG_ROOT}/build}"
+NG_BIN="${NG_BUILD}/udepot_ng_bench"
+LEGACY_BIN="${NG_BUILD}/udepot_legacy_bench"
 
 # Ensure legacy uDepot is built at -O3 -DNDEBUG (BUILD_TYPE=PERFORMANCE).
 UDEPOT_ROOT="${UDEPOT_ROOT:-${NG_ROOT}/../uDepot}"
 if [ -d "$UDEPOT_ROOT" ]; then
-    echo "Building legacy uDepot at BUILD_TYPE=PERFORMANCE..." >&2
-    make -C "$UDEPOT_ROOT" BUILD_TYPE=PERFORMANCE -j"$(nproc)" 2>&1 | tail -1 >&2
-    # Rebuild the legacy benchmark binary to link against the fresh library.
-    cmake --build "${NG_ROOT}/build" --target udepot_legacy_bench 2>&1 | tail -1 >&2
+    echo "Building legacy uDepot at BUILD_TYPE=PERFORMANCE BUILD_SPDK=$LEGACY_SPDK..." >&2
+    # uDepot's Makefile updates libudepot.a in place (gcc-ar cr), so after a
+    # BUILD_SPDK flip it holds both libtrt.o and libtrt-rte.o and the bench
+    # fails to link: have it rebuilt from the current objects.
+    rm -f "${UDEPOT_ROOT:?}/libudepot.a"
+    make -C "$UDEPOT_ROOT" BUILD_TYPE=PERFORMANCE BUILD_SPDK="$LEGACY_SPDK" \
+        -j"$(nproc)" 2>&1 | tail -1 >&2
+    # Reconfigure (the legacy bench links SPDK only if uDepot was built
+    # with it), then rebuild both benchmarks against the fresh library.
+    cmake "$NG_BUILD" > /dev/null
+    cmake --build "$NG_BUILD" --target udepot_legacy_bench udepot_ng_bench \
+        2>&1 | tail -1 >&2
 fi
 
 NG_FILE="/dev/shm/udepot-ng-perf.store"
 LEGACY_FILE="/dev/shm/udepot-legacy-perf.store"
 SIZE=1077936129
+# SPDK: the whole namespace, on both sides. uDepot-ng's SPDK backend always
+# takes it whole; uDepot takes it whole at size 0 (as its own NVMe-oF test
+# runs udepot-test), and a larger size makes it try to ftruncate the
+# namespace, which fails.
+[ "$BACKEND" = "spdk" ] && SIZE=0
 GRAIN=512
 VAL=1024
 
-trap 'rm -f "$NG_FILE" "$LEGACY_FILE"' EXIT
+NG_ERR="$(mktemp)"
+LEGACY_ERR="$(mktemp)"
+trap 'rm -f "$NG_FILE" "$LEGACY_FILE" "$NG_ERR" "$LEGACY_ERR"' EXIT
 
 for bin in "$NG_BIN" "$LEGACY_BIN"; do
     if [ ! -x "$bin" ]; then
@@ -60,7 +95,8 @@ run_ng() {
     rm -f "$NG_FILE"
     local out
     out=$("$NG_BIN" -w "$OPS" -f "$NG_FILE" --size "$SIZE" \
-        --grain-size "$GRAIN" --val-size "$VAL" 2>/dev/null)
+        --grain-size "$GRAIN" --val-size "$VAL" \
+        --backend "$BACKEND" --qd "$QD" 2>"$NG_ERR")
     echo "$(extract PUT "$out") $(extract GET "$out") $(extract EXIST "$out") $(extract DEL "$out")"
 }
 
@@ -68,7 +104,8 @@ run_legacy() {
     rm -f "$LEGACY_FILE"
     local out
     out=$("$LEGACY_BIN" -w "$OPS" -f "$LEGACY_FILE" --size "$SIZE" \
-        --grain-size "$GRAIN" --val-size "$VAL" 2>/dev/null)
+        --grain-size "$GRAIN" --val-size "$VAL" \
+        --backend "$BACKEND" --qd "$QD" 2>"$LEGACY_ERR")
     echo "$(extract PUT "$out") $(extract GET "$out") $(extract EXIST "$out") $(extract DEL "$out")"
 }
 
@@ -85,13 +122,16 @@ median() {
 ng_p=(); ng_g=(); ng_e=(); ng_d=()
 leg_p=(); leg_g=(); leg_e=(); leg_d=()
 
-echo "Running $ITERS interleaved iterations @ $OPS ops each..." >&2
+echo "Running $ITERS interleaved iterations @ $OPS ops each, backend=$BACKEND qd=$QD..." >&2
 for iter in $(seq 1 "$ITERS"); do
     read -r lp lg le ld <<<"$(run_legacy)"
     read -r np ng_ ne nd <<<"$(run_ng)"
-    for v in "$lp" "$lg" "$le" "$ld" "$np" "$ng_" "$ne" "$nd"; do
-        if [ -z "$v" ]; then
-            echo "FATAL: a run produced no throughput (iter $iter)" >&2
+    for side in legacy ng; do
+        if [ "$side" = legacy ]; then vals="$lp $lg $le $ld"; err="$LEGACY_ERR"
+        else vals="$np $ng_ $ne $nd"; err="$NG_ERR"; fi
+        if [ "$(wc -w <<<"$vals")" -ne 4 ]; then
+            echo "FATAL: the $side run produced no throughput (iter $iter); its stderr ends:" >&2
+            grep -v -E '^(GC|XNP) ' "$err" | tail -15 >&2
             exit 2
         fi
     done
@@ -107,7 +147,7 @@ ldm=$(median "${leg_d[@]}"); ndm=$(median "${ng_d[@]}")
 
 {
   echo ""
-  echo "Mops/sec medians over ${ITERS} interleaved runs @ ${OPS} ops on /dev/shm:"
+  echo "Mops/sec medians over ${ITERS} interleaved runs @ ${OPS} ops, backend=${BACKEND} qd=${QD}:"
   printf "  %-7s uDepot=%-12s uDepot-ng=%-12s\n" PUT "$lpm" "$npm"
   printf "  %-7s uDepot=%-12s uDepot-ng=%-12s\n" GET "$lgm" "$ngm"
   printf "  %-7s uDepot=%-12s uDepot-ng=%-12s\n" EXISTS "$lem" "$nem"

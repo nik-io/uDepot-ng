@@ -13,13 +13,22 @@
 #include <vector>
 
 #include "udepot/hash_entry.h"
+#include "udepot/table_region.h"
 
 namespace udepot {
 
 // Hopscotch hash table with lock-free reads and stripe-locked writes.
 //
-// Each slot is an atomic<uint64_t> holding a packed HashEntry. Readers scan
-// a bucket's neighborhood (kHopRange slots) without taking any lock.
+// The table lives in a TableRegion, the mapping of its index segment, as
+// uDepot's uDepotMap lives in its mmap'd directory segment: the slots start
+// past the region's header, and their number follows from the region's
+// size (uDepotMap::restore: the largest power of two of buckets, plus one
+// neighborhood, that fits between header and footer). A smaller table is a
+// smaller segment.
+//
+// Each slot is a uint64_t holding a packed HashEntry, accessed atomically.
+// Readers scan a bucket's neighborhood (kHopRange slots) without taking any
+// lock.
 //
 // Writers lock stripes, as uDepot's uDepotMap does. A write for a bucket
 // may look for a free slot up to kMaxDisplace neighborhoods past it and
@@ -37,9 +46,18 @@ public:
     // (uDepot's _UDEPOT_HOP_MAX_BUCKET_DISPLACE).
     static constexpr uint64_t kMaxDisplace = 64;
 
-    // Construct a hash table with 2^index_bits buckets.
-    explicit HashTable(uint32_t index_bits);
+    // A table over `region`, whose slots it takes as they are: a restored
+    // table's, or a new one's to clear(). The region must hold at least
+    // one bucket (index_bits_for() != 0).
+    explicit HashTable(TableRegion region);
     ~HashTable();
+
+    // log2 of the buckets a region of net_bytes holds, or 0 if it holds no
+    // more than one neighborhood.
+    static uint32_t index_bits_for(size_t net_bytes) noexcept;
+
+    // Mark every slot unused (uDepot's uDepotMap::init: memset to -1).
+    void clear() noexcept;
 
     HashTable(const HashTable&) = delete;
     HashTable& operator=(const HashTable&) = delete;
@@ -98,32 +116,40 @@ public:
 
     // Direct slot access for directory rehash during grow.
     HashEntry load_slot(uint64_t idx) const noexcept {
-        return HashEntry::load(slots_[idx], std::memory_order_relaxed);
-    }
-
-    // Set a slot's raw entry, when restoring a persisted table. Nothing
-    // may read or write the table meanwhile.
-    void restore_slot(uint64_t idx, uint64_t raw) noexcept {
-        slots_[idx].store(raw, std::memory_order_relaxed);
+        return HashEntry::load(slot(idx), std::memory_order_relaxed);
     }
 
     uint64_t total_slots() const noexcept {
         return num_buckets_ + HashEntry::kHopRange;
     }
 
+    // Bytes from the region's start to the end of the slots.
+    size_t used_bytes() const noexcept {
+        return TableRegion::kMdBytes + total_slots() * sizeof(uint64_t);
+    }
+
+    const TableRegion& region() const noexcept { return region_; }
+    // Give a table mapped without a segment its segment (crash recovery).
+    void set_segment(uint64_t grain) noexcept { region_.set_grain(grain); }
+
 private:
     struct alignas(64) Stripe {
         std::mutex mu;
     };
 
+    TableRegion region_;
     uint32_t index_bits_;
     uint64_t num_buckets_;
     uint64_t bucket_mask_;
     uint64_t num_stripes_;
     uint64_t slots_per_stripe_;
 
-    std::unique_ptr<std::atomic<uint64_t>[]> slots_;
+    uint64_t* slots_;  // in region_, past its header
     std::unique_ptr<Stripe[]> stripes_;
+
+    std::atomic_ref<uint64_t> slot(uint64_t idx) const noexcept {
+        return std::atomic_ref<uint64_t>(slots_[idx]);
+    }
 
     uint64_t hash_to_bucket(uint64_t hash) const noexcept {
         return hash & bucket_mask_;

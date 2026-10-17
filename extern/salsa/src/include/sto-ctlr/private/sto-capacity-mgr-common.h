@@ -53,6 +53,7 @@ struct scm_throttler {
 struct sto_capacity_mgr {
 	os_atomic32_t                ctlr_nr; /* # of ctrls */
 	os_atomic32_t                exit;	  /* for shutdown */
+	os_atomic32_t                threads_running; /* init_threads ran, exit_threads not yet */
 	os_atomic64_t                thin_prov_segs; /* # available segments for
 						    thin provisioned devices */
 	struct gc             *const gc;

@@ -35,6 +35,7 @@ add_compile_options(-Wall -Wextra -Werror)
 add_library(udepot
     src/udepot/rcu.cc
     src/udepot/hash_table.cc
+    src/udepot/table_region.cc
     src/udepot/directory.cc
     src/udepot/store.cc
     src/udepot/io/aio.cc
@@ -341,6 +342,38 @@ if(UDEPOT_BUILD_TESTS)
             pthread rt z
         )
         target_compile_options(udepot_legacy_bench PRIVATE -Wno-error)
+        # A legacy tree built with BUILD_SPDK=1 has its TRT SPDK backend in
+        # libudepot.a; link it as uDepot's Makefile links udepot-test.
+        # Read at configure time: scripts/perf-regression.sh reconfigures
+        # after (re)building uDepot.
+        set(_legacy_cfg "")
+        if(EXISTS "${UDEPOT_ROOT}/.build-config")
+            file(READ "${UDEPOT_ROOT}/.build-config" _legacy_cfg)
+        endif()
+        if(_legacy_cfg MATCHES "SPDK=1")
+            set(_lspdk ${UDEPOT_ROOT}/trt/external/spdk)
+            target_compile_definitions(udepot_legacy_bench PRIVATE
+                UDEPOT_TRT_SPDK)
+            target_compile_options(udepot_legacy_bench PRIVATE -msse4)
+            target_include_directories(udepot_legacy_bench SYSTEM PRIVATE
+                ${_lspdk}/include ${_lspdk}/dpdk/build/include)
+            set(_lspdk_libs)
+            foreach(_l util log trace thread env_dpdk sock json jsonrpc rpc
+                       keyring dma)
+                list(APPEND _lspdk_libs ${_lspdk}/build/lib/libspdk_${_l}.a)
+            endforeach()
+            target_link_libraries(udepot_legacy_bench PRIVATE
+                -Wl,--whole-archive
+                ${_lspdk}/build/lib/libspdk_nvme.a
+                ${_lspdk}/build/lib/libspdk_sock_posix.a
+                -Wl,--no-whole-archive
+                ${_lspdk_libs} ${_lspdk_libs}
+                -L${_lspdk}/dpdk/build/lib -Wl,-rpath=${_lspdk}/dpdk/build/lib
+                rte_eal rte_mempool rte_ring rte_telemetry rte_pci rte_bus_pci
+                ${_lspdk}/isa-l/.libs/libisal.a ssl crypto dl numa uuid)
+            message(STATUS "udepot_legacy_bench: legacy uDepot built with "
+                           "SPDK, TRT SPDK backend enabled")
+        endif()
     else()
         message(STATUS "UDEPOT_ROOT=${UDEPOT_ROOT} — libudepot.a not found, "
                        "skipping legacy benchmark build")

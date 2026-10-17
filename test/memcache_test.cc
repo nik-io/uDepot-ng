@@ -172,8 +172,6 @@ protected:
         config.path = path_.c_str();
         config.size = store_size();
         config.grain_size = grain_size();
-        config.initial_tables = 2;
-        config.index_bits = 10;
         config.force_destroy = true;
         ASSERT_EQ(store_.open(config), 0);
 

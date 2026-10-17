@@ -46,9 +46,13 @@
     paper. Where the paper and legacy uDepot's code disagree, **follow the
     paper, or ask**; where both are silent, legacy is the reference. Notable
     consequences already decided: empty values are valid (tombstones need their
-    own encoding); the index is flushed to index segments and restored on a
-    clean start, with the log scan only after a crash; resize is incremental
-    per lock region with a shadow directory; PUT writes before it checks, and
+    own encoding); each directory table maps to an index segment of its own
+    for its life, as large as the segment allows (smaller tables come from a
+    smaller segment size, never from a separate setting), is written back
+    there at close and restored from it on a clean start, with the log scan
+    only after a crash; the directory grows
+    by freeze-and-copy, not the paper's incremental resize (tried in PR #8,
+    dropped: see `docs/udepot-paper.md`, §4.3); PUT writes before it checks, and
     Memcache paths may carry weaker durability than the store.
 
 ## Project Overview
@@ -220,7 +224,30 @@ on-disk format, same hash function (CityHash64), same operations. Legacy uDepot
 must be built at `BUILD_TYPE=PERFORMANCE` (`-O3 -DNDEBUG`) to match uDepot-ng's
 cmake Release build; `perf-regression.sh` does this automatically.
 
-The speed gap is genuine, not a benchmark artifact. With both at -O3, uDepot-ng
+**Every backend.** `scripts/perf-regression.sh [ops] [iters] [tol] [backend]
+[qd]` takes posix (default), aio, uring or spdk, and the operations each side
+keeps in flight. uDepot runs aio, uring and spdk on TRT as its `udepot-test`
+does: `--qd` TRT tasks per phase (`--trt-ntasks`, default 128), each a slice
+of the ops; uDepot-ng keeps `--qd` operations in flight. SPDK runs through
+`scripts/spdk-nvmef-test.sh <spdk-release-build> regression`, both stores on
+the target's whole namespace. The gate is not in CI (it needs uDepot built).
+Until 5d9c4e9 it only ever ran posix. First run on every backend (5000 ops,
+9 runs, uDepot-ng vs uDepot, `/dev/shm`):
+
+| backend | qd | PUT | GET | EXISTS | DEL |
+|---|---|---|---|---|---|
+| aio | 1 | −81% | −87% | −80% | −77% |
+| aio | 128 | −15% | −52% | −18% | −62% |
+| uring | 1 | −29% | −35% | −26% | −21% |
+| uring | 128 | −37% | −32% | −16% | −77% |
+| spdk (NVMe-oF) | 1 | +16% | −3% | +1% | +3% |
+| spdk (NVMe-oF) | 128 | +122% | +111% | +186% | +46% |
+
+**aio and uring fail the gate, on main as well.** Open. SPDK harvests its
+completions on the submitting thread, as uDepot's TRT poller task does; aio
+and uring hand every completion from a poller thread to the waiting one.
+
+The posix speed gap is genuine, not a benchmark artifact. With both at -O3, uDepot-ng
 is 2-5x faster at 5000 ops, varying by host: PUT +127-182%, GET +174-227%,
 EXISTS +345-408%, DEL +125-303% on the two cloud hosts measured. Each phase
 lasts only a few milliseconds, so single runs swing by ~15%; compare medians

@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -44,6 +46,27 @@ struct BenchConfig {
     // R rounds, each a batch of `ops` copying operations and a batch of
     // `ops` zero-copy ones, in alternating order, against the same store.
     int compare_rounds = 0;
+    // Segment size in grains (--segment-size), 0 for the store's default.
+    // It also sizes the directory's tables, one per index segment: small
+    // segments make the directory grow during the run.
+    uint64_t segment_size = 0;
+    // Record each put's latency and print percentiles (--latency): what a
+    // grow costs writers shows in the tail, not in the throughput.
+    bool latency = false;
+    // Open loop (--rate): each thread issues puts at this many per second
+    // and a put's latency counts from when it was due, not when it was
+    // issued. A closed loop hides a stall: a writer stuck for 100 ms has one
+    // slow put, and the puts it would have issued meanwhile are never
+    // measured (coordinated omission). 0 = closed loop.
+    double rate = 0;
+    // Operations each thread keeps in flight, in every phase (--qd), as
+    // legacy udepot-test keeps --trt-ntasks TRT tasks busy. A put waiting
+    // out a grow then holds one slot, not the thread: the others keep
+    // going, and the wait shows as that put's latency and as the puts that
+    // queue behind a full window. 1 = one operation at a time.
+    uint32_t qd = 1;
+    // Only the put phase (--put-only): the latency runs need nothing else.
+    bool put_only = false;
 };
 
 static double now_secs() {
@@ -57,113 +80,164 @@ struct ThreadResult {
     double exists_secs = 0;
     double del_secs = 0;
     int errors = 0;
+    std::vector<uint32_t> put_ns;  // with --latency
 };
+
+// Put latency percentiles over every thread's puts, and the number of puts
+// past 100 us and 1 ms: a grow that stalls writers shows up there.
+static void print_put_latency(std::vector<uint32_t> ns) {
+    if (ns.empty()) return;
+    std::sort(ns.begin(), ns.end());
+    auto pct = [&](double p) {
+        size_t i = static_cast<size_t>(p / 100.0 * (ns.size() - 1));
+        return ns[i] / 1000.0;
+    };
+    size_t over_100us = ns.end() - std::lower_bound(ns.begin(), ns.end(),
+                                                    100000u);
+    size_t over_1ms = ns.end() - std::lower_bound(ns.begin(), ns.end(),
+                                                  1000000u);
+    printf("PUT latency us: p50=%.2f p90=%.2f p95=%.2f p99=%.2f p99.9=%.2f "
+           "p99.99=%.2f max=%.2f over_100us=%zu over_1ms=%zu n=%zu\n",
+           pct(50), pct(90), pct(95), pct(99), pct(99.9), pct(99.99),
+           ns.back() / 1000.0, over_100us, over_1ms, ns.size());
+}
+
+enum class Op { kPut, kGet, kExists, kDel };
+
+static const char* op_name(Op op) {
+    switch (op) {
+        case Op::kPut: return "put";
+        case Op::kGet: return "get";
+        case Op::kExists: return "exists";
+        case Op::kDel: return "del";
+    }
+    return "?";
+}
+
+// One phase: up to cfg.qd operations in flight, as legacy udepot-test keeps
+// its TRT tasks (--trt-ntasks) busy. With --rate, put i is due at
+// start + i / rate; it is issued then, or as soon as a slot frees, and its
+// latency counts from when it was due. Returns false on a failed
+// operation, once every one in flight has completed.
+template <typename IO>
+static bool op_window(uDepot<IO>& store, const BenchConfig& cfg,
+                      int thread_id, Op op,
+                      std::chrono::steady_clock::time_point start,
+                      ThreadResult& result) {
+    using Clock = std::chrono::steady_clock;
+    struct Slot {
+        std::optional<udepot::CoroTask<int>> task;
+        Clock::time_point t0;
+        uint64_t i = 0;
+        uint64_t valu = 0;
+        uint8_t key[32] = {};
+        std::vector<uint8_t> val;  // put: the value; get: what is read
+        size_t val_size = 0;
+    };
+    const uint64_t thread_seed = cfg.seed + thread_id * 1000000ULL;
+    const bool puts = op == Op::kPut;
+    std::vector<Slot> slots(std::max<uint32_t>(cfg.qd, 1));
+    std::vector<size_t> free_slots;
+    for (size_t k = 0; k < slots.size(); ++k) {
+        if (op == Op::kPut || op == Op::kGet)
+            slots[k].val.assign(cfg.val_size, 0);
+        free_slots.push_back(slots.size() - 1 - k);
+    }
+
+    // Reap a finished operation: check it, record its latency, free its
+    // slot.
+    auto reap = [&](Slot& s) {
+        int rc = s.task->run_sync();
+        s.task.reset();
+        if (puts && cfg.latency)
+            result.put_ns.push_back(static_cast<uint32_t>(std::min<int64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    Clock::now() - s.t0).count(),
+                UINT32_MAX)));
+        if (rc != 0 && !result.errors) {
+            fprintf(stderr, "%s failed: thread=%d i=%lu rc=%d\n",
+                    op_name(op), thread_id, static_cast<unsigned long>(s.i),
+                    rc);
+            ++result.errors;
+        }
+        if (rc == 0 && op == Op::kGet && cfg.val_size >= sizeof(uint64_t)) {
+            uint64_t val_ret;
+            std::memcpy(&val_ret, s.val.data(), sizeof(val_ret));
+            if (val_ret != s.valu && !result.errors) {
+                fprintf(stderr, "value mismatch: thread=%d i=%lu\n",
+                        thread_id, static_cast<unsigned long>(s.i));
+                ++result.errors;
+            }
+        }
+        free_slots.push_back(&s - slots.data());
+    };
+
+    uint64_t next = 0;
+    while (true) {
+        // Reap first, so a completion is timed before the next issue.
+        for (auto& s : slots)
+            if (s.task && s.task->await_ready()) reap(s);
+        const bool issuing = next < cfg.ops && !result.errors;
+        if (!issuing && free_slots.size() == slots.size()) break;
+        if (issuing && !free_slots.empty()) {
+            auto t = Clock::now();
+            if (puts && cfg.rate > 0) {
+                const auto due = start + std::chrono::nanoseconds(
+                    static_cast<int64_t>(next * 1e9 / cfg.rate));
+                if (t < due) { udepot::poll_this_thread(); continue; }
+                t = due;
+            }
+            Slot& s = slots[free_slots.back()];
+            free_slots.pop_back();
+            const uint64_t key = (thread_seed + next) * kPrime;
+            s.valu = key * kPrime;
+            const uint64_t key_size = 8 + (key % 24);
+            std::memcpy(s.key, &key, sizeof(key));
+            s.t0 = t;
+            s.i = next++;
+            const std::span<const uint8_t> k(s.key, key_size);
+            switch (op) {
+                case Op::kPut:
+                    std::memcpy(s.val.data(), &s.valu, sizeof(s.valu));
+                    s.task.emplace(store.put(
+                        k, std::span<const uint8_t>(s.val.data(),
+                                                    cfg.val_size)));
+                    break;
+                case Op::kGet:
+                    s.task.emplace(store.get(k, s.val.data(), s.val.size(),
+                                             &s.val_size));
+                    break;
+                case Op::kExists:
+                    s.task.emplace(store.exists(k, &s.val_size));
+                    break;
+                case Op::kDel:
+                    s.task.emplace(store.del(k));
+                    break;
+            }
+            continue;
+        }
+        udepot::poll_this_thread();
+    }
+    return !result.errors;
+}
 
 template <typename IO>
 static ThreadResult run_thread(uDepot<IO>& store,
                                const BenchConfig& cfg,
                                int thread_id) {
     ThreadResult result;
-    uint64_t thread_seed = cfg.seed + thread_id * 1000000ULL;
-
-    std::vector<uint8_t> val(cfg.val_size, 0);
-    uint8_t keyb[32] = {};
-
-    // PUT
-    double t0 = now_secs();
-    for (uint64_t i = 0; i < cfg.ops; ++i) {
-        uint64_t key = (thread_seed + i) * kPrime;
-        uint64_t valu = key * kPrime;
-        uint64_t key_size = 8 + (key % 24);
-
-        std::memcpy(keyb, &key, sizeof(key));
-
-        std::memcpy(val.data(), &valu, sizeof(valu));
-        int rc = store.put(
-            std::span<const uint8_t>(keyb, key_size),
-            std::span<const uint8_t>(val.data(), cfg.val_size)).run_sync();
-        if (rc != 0) {
-            fprintf(stderr, "put failed: thread=%d i=%lu rc=%d\n",
-                    thread_id, static_cast<unsigned long>(i), rc);
-            ++result.errors;
+    if (cfg.latency) result.put_ns.reserve(cfg.ops);
+    const Op ops[] = {Op::kPut, Op::kGet, Op::kExists, Op::kDel};
+    double* secs[] = {&result.put_secs, &result.get_secs,
+                      &result.exists_secs, &result.del_secs};
+    for (size_t k = 0; k < std::size(ops); ++k) {
+        const auto start = std::chrono::steady_clock::now();
+        const double t0 = now_secs();
+        if (!op_window(store, cfg, thread_id, ops[k], start, result))
             return result;
-        }
+        *secs[k] = now_secs() - t0;
+        if (cfg.put_only) break;
     }
-    result.put_secs = now_secs() - t0;
-
-    // GET
-    std::vector<uint8_t> val_out(cfg.val_size);
-    t0 = now_secs();
-    for (uint64_t i = 0; i < cfg.ops; ++i) {
-        uint64_t key = (thread_seed + i) * kPrime;
-        uint64_t valu = key * kPrime;
-        uint64_t key_size = 8 + (key % 24);
-
-        std::memcpy(keyb, &key, sizeof(key));
-
-        size_t val_size_read = 0;
-        int rc = store.get(
-            std::span<const uint8_t>(keyb, key_size),
-            val_out.data(), val_out.size(), &val_size_read).run_sync();
-        if (rc != 0) {
-            fprintf(stderr, "get failed: thread=%d i=%lu rc=%d\n",
-                    thread_id, static_cast<unsigned long>(i), rc);
-            ++result.errors;
-            return result;
-        }
-
-        if (cfg.val_size >= sizeof(uint64_t)) {
-            uint64_t val_ret;
-            std::memcpy(&val_ret, val_out.data(), sizeof(val_ret));
-            if (val_ret != valu) {
-                fprintf(stderr, "value mismatch: thread=%d i=%lu\n",
-                        thread_id, static_cast<unsigned long>(i));
-                ++result.errors;
-                return result;
-            }
-        }
-    }
-    result.get_secs = now_secs() - t0;
-
-    // EXISTS
-    t0 = now_secs();
-    for (uint64_t i = 0; i < cfg.ops; ++i) {
-        uint64_t key = (thread_seed + i) * kPrime;
-        uint64_t key_size = 8 + (key % 24);
-
-        std::memcpy(keyb, &key, sizeof(key));
-
-        size_t val_sz = 0;
-        int rc = store.exists(
-            std::span<const uint8_t>(keyb, key_size), &val_sz).run_sync();
-        if (rc != 0) {
-            fprintf(stderr, "exists failed: thread=%d i=%lu rc=%d\n",
-                    thread_id, static_cast<unsigned long>(i), rc);
-            ++result.errors;
-            return result;
-        }
-    }
-    result.exists_secs = now_secs() - t0;
-
-    // DEL
-    t0 = now_secs();
-    for (uint64_t i = 0; i < cfg.ops; ++i) {
-        uint64_t key = (thread_seed + i) * kPrime;
-        uint64_t key_size = 8 + (key % 24);
-
-        std::memcpy(keyb, &key, sizeof(key));
-
-        int rc = store.del(
-            std::span<const uint8_t>(keyb, key_size)).run_sync();
-        if (rc != 0) {
-            fprintf(stderr, "del failed: thread=%d i=%lu rc=%d\n",
-                    thread_id, static_cast<unsigned long>(i), rc);
-            ++result.errors;
-            return result;
-        }
-    }
-    result.del_secs = now_secs() - t0;
-
     return result;
 }
 
@@ -286,8 +360,7 @@ static int run_bench(const BenchConfig& cfg) {
     sc.path = cfg.file;
     sc.size = cfg.store_size;
     sc.grain_size = cfg.grain_size;
-    sc.initial_tables = 4;
-    sc.index_bits = 14;
+    sc.segment_size = cfg.segment_size;
     // Every run starts empty: a file is removed between runs, but an SPDK
     // namespace keeps the previous run's store.
     sc.force_destroy = true;
@@ -313,12 +386,15 @@ static int run_bench(const BenchConfig& cfg) {
 
         printf("PUTs Aggregate time=%lfs Mops/sec=%lf\n",
                r.put_secs, cfg.ops / (r.put_secs * 1e6));
-        printf("GETs Aggregate time=%lfs Mops/sec=%lf\n",
-               r.get_secs, cfg.ops / (r.get_secs * 1e6));
-        printf("EXISTs Aggregate time=%lfs Mops/sec=%lf\n",
-               r.exists_secs, cfg.ops / (r.exists_secs * 1e6));
-        printf("DELs Aggregate time=%lfs Mops/sec=%lf\n",
-               r.del_secs, cfg.ops / (r.del_secs * 1e6));
+        if (!cfg.put_only) {
+            printf("GETs Aggregate time=%lfs Mops/sec=%lf\n",
+                   r.get_secs, cfg.ops / (r.get_secs * 1e6));
+            printf("EXISTs Aggregate time=%lfs Mops/sec=%lf\n",
+                   r.exists_secs, cfg.ops / (r.exists_secs * 1e6));
+            printf("DELs Aggregate time=%lfs Mops/sec=%lf\n",
+                   r.del_secs, cfg.ops / (r.del_secs * 1e6));
+        }
+        print_put_latency(std::move(r.put_ns));
 #ifdef UDEPOT_BUILD_SPDK
         // I/Os SPDK copied through a bounce buffer because their buffer was
         // not DMA memory: zero copy hands the device the store's own.
@@ -351,14 +427,21 @@ static int run_bench(const BenchConfig& cfg) {
 
         printf("PUTs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
                max_put, total_ops / (max_put * 1e6), cfg.threads);
-        printf("GETs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
-               max_get, total_ops / (max_get * 1e6), cfg.threads);
-        printf("EXISTs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
-               max_exists, total_ops / (max_exists * 1e6), cfg.threads);
-        printf("DELs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
-               max_del, total_ops / (max_del * 1e6), cfg.threads);
+        if (!cfg.put_only) {
+            printf("GETs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
+                   max_get, total_ops / (max_get * 1e6), cfg.threads);
+            printf("EXISTs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
+                   max_exists, total_ops / (max_exists * 1e6), cfg.threads);
+            printf("DELs Aggregate time=%lfs Mops/sec=%lf threads=%d\n",
+                   max_del, total_ops / (max_del * 1e6), cfg.threads);
+        }
+        std::vector<uint32_t> all;
+        for (auto& r : results)
+            all.insert(all.end(), r.put_ns.begin(), r.put_ns.end());
+        print_put_latency(std::move(all));
     }
 
+    printf("TABLES %u\n", store.directory().num_tables());
     store.close();
     return 0;
 }
@@ -376,7 +459,15 @@ static void usage() {
         "  --backend <b>  posix, aio, uring or spdk (default: posix); spdk\n"
         "                 uses the namespace UDEPOT_NVMEF names, whole\n"
         "  --compare <r>  Copy vs zero copy in one store: r rounds of a\n"
-        "                 batch of -w ops each way, order alternating\n");
+        "                 batch of -w ops each way, order alternating\n"
+        "  --segment-size <grains>  Segment size, which also sizes the\n"
+        "                 directory's tables; small values force grows\n"
+        "  --latency      Print put latency percentiles\n"
+        "  --rate <n>     Open loop: n puts/s per thread, latency counted\n"
+        "                 from each put's due time (with --latency)\n"
+        "  --qd <n>       Operations each thread keeps in flight, in every\n"
+        "                 phase (default: 1)\n"
+        "  --put-only     Run only the put phase\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -402,6 +493,16 @@ int main(int argc, char* argv[]) {
             cfg.backend = argv[++i];
         } else if (arg == "--compare" && i + 1 < argc) {
             cfg.compare_rounds = std::stoi(argv[++i]);
+        } else if (arg == "--latency") {
+            cfg.latency = true;
+        } else if (arg == "--put-only") {
+            cfg.put_only = true;
+        } else if (arg == "--qd" && i + 1 < argc) {
+            cfg.qd = std::stoul(argv[++i]);
+        } else if (arg == "--rate" && i + 1 < argc) {
+            cfg.rate = std::stod(argv[++i]);
+        } else if (arg == "--segment-size" && i + 1 < argc) {
+            cfg.segment_size = std::stoull(argv[++i]);
         } else if (arg == "-h" || arg == "--help") {
             usage();
             return 0;

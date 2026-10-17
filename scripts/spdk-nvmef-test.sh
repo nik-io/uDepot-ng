@@ -23,12 +23,17 @@
 #   perf   the SPDK zero-copy perf invariant, scripts/perf-zerocopy.sh spdk
 #          (CI: its own job, on a Release build, as the other backends')
 #   all    both (default)
+#   regression  the v0 perf gate against uDepot over SPDK,
+#          scripts/perf-regression.sh with backend spdk (both stores on the
+#          target's namespace in turn); REGRESSION_OPS, REGRESSION_ITERS
+#          and REGRESSION_QD tune it. Needs uDepot built (the gate builds
+#          it with BUILD_SPDK=1). Not in CI.
 set -uo pipefail
 
 BUILD_DIR="${1:-build}"
 MODE="${2:-all}"
-case "$MODE" in tests|perf|all) ;; *)
-    echo "usage: spdk-nvmef-test.sh [build_dir] [tests|perf|all]" >&2; exit 2 ;;
+case "$MODE" in tests|perf|all|regression) ;; *)
+    echo "usage: spdk-nvmef-test.sh [build_dir] [tests|perf|all|regression]" >&2; exit 2 ;;
 esac
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SPDK_DIR="${SPDK_DIR:-$HERE/extern/spdk}"
@@ -74,7 +79,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 TESTS=()
-if [ "$MODE" != "perf" ]; then
+if [ "$MODE" = "tests" ] || [ "$MODE" = "all" ]; then
     [ -f "$TEST_LIST" ] || fail "$TEST_LIST not found -- configure with -DUDEPOT_BUILD_SPDK=ON"
     while IFS= read -r name; do
         [ -n "$name" ] || continue
@@ -159,12 +164,24 @@ for t in "${TESTS[@]}"; do
     [ $rc -eq 0 ] || fail "$(basename "$t") failed (rc=$rc)"
 done
 
+# ── v0 perf gate against uDepot over SPDK ───────────────────────────────────
+if [ "$MODE" = "regression" ]; then
+    log "perf gate against uDepot over SPDK"
+    env "${INIT_ENV[@]}" UDEPOT_NVMEF="$TADDR:$TPORT:$NQN" \
+        LD_LIBRARY_PATH="$DPDK_LIB" NG_BUILD="$HERE/$BUILD_DIR" \
+        timeout "${PERF_TIMEOUT:-3600}" "${PIN[@]}" \
+        "$HERE/scripts/perf-regression.sh" "${REGRESSION_OPS:-5000}" \
+        "${REGRESSION_ITERS:-9}" 5 spdk "${REGRESSION_QD:-1}"
+    rc=$?
+    [ $rc -eq 0 ] || fail "perf gate against uDepot over SPDK failed (rc=$rc)"
+fi
+
 # ── zero-copy perf invariant over SPDK ──────────────────────────────────────
 # scripts/perf-zerocopy.sh spdk: zero copy must be strictly faster than copy
 # on PUT and GET (compared batch by batch inside each run, against the
 # target), and must bounce no I/O through a DMA copy. Each run starts a
 # fresh store.
-if [ "$MODE" != "tests" ]; then
+if [ "$MODE" = "perf" ] || [ "$MODE" = "all" ]; then
     log "zero-copy perf invariant over SPDK"
     env "${INIT_ENV[@]}" UDEPOT_NVMEF="$TADDR:$TPORT:$NQN" \
         LD_LIBRARY_PATH="$DPDK_LIB" timeout "${PERF_TIMEOUT:-900}" \
@@ -184,4 +201,5 @@ case "$MODE" in
     tests) log "OK: SPDK backend tests passed over the soft NVMe-oF target" ;;
     perf)  log "OK: SPDK zero-copy perf invariant passed over the soft NVMe-oF target" ;;
     all)   log "OK: SPDK backend tests and zero-copy perf invariant passed over the soft NVMe-oF target" ;;
+    regression) log "OK: uDepot-ng within tolerance of uDepot over the soft NVMe-oF target" ;;
 esac

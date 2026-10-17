@@ -67,7 +67,7 @@ Quotes below are from the paper; section numbers are the paper's.
   *"the caller decides whether to update an entry in-place or continue the
   search for a free entry where they left off."*
 
-## Resize (§4.3): incremental, no IO
+## Resize (§4.3): incremental, no IO (not adopted)
 
 - The directory grows in powers of two. Only fingerprints are needed to place
   entries, so there is no IO.
@@ -92,9 +92,20 @@ Quotes below are from the paper; section numbers are the paper's.
   snapshot (see PR #3 review, finding 4).
 - Figure 4: lock region r of old table ht0 migrates to the same region r of the
   two new tables ht'00 and ht'10.
-- uDepot-ng status: not implemented yet. The current freeze-and-synchronize grow
-  is a stopgap; the incremental resize is its own PR. Legacy never finished it
-  (`uDepotDirMapOR`'s shadow directory is the started half).
+- uDepot-ng status: **not implemented, by decision.** uDepot-ng grows with
+  freeze-and-copy (`docs/architecture.md`, "Directory"), as legacy grows with
+  a stop-the-world `uDepotDirectoryMap::grow()`; legacy never finished the
+  incremental resize either (`uDepotDirMapOR`'s shadow directory is the
+  started half). PR #8 implemented it and measured put tail latency while the
+  directory grew 1 -> 32 tables, open loop: incremental won with two writers
+  on posix, but lost to the freeze with one writer (p99 83-89 ms against
+  2-8 ms) and on aio. Two causes: the new tables' first-touch page faults
+  (~216 us per stripe on a cloud VM, ten times the slot copy) land on the
+  writer's put path, where the freeze takes them on the waker before it
+  freezes; and on aio a put's commit, so its migrations, runs on the single
+  completion poller. Fixing both needed more machinery (next tables prepared
+  ahead, migration moved off the poller) for an uncertain benefit, so it was
+  dropped. Revisit only with a measured need.
 
 ## Metadata and persistence (§4.4)
 
@@ -128,10 +139,12 @@ Quotes below are from the paper; section numbers are the paper's.
   - After a crash, the log scan decides, by segment timestamp.
 - Legacy implements this with tables mmap'd onto index segments, footers written
   and `msync`ed at shutdown, `restore()` first, `crash_recovery()` as fallback,
-  and footers invalidated right after a successful restore. uDepot-ng flushes
-  with explicit writes at `close()` instead of mmap (SPDK has no mmap), in
-  legacy's layout. Status: implemented (`docs/architecture.md`, "Index
-  segments"), except the periodic flush, deferred: see there for why.
+  and footers invalidated right after a successful restore. uDepot-ng does the
+  same with one segment per table for the table's life, sized by it, mapped
+  as legacy maps it on AIO and SPDK (anonymous, the full segment, huge pages
+  when it is a 2 MiB multiple), written back at `close()` and read in on
+  restore. Status: implemented (`docs/architecture.md`, "Index segments"),
+  except the periodic flush, deferred: see there for why.
 
 ## KV operations (§4.5)
 

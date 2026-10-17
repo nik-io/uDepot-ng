@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "city.h"
@@ -31,8 +32,6 @@ protected:
         config_.path = path_.c_str();
         config_.size = kStoreSize;
         config_.grain_size = 512;
-        config_.initial_tables = 2;
-        config_.index_bits = 10;
         config_.force_destroy = true;
 
         ASSERT_EQ(store_.open(config_), 0);
@@ -284,37 +283,31 @@ TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
 // different keys.  The store must find each one via disk verification,
 // not stop at the first tag match.
 
-// Brute-force search for a pair of short keys whose CityHash64 values
-// share the same tag (top 8 bits) and bucket (low index_bits bits).
+// Search for a pair of short keys whose CityHash64 values share the same
+// tag (top 8 bits, so also the table) and bucket (low index_bits bits).
 static std::pair<std::string, std::string> find_colliding_keys(
     uint32_t index_bits) {
-    uint64_t bucket_mask = (1ULL << index_bits) - 1;
-    // Try sequential integer keys; CityHash spreads them well, so two
-    // that collide on both tag and bucket take a little searching.
-    for (int a = 0; a < 100000; ++a) {
-        std::string ka = "col_a_" + std::to_string(a);
-        uint64_t ha = CityHash64(ka.data(), ka.size());
-        uint8_t tag_a = static_cast<uint8_t>(ha >> 56);
-        uint64_t bucket_a = ha & bucket_mask;
-
-        for (int b = a + 1; b < a + 200; ++b) {
-            std::string kb = "col_b_" + std::to_string(b);
-            uint64_t hb = CityHash64(kb.data(), kb.size());
-            uint8_t tag_b = static_cast<uint8_t>(hb >> 56);
-            uint64_t bucket_b = hb & bucket_mask;
-
-            if (tag_a == tag_b && bucket_a == bucket_b)
-                return {ka, kb};
-        }
+    const uint64_t bucket_mask = (1ULL << index_bits) - 1;
+    // Birthday search: about 2^((8 + index_bits) / 2) keys find a pair.
+    std::unordered_map<uint64_t, std::string> seen;
+    for (int a = 0; a < (1 << 22); ++a) {
+        std::string k = "col_" + std::to_string(a);
+        uint64_t h = CityHash64(k.data(), k.size());
+        auto [it, inserted] = seen.emplace((h >> 56) << 40 | (h & bucket_mask), k);
+        if (!inserted) return {it->second, k};
     }
-    // Collision must be found — 10-bit bucket × 8-bit tag = 18 bits, so
-    // any window of ~500k pairs will contain dozens.
     ADD_FAILURE() << "no colliding pair found";
     return {"", ""};
 }
 
+// The width of the store's tables, which its segment size sets.
+template <typename Store>
+static uint32_t table_index_bits(Store& store) {
+    return store.directory().snapshot().tables[0]->index_bits();
+}
+
 TEST_F(StoreTest, GetWithTagCollisionReturnsCorrectValue) {
-    auto [key_a, key_b] = find_colliding_keys(config_.index_bits);
+    auto [key_a, key_b] = find_colliding_keys(table_index_bits(store_));
     ASSERT_FALSE(key_a.empty());
 
     ASSERT_EQ(store_.put(key_a, "val_a").run_sync(), 0);
@@ -333,7 +326,7 @@ TEST_F(StoreTest, GetWithTagCollisionReturnsCorrectValue) {
 }
 
 TEST_F(StoreTest, DeleteWithTagCollisionRemovesCorrectKey) {
-    auto [key_a, key_b] = find_colliding_keys(config_.index_bits);
+    auto [key_a, key_b] = find_colliding_keys(table_index_bits(store_));
     ASSERT_FALSE(key_a.empty());
 
     ASSERT_EQ(store_.put(key_a, "val_a").run_sync(), 0);
@@ -352,7 +345,7 @@ TEST_F(StoreTest, DeleteWithTagCollisionRemovesCorrectKey) {
 }
 
 TEST_F(StoreTest, ExistsWithTagCollisionFindsCorrectKey) {
-    auto [key_a, key_b] = find_colliding_keys(config_.index_bits);
+    auto [key_a, key_b] = find_colliding_keys(table_index_bits(store_));
     ASSERT_FALSE(key_a.empty());
 
     ASSERT_EQ(store_.put(key_a, "aaa").run_sync(), 0);
