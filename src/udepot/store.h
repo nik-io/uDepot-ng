@@ -307,6 +307,13 @@ public:
     inline static std::atomic<IndexSegmentHook> index_segment_test_hook{
         nullptr};
 
+    // Test seam, never set in production: called before each of uDepot's
+    // own reads and writes (recovery, index, segment metadata, GC) with
+    // whether it writes, where and how much; returning -errno fails that
+    // I/O with it, as the device would. 0 lets it go on.
+    using InternalIoHook = int (*)(bool write, off_t offset, size_t count);
+    inline static std::atomic<InternalIoHook> internal_io_test_hook{nullptr};
+
     Directory& directory() { return *directory_; }
     const Directory& directory() const { return *directory_; }
     Rcu& rcu() { return rcu_; }
@@ -406,8 +413,11 @@ private:
     int persist_seg_md(uint64_t grain_start, uint64_t timestamp,
                        uint8_t ctlr_type);
     bool validate_seg_md(const salsa::salsa_seg_md& md) const;
-    // Reads and validates the metadata of the segment starting at seg_base.
-    bool read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md);
+    // Reads and validates the metadata of the segment starting at seg_base:
+    // 0, -ENODATA if the segment has no valid metadata of this store, or
+    // -errno if it could not be read. A read error is never "no metadata":
+    // the segment may hold records, or an index footer, that matter.
+    int read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md);
 
     // uDepot's own synchronous I/O (recovery, index persistence, GC). It
     // shares the backend's queue with the caller's operations, so a
@@ -416,10 +426,18 @@ private:
     template <typename Start>
     static auto run_internal(Start&& start);
     ssize_t pread_internal(void* buf, size_t count, off_t offset) {
+        if (int rc = internal_io_fault(false, offset, count); rc != 0)
+            return rc;
         return run_internal([&] { return io_.pread(buf, count, offset); });
     }
     ssize_t pwrite_internal(const void* buf, size_t count, off_t offset) {
+        if (int rc = internal_io_fault(true, offset, count); rc != 0)
+            return rc;
         return run_internal([&] { return io_.pwrite(buf, count, offset); });
+    }
+    static int internal_io_fault(bool write, off_t offset, size_t count) {
+        auto hook = internal_io_test_hook.load(std::memory_order_relaxed);
+        return hook ? hook(write, offset, count) : 0;
     }
 
     // ── Index segments (paper §4.4) ─────────────────────────────────────
@@ -488,7 +506,9 @@ private:
     // Restore the newest complete index, if there is one (*restored), and
     // invalidate every valid index footer on the device either way, so a
     // later crash cannot bring back an index older than the log. Returns
-    // -errno only if that invalidation failed.
+    // -errno if a segment's metadata, header or footer could not be read
+    // (it may hold a footer that must be invalidated) or the invalidation
+    // failed.
     int restore_index(bool* restored);
     CoroTask<int> tombstone_grains(uint64_t pba, uint64_t seg_ts,
                                    uint64_t* grains);

@@ -75,6 +75,9 @@ Scm::~Scm()
 	const int err = sto_capacity_mgr_dtr(scm_);
 	if (err)
 		ERR("sto_capacity_mgr_dtr failed with err=%d", err);
+	// A refusal leaks the manager and its GC: an owner tore it down with
+	// controllers registered or its threads running.
+	assert(0 == err);
 	DBG("SCM used capacity=%lu grains", used_capacity_.load());
 	scm_ = nullptr;
 }

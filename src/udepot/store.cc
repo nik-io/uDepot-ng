@@ -178,6 +178,8 @@ int uDepot<IO>::persist_seg_md(uint64_t grain_start, uint64_t timestamp,
     std::memset(buf.data, 0, md_bytes);
     std::memcpy(buf.data, &md, sizeof(md));
 
+    if (internal_io_fault(true, grain_to_offset(grain_start), md_bytes) != 0)
+        return -EIO;
     ssize_t w = io_.pwrite_sync(buf.data, md_bytes, grain_to_offset(grain_start));
     return (w == static_cast<ssize_t>(md_bytes)) ? 0 : -EIO;
 }
@@ -197,16 +199,17 @@ bool uDepot<IO>::validate_seg_md(const salsa::salsa_seg_md& md) const {
 }
 
 template <typename IO>
-bool uDepot<IO>::read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md) {
+int uDepot<IO>::read_seg_md(uint64_t seg_base, salsa::salsa_seg_md* md) {
     uint64_t md_grain = seg_base + get_seg_size() - seg_md_grains_;
     size_t md_bytes = static_cast<size_t>(seg_md_grains_) * grain_size_;
     IoBuffer md_buf = io_.alloc_buffer(md_bytes);
-    if (!md_buf.data) return false;
+    if (!md_buf.data) return -ENOMEM;
     ssize_t r = pread_internal(md_buf.data, md_bytes,
                                grain_to_offset(md_grain));
-    if (r < static_cast<ssize_t>(sizeof(salsa::salsa_seg_md))) return false;
+    if (r < 0) return static_cast<int>(r);
+    if (r != static_cast<ssize_t>(md_bytes)) return -EIO;
     std::memcpy(md, md_buf.data, sizeof(*md));
-    return validate_seg_md(*md);
+    return validate_seg_md(*md) ? 0 : -ENODATA;
 }
 
 // ── Crash recovery ─────────────────────────────────────────────────────────
@@ -305,10 +308,14 @@ int uDepot<IO>::crash_recovery() {
         uint64_t seg_idx = scm_->grain_to_seg_idx(seg_base);
 
         // Read segment metadata from tail. Index segments hold no records.
+        // A segment that cannot be read fails the open: skipped, its
+        // records would be lost and the segment reused.
         salsa::salsa_seg_md seg_md;
-        if (!read_seg_md(seg_base, &seg_md) ||
-            seg_md.ctlr_type != get_ctlr_id())
+        if (int rc = read_seg_md(seg_base, &seg_md); rc == -ENODATA)
             continue;
+        else if (rc != 0)
+            return rc;
+        if (seg_md.ctlr_type != get_ctlr_id()) continue;
 
         uint64_t ts = seg_md.timestamp;
         seg_timestamps_[seg_idx].store(ts, std::memory_order_relaxed);
@@ -370,25 +377,32 @@ int uDepot<IO>::crash_recovery() {
     // segment in full first, and invalidated the dead grains after; past
     // the logical capacity salsa dropped the excess, checked by an assert
     // only, and the invalidations underflowed its used count.)
+    //
+    // The log can hold more live data than the store may: rejected writes
+    // come back after a crash (paper §4.5). The device is then full; left
+    // to an operator. Checked against the capacity user writes get, not
+    // the larger one restore_grain_range() allows (it charges as GC
+    // relocation does).
+    uint64_t live = 0;
+    for (uint64_t v : valid) live += v;
+    if (live > scm_->get_max_capacity()) {
+        std::fprintf(stderr,
+                     "udepot: crash recovery found %lu grains of live data, "
+                     "more than the store's capacity of %lu (%u per mille "
+                     "overprovisioned); the store cannot open until it has "
+                     "more space\n",
+                     static_cast<unsigned long>(live),
+                     static_cast<unsigned long>(scm_->get_max_capacity()),
+                     overprovision_);
+        return -ENOSPC;
+    }
     for (uint64_t seg_base : data_segs) {
         const uint64_t n = valid[scm_->grain_to_seg_idx(seg_base)];
         if (n == 0) continue;
+        // Within the capacity, a failure is a broken count or segment.
         if (int rc = scm_->restore_grain_range(seg_base, n, get_ctlr_id());
-            rc != 0) {
-            // The log holds more live data than the store may: rejected
-            // writes come back after a crash (paper §4.5). The device is
-            // full; left to an operator.
-            uint64_t total = 0;
-            for (uint64_t v : valid) total += v;
-            std::fprintf(stderr,
-                         "udepot: crash recovery found %lu grains of live "
-                         "data, more than the store's capacity (%u per mille "
-                         "overprovisioned); the store cannot open until it "
-                         "has more space (%s)\n",
-                         static_cast<unsigned long>(total), overprovision_,
-                         std::strerror(rc));
-            return -ENOSPC;
-        }
+            rc != 0)
+            return -EIO;
     }
 
     // Restore seg_alloc_nr so future allocations get higher timestamps.
@@ -467,17 +481,17 @@ uint32_t uDepot<IO>::index_md_csum(const T& md) const {
 
 template <typename IO>
 void uDepot<IO>::index_seg_md_callback(uint64_t md_grain) {
-    // Whatever this segment held is about to be overwritten: no record in
-    // it can come back.
+    const bool ok = persist_seg_md(md_grain, get_seg_alloc_nr(),
+                                   index_ctlr_->get_ctlr_id()) == 0;
     uint64_t seg_idx = scm_->grain_to_seg_idx(md_grain);
-    if (seg_idx < num_segments_) {
-        seg_md_ok_[seg_idx].store(false, std::memory_order_release);
-        seg_live_[seg_idx].store(false, std::memory_order_release);
-    }
-    // A failed write leaves the segment without valid metadata, and the
-    // next open without this index: it scans the log.
-    (void)persist_seg_md(md_grain, get_seg_alloc_nr(),
-                         index_ctlr_->get_ctlr_id());
+    if (seg_idx >= num_segments_) return;
+    // allocate_index_segment() hands the segment out only if this landed.
+    seg_md_ok_[seg_idx].store(ok, std::memory_order_release);
+    // Once the index's metadata is on the device, no record the segment
+    // held can come back. Until then, or if the write failed, its old
+    // metadata and records may still be there: seg_live_ stays as it was,
+    // so GC keeps every tombstone they could need.
+    if (ok) seg_live_[seg_idx].store(false, std::memory_order_release);
 }
 
 // Never salsa's allocate_grains(), which waits for a segment without a
@@ -491,8 +505,18 @@ int uDepot<IO>::allocate_index_segment(uint64_t net_grains, u64* grain) {
         if (int rc = hook(); rc != 0) return rc;
     }
     int rc = index_ctlr_->allocate_grains_no_wait(net_grains, grain);
-    if (rc == 0) return 0;
-    return rc == EAGAIN ? -EAGAIN : -ENOSPC;
+    if (rc != 0) return rc == EAGAIN ? -EAGAIN : -ENOSPC;
+    // As for user writes (try_allocate_grains): a segment whose metadata
+    // could not be written is not used. (Salsa runs the metadata callback
+    // inside the allocation: an index allocation fills a segment, so each
+    // one stages a new segment.)
+    if (!seg_md_ok_[scm_->grain_to_seg_idx(*grain)].load(
+            std::memory_order_acquire)) {
+        index_ctlr_->invalidate_grains(*grain, net_grains, false);
+        index_ctlr_->release_grains(*grain, net_grains);
+        return -EIO;
+    }
+    return 0;
 }
 
 template <typename IO>
@@ -691,16 +715,23 @@ int uDepot<IO>::restore_index(bool* restored) {
         ssize_t r = pread_internal(md_buf.data, md_chunk,
                                    grain_to_offset(grain) +
                                        static_cast<off_t>(pos));
-        if (r != static_cast<ssize_t>(md_chunk)) return false;
+        if (r < 0) return static_cast<int>(r);
+        if (r != static_cast<ssize_t>(md_chunk)) return -EIO;
         std::memcpy(out, static_cast<uint8_t*>(md_buf.data) + at, len);
-        return true;
+        return 0;
     };
 
+    // A read error fails the open. A segment passed over could hold a
+    // valid footer, which would then not be invalidated below, and a later
+    // crash would restore that index over everything written since.
     for (auto it = scm_->begin(); it != scm_->end(); ++it) {
         const uint64_t seg_base = (*it).grain_start;
         const uint64_t seg_idx = scm_->grain_to_seg_idx(seg_base);
         salsa::salsa_seg_md seg_md;
-        if (!read_seg_md(seg_base, &seg_md)) continue;
+        if (int rc = read_seg_md(seg_base, &seg_md); rc == -ENODATA)
+            continue;
+        else if (rc != 0)
+            return rc;
         if (seg_md.ctlr_type == get_ctlr_id()) {
             data_ts[seg_idx] = seg_md.timestamp;
             max_data_ts = std::max(max_data_ts, seg_md.timestamp);
@@ -710,12 +741,14 @@ int uDepot<IO>::restore_index(bool* restored) {
 
         IndexHdr hdr;
         IndexFtr ftr;
-        if (!read_md(seg_base, 0, &hdr, sizeof(hdr), 0)) continue;
+        if (int rc = read_md(seg_base, 0, &hdr, sizeof(hdr), 0); rc != 0)
+            return rc;
         bool hdr_ok = hdr.csum == index_md_csum(hdr);
         if (hdr_ok) index_ts_ = std::max(index_ts_, hdr.ts);
-        if (!read_md(seg_base, net_bytes - md_chunk, &ftr, sizeof(ftr),
-                     md_chunk - kIndexMdBytes))
-            continue;
+        if (int rc = read_md(seg_base, net_bytes - md_chunk, &ftr,
+                             sizeof(ftr), md_chunk - kIndexMdBytes);
+            rc != 0)
+            return rc;
         if (ftr.csum != index_md_csum(ftr)) continue;
         index_ts_ = std::max(index_ts_, ftr.ts);
         // A valid footer is cleared below whatever happens; only those
@@ -1492,14 +1525,20 @@ void uDepot<IO>::seg_md_callback(u64 grain_start, u64 /*grain_nr*/,
         hook(ts);
     uint64_t seg_idx = scm_->grain_to_seg_idx(grain_start);
     if (seg_idx >= num_segments_) return;
-    seg_timestamps_[seg_idx].store(ts, std::memory_order_release);
     // As uDepot's persist_seg_md: written before salsa stages the segment,
     // so it is on the device before any grain of it is handed out. This
     // may run on whichever thread found the stage queue empty, including an
     // I/O poller, hence the blocking write.
     bool ok = persist_seg_md(grain_start, ts, get_ctlr_id()) == 0;
+    if (ok) {
+        seg_timestamps_[seg_idx].store(ts, std::memory_order_release);
+        seg_live_[seg_idx].store(true, std::memory_order_release);
+    }
+    // If the write failed, no grain of the segment is handed out
+    // (try_allocate_grains, relocate), and the device still holds its old
+    // metadata and records: it keeps their timestamp, so GC keeps every
+    // tombstone they could need.
     seg_md_ok_[seg_idx].store(ok, std::memory_order_release);
-    seg_live_[seg_idx].store(true, std::memory_order_release);
 }
 
 template <typename IO>

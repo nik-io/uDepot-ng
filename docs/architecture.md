@@ -615,7 +615,10 @@ persistent source of truth is the log"*.
   plus one neighborhood, that fits between the header and the footer
   (`HashTable::index_bits_for`). The segment size is the only knob; tests
   get small tables from small segments. The directory starts with one
-  table, as uDepot's `init()` grows from none.
+  table, as uDepot's `init()` grows from none. A table's memory is all
+  touched at open, so the default segment (2^29 bytes) means up to 512 MiB
+  per table; the Python and JNI bindings open with 2 MiB segments instead,
+  the smallest that still map on huge pages (a table of 2^17 buckets).
 - **Memory** (`TableRegion`). An anonymous mapping of the whole segment,
   uDepot's mapping on its AIO and SPDK backends: read from the segment on
   restore, written back at close. As uDepot's fix for the shutdown overrun
@@ -675,7 +678,24 @@ persistent source of truth is the log"*.
 - **More live data than the store may hold after a crash: open fails.**
   Rejected writes come back after a crash (§4.5), and can take the log
   past the logical capacity. The device is then full: `open()` fails with
-  -ENOSPC, every time, with a message saying so, left to an operator.
+  -ENOSPC, every time, with a message giving the live data and the
+  capacity, left to an operator. The live data is summed and checked
+  against the capacity user writes get, before anything is charged:
+  `restore_grain_range` charges as GC relocation does, which may overshoot
+  the capacity by two segments, so it alone would let such a store through
+  to fail later for want of index segments, under the wrong message.
+- **A read error at open fails the open (-EIO).** Only valid metadata
+  that says "not this" lets a segment be passed over. A segment whose
+  metadata, or whose index header or footer, could not be read may hold
+  live records or a valid footer: skipped, the records would be lost and
+  the segment reused, or the footer left valid, so that a crash later in
+  the session restored that old index over everything written since.
+- **A segment whose metadata write fails is not used**, data or index
+  alike: no grain of it is handed out (a put gets -EIO, a grow fails the
+  writes that asked for it with -EIO). Until its new metadata is on the
+  device a segment keeps its old metadata and records, and keeps its old
+  timestamp and `seg_live_` too, so GC keeps every tombstone those records
+  could need.
 - **No room for the index after a crash: open fails, by decision.** Those
   same records can need more tables than the session had. If the device has
   no segment for every one, `open()` fails with -ENOSPC, every time, with a

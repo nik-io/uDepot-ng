@@ -90,6 +90,9 @@ public:
 	u64 get_seg_size(void) const;
 	u64 get_grain_size(void) const;
 	int provision_grains(u64 len, bool is_reloc = false);
+	// Grains that may be provisioned outside relocation: the device less
+	// its overprovisioning.
+	u64 get_max_capacity(void) const { return max_capacity_; }
 	void unprovision_grains(const u64 len) {
 		const u64 old_val __attribute__((unused)) = used_capacity_.fetch_sub(len);
 		assert(len <= old_val);

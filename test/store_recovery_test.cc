@@ -42,6 +42,9 @@ protected:
 
     void TearDown() override {
         uDepot<PosixIO>::index_footer_test_hook = nullptr;
+        uDepot<PosixIO>::index_segment_test_hook = nullptr;
+        uDepot<PosixIO>::internal_io_test_hook = nullptr;
+        uDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
         std::filesystem::remove(path_);
         std::filesystem::remove(crash_path());
     }
@@ -858,7 +861,7 @@ TEST_P(StoreIndexTest, RetiredTablesFreeTheirSegments) {
 // the store for an operator to give it space; it does not open without a
 // persistable index.
 TEST_P(StoreIndexTest, CrashRecoveryWithNoRoomForItsIndexDoesNotOpen) {
-    config_.size = 4 * 1024 * 1024;
+    config_.size = 4 * 1024 * 1024 + 4096;
     config_.segment_size = 64;  // 32 KiB
     {
         uDepot<PosixIO> store;
@@ -883,6 +886,10 @@ TEST_P(StoreIndexTest, CrashRecoveryWithNoRoomForItsIndexDoesNotOpen) {
 // grains: past the logical capacity salsa dropped the excess, and on a
 // churned device with little live data the used count underflowed, so
 // every write failed with -ENOSPC.
+//
+// Live includes the tombstones of deleted keys, and a key put again after
+// its delete no longer holds its tombstone: both are charged right, or the
+// fill is off by thousands of grains.
 TEST_P(StoreIndexTest, CrashRecoveryChargesOnlyLiveData) {
     config_.size = 4 * 1024 * 1024 + 4096;
     config_.segment_size = 64;  // 32 KiB
@@ -902,9 +909,16 @@ TEST_P(StoreIndexTest, CrashRecoveryChargesOnlyLiveData) {
         fresh = fill(store, "fresh");
         store.close();
     }
-    ASSERT_GT(fresh, 1000);
+    ASSERT_GT(fresh, 5000);
     constexpr int kLive = 100;
     constexpr int kRounds = 200;
+    constexpr int kDeleted = 4000;  // put, then deleted
+    constexpr int kReput = 2000;    // of those, put again
+    auto del_key = [](int d) { return "del" + std::to_string(d); };
+    // Tombstones of keys still deleted at the crash that GC dropped (lazy
+    // reclaim): they are not live after it.
+    static std::atomic<int> dropped;
+    dropped = 0;
     {
         uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);  // a new store
@@ -916,7 +930,20 @@ TEST_P(StoreIndexTest, CrashRecoveryChargesOnlyLiveData) {
                 ASSERT_EQ(store.put(make_key(i),
                                     make_val(i + round * kLive)).run_sync(),
                           0);
+        for (int d = 0; d < kDeleted; ++d)
+            ASSERT_EQ(store.put(del_key(d), "x").run_sync(), 0);
+        uDepot<PosixIO>::gc_tombstone_drop_test_hook =
+            [](std::span<const uint8_t> key, uint64_t) {
+                const std::string k(key.begin(), key.end());
+                if (k.starts_with("del") && std::stoi(k.substr(3)) >= kReput)
+                    ++dropped;
+            };
+        for (int d = 0; d < kDeleted; ++d)
+            ASSERT_EQ(store.del(del_key(d)).run_sync(), 0);
+        for (int d = 0; d < kReput; ++d)
+            ASSERT_EQ(store.put(del_key(d), "y").run_sync(), 0);
         crash(store);
+        uDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
     }
     uDepot<PosixIO> store;
     ASSERT_EQ(store.open(reopen_config()), 0);
@@ -924,11 +951,15 @@ TEST_P(StoreIndexTest, CrashRecoveryChargesOnlyLiveData) {
     for (int i = 0; i < kLive; ++i)
         ASSERT_EQ(get_value(store, make_key(i)),
                   make_val(i + (kRounds - 1) * kLive));
+    for (int d = 0; d < kDeleted; ++d)
+        ASSERT_EQ(get_value(store, del_key(d)), d < kReput ? std::string("y") : "<" + std::to_string(-ENOENT) + ">")
+            << del_key(d);
+    // Every record and tombstone here takes one grain, as a fill's put.
+    const int live = kLive + kReput + (kDeleted - kReput - dropped.load());
     const int after = fill(store, "after");
-    // The live keys take about what kLive fresh ones do; allow GC some
-    // slack either way.
-    EXPECT_GT(after, (fresh - kLive) * 9 / 10) << "capacity lost";
-    EXPECT_LT(after, fresh + fresh / 10) << "capacity counted twice";
+    // GC's timing moves a fill by a few hundred either way.
+    EXPECT_NEAR(after, fresh - live, fresh / 10)
+        << "live " << live << ", fresh " << fresh;
     store.close();
 }
 
@@ -937,7 +968,7 @@ TEST_P(StoreIndexTest, CrashRecoveryChargesOnlyLiveData) {
 // fails with -ENOSPC, every time. (It used to trip an assert in salsa, or
 // without asserts open with a broken used count.)
 TEST_P(StoreIndexTest, CrashRecoveryBeyondCapacityDoesNotOpen) {
-    config_.size = 4 * 1024 * 1024;
+    config_.size = 4 * 1024 * 1024 + 4096;
     config_.segment_size = 64;  // 32 KiB
     {
         uDepot<PosixIO> store;
@@ -961,6 +992,190 @@ TEST_P(StoreIndexTest, CrashRecoveryBeyondCapacityDoesNotOpen) {
                   std::string::npos)
             << "failed for another reason: " << err;
     }
+}
+
+// Just past the capacity, by no more than salsa lets relocation overshoot
+// it (restore_grain_range charges as relocation does): the open fails for
+// the capacity. It used to restore the data, then fail for want of
+// segments for the index, which named the wrong cause.
+TEST_P(StoreIndexTest, CrashRecoveryJustBeyondCapacityNamesTheCapacity) {
+    config_.size = 4 * 1024 * 1024 + 4096;
+    config_.segment_size = 64;  // 32 KiB
+    // Salsa's capacity, as Scm::init computes it; every record here takes
+    // one grain.
+    const int capacity = static_cast<int>(
+        config_.size / config_.grain_size * (1000 - config_.overprovision) /
+        1000);
+    constexpr int kLive = 3000;
+    const int rejected = capacity - kLive + 16;
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        for (int i = 0; i < kLive; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        for (int i = kLive; i < kLive + rejected; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i),
+                                udepot::PutMode::kReplace).run_sync(),
+                      -ENOENT);
+        crash(store);
+    }
+    uDepot<PosixIO> store;
+    testing::internal::CaptureStderr();
+    const int rc = store.open(reopen_config());
+    const std::string err = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(rc, -ENOSPC);
+    unsigned long live = 0, cap = 0;
+    const size_t at = err.find("crash recovery found");
+    ASSERT_NE(at, std::string::npos) << "failed for another reason: " << err;
+    ASSERT_EQ(std::sscanf(err.c_str() + at,
+                          "crash recovery found %lu grains of live data, "
+                          "more than the store's capacity of %lu",
+                          &live, &cap),
+              2)
+        << err;
+    // The case this covers: within what relocation may overshoot.
+    EXPECT_GT(live, cap);
+    EXPECT_LE(live, cap + 2 * config_.segment_size) << err;
+}
+
+// A read error while open looks for the index fails the open. It used to
+// pass over the segment and scan the log, leaving that segment's footer
+// valid: after more writes and a crash, the next open restored the old
+// index, and every write since was lost.
+TEST_P(StoreIndexTest, AReadErrorWhileRestoringTheIndexFailsTheOpen) {
+    config_.size = 16 * 1024 * 1024 + 4096;
+    config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
+    constexpr int kKeys = 100;
+    static off_t header;
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        for (int i = 0; i < kKeys; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        header = static_cast<off_t>(
+                     store.directory().snapshot().tables[0]->region().grain()) *
+                 config_.grain_size;
+        store.close();
+    }
+    uDepot<PosixIO>::internal_io_test_hook = [](bool write, off_t off,
+                                                size_t) {
+        return !write && off == header ? -EIO : 0;
+    };
+    {
+        uDepot<PosixIO> store;
+        EXPECT_EQ(store.open(reopen_config()), -EIO);
+    }
+    uDepot<PosixIO>::internal_io_test_hook = nullptr;
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(reopen_config()), 0);
+        EXPECT_TRUE(store.index_restored());
+        for (int i = 0; i < kKeys; ++i)
+            ASSERT_EQ(get_value(store, make_key(i)), make_val(i));
+        ASSERT_EQ(store.put(make_key(0), "after").run_sync(), 0);
+        ASSERT_EQ(store.put("new", "after").run_sync(), 0);
+        crash(store);
+    }
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(reopen_config()), 0);
+    EXPECT_FALSE(store.index_restored());
+    EXPECT_EQ(get_value(store, make_key(0)), "after");
+    EXPECT_EQ(get_value(store, "new"), "after");
+    for (int i = 1; i < kKeys; ++i)
+        ASSERT_EQ(get_value(store, make_key(i)), make_val(i));
+    store.close();
+}
+
+// A segment whose metadata cannot be read fails crash recovery's open. It
+// used to be skipped: its records were lost, and the segment free to be
+// written over.
+TEST_P(StoreIndexTest, AReadErrorInCrashRecoveryFailsTheOpen) {
+    config_.size = 4 * 1024 * 1024 + 4096;
+    config_.segment_size = 64;  // 32 KiB
+    constexpr int kKeys = 500;
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        for (int i = 0; i < kKeys; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        crash(store);
+    }
+    // Only crash recovery reads a segment's records: fail the metadata
+    // read that follows the first such read.
+    static uint64_t seg_bytes;
+    static std::atomic<int> state;  // 0: before, 1: armed, 2: failed one
+    seg_bytes = config_.segment_size * config_.grain_size;
+    state = 0;
+    uDepot<PosixIO>::internal_io_test_hook = [](bool write, off_t off,
+                                                size_t count) {
+        if (write) return 0;
+        const uint64_t end = static_cast<uint64_t>(off) + count;
+        if (off % seg_bytes == 0 && count > 4096 && state == 0) state = 1;
+        else if (end % seg_bytes == 0 && count < seg_bytes && state == 1) {
+            state = 2;
+            return -EIO;
+        }
+        return 0;
+    };
+    {
+        uDepot<PosixIO> store;
+        EXPECT_EQ(store.open(reopen_config()), -EIO);
+    }
+    uDepot<PosixIO>::internal_io_test_hook = nullptr;
+    ASSERT_EQ(state.load(), 2);
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(reopen_config()), 0);
+    for (int i = 0; i < kKeys; ++i)
+        ASSERT_EQ(get_value(store, make_key(i)), make_val(i));
+    store.close();
+}
+
+// A new table's segment whose metadata write fails is not used: the grow
+// fails the write that asked for it with -EIO, as a put that cannot write
+// its segment's metadata does. Its metadata used to be ignored, so the
+// segment kept its old data metadata and records, and GC took them for
+// gone.
+TEST_P(StoreIndexTest, ATableSegmentWhoseMetadataWriteFailsIsNotUsed) {
+    config_.size = 16 * 1024 * 1024 + 4096;
+    config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(config()), 0);
+    // Segment metadata written off this thread: the space waker's, for a
+    // grow's tables. (This thread's puts write their segments'.)
+    static std::thread::id test_thread;
+    static uint64_t seg_bytes;
+    test_thread = std::this_thread::get_id();
+    seg_bytes = config_.segment_size * config_.grain_size;
+    uDepot<PosixIO>::internal_io_test_hook = [](bool write, off_t off,
+                                                size_t count) {
+        const bool seg_md = (static_cast<uint64_t>(off) + count) %
+                                    seg_bytes == 0 &&
+                            count < seg_bytes;
+        return write && seg_md && std::this_thread::get_id() != test_thread
+                   ? -EIO
+                   : 0;
+    };
+    int i = 0;
+    int rc = 0;
+    for (; i < 5000; ++i) {
+        rc = store.put(make_key(i), make_val(i)).run_sync();
+        if (rc != 0) break;
+    }
+    uDepot<PosixIO>::internal_io_test_hook = nullptr;
+    EXPECT_EQ(rc, -EIO);
+    EXPECT_EQ(store.directory().num_tables(), 1u);
+    ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+    EXPECT_GE(store.directory().num_tables(), 2u);
+    for (int j = 0; j <= i; ++j)
+        ASSERT_EQ(get_value(store, make_key(j)), make_val(j)) << make_key(j);
+    store.close();
+
+    uDepot<PosixIO> reopened;
+    ASSERT_EQ(reopened.open(reopen_config()), 0);
+    EXPECT_TRUE(reopened.index_restored());
+    for (int j = 0; j <= i; ++j)
+        ASSERT_EQ(get_value(reopened, make_key(j)), make_val(j));
+    reopened.close();
 }
 
 INSTANTIATE_TEST_SUITE_P(Index, StoreIndexTest,
