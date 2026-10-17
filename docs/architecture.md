@@ -172,7 +172,7 @@ writers only, using RCU:
 Readers never block: they keep reading the frozen tables during the copy.
 Grow is rare, so ordinary writes pay only a flag load under their stripe lock.
 Because `grow()` waits for a grace period it never runs inside a read section
-or on an I/O poller thread (which in-flight reads may be waiting on): a
+or on a thread whose own I/O in-flight reads may be waiting on: a
 writer that finds its table full leaves its section and suspends, and the
 store's waker thread runs the grow.
 
@@ -224,14 +224,25 @@ backend pollers. C++23 coroutines replace everything except the pollers.
 
 What remains lives in `io/`:
 
-- **Completion polling** per async backend. AIO and io_uring run a poller
-  thread that harvests completions and resumes the coroutines that completed.
-  SPDK follows uDepot's TRT model instead: each thread has its own queue pair
-  (`SpdkQpair`, no shared state), submits and suspends, and its own poll —
-  driven by `run_sync()` through a thread-local hook, the way a TRT scheduler
-  polled between tasks — harvests completions and resumes the coroutines.
-  One thread per `SpdkIO` polls the controllers' admin queues (~10x/s), which
-  keeps NVMe-oF keep-alives flowing.
+- **Completion polling** per async backend, as uDepot's TRT: each thread
+  has its own queue — an SPDK queue pair (`SpdkQpair`), an AIO context, an
+  io_uring ring, as TRT kept a `thread_local` `AioState` and `UringState`
+  per scheduler thread — shared by every store the thread uses, with no
+  shared state between threads. A thread submits and suspends, and its own
+  poll — driven by `run_sync()` through thread-local hooks (one per backend
+  it has used), the way a TRT scheduler polled between tasks — harvests the
+  completions and resumes the coroutines, so a coroutine stays on the thread
+  that submitted its I/O. io_uring queues SQEs and pushes them in batches of
+  up to 128, or at the thread's next poll, as uDepot's `UringState` does.
+  A thread that resumes operations it did not start (the space waker, a
+  memcache connection's epoll poller) polls its own queue too: their I/O is
+  now its own. One thread per `SpdkIO` polls the controllers' admin queues
+  (~10x/s), which keeps NVMe-oF keep-alives flowing.
+
+  AIO and io_uring used to hand every completion from a poller thread to the
+  waiting thread instead. Measured against uDepot (v0 gate, below), that
+  made them 15–87% slower than uDepot; reaped on the submitting thread they
+  are faster on every operation.
 - **Awaitable** that bridges I/O completion to coroutine resume.
 - **Buffer allocation** utilities (tagged by backend).
 
@@ -283,9 +294,9 @@ Six backends, all implementing the same `IoBackend` concept:
 | Backend | Completion model | Poller | Buffer | Notes |
 |---|---|---|---|---|
 | `PosixIO` | Synchronous | No | aligned malloc | pread/pwrite, never suspends |
-| `AioIO` | Async (io_getevents) | Yes | aligned malloc | Linux AIO |
-| `UringIO` | Async (CQ ring) | Yes | aligned malloc | io_uring |
-| `SpdkIO` | Async (qpair) | Yes | rte_malloc (DMA) | SPDK/NVMe, DPDK lcores |
+| `AioIO` | Async (per-thread context) | Submitting thread | aligned malloc | Linux AIO |
+| `UringIO` | Async (per-thread ring) | Submitting thread | aligned malloc | io_uring |
+| `SpdkIO` | Async (per-thread qpair) | Submitting thread | rte_malloc (DMA) | SPDK/NVMe, DPDK lcores |
 | `NetIO` | Async (epoll or uring) | Yes | malloc | Socket I/O for memcache server |
 | `ODirectIO` | Synchronous | No | aligned malloc | pread/pwrite with O_DIRECT |
 
@@ -303,9 +314,18 @@ concept IoBackend = requires(T io, void* buf, size_t n, off_t off) {
 **Queue depth.** The intended use: preallocate zero-copy buffers for the
 depth you choose (`alloc_put_buffer`, `alloc_get_buffer`), issue that many
 operations, wait for them, reuse the buffers. uDepot allocates no data
-buffers for depth. `StoreConfig::queue_depth` sizes each backend's queue for
-it: the AIO context (`io_setup`), the io_uring ring, and the SPDK request
-pool of queue pairs created afterwards (per thread). SPDK's own pool size
+buffers for depth. `StoreConfig::queue_depth` sizes each backend's
+per-thread queue for it: the opening thread's AIO context (`io_setup`) or
+io_uring ring (recreated if it is idle), and the contexts, rings and SPDK
+request pools of queue pairs that threads create afterwards; a thread's
+busy queue keeps its size.
+
+Per-thread queues cost kernel resources per thread, as in uDepot: an AIO
+context reserves its depth against the system-wide `fs.aio-max-nr` (65536
+by default, so 64 contexts of the default 1024 can exist at once across
+the system). A thread that cannot get a context fails its I/O with
+`-EAGAIN`. Many threads doing AIO at once (the memcache server runs two per
+connection) need a smaller `queue_depth` or a larger `aio-max-nr`. SPDK's own pool size
 stays the minimum: a large I/O takes several requests (one per transfer-size
 piece), so a pool sized to a small depth could never take it. Nothing in
 uDepot caps the depth below what the backend takes. A depth the backend
@@ -323,8 +343,8 @@ checks"): the directory is unchanged, so a clean restart, which restores
 the index, never sees the record; but it stays in the log, and after a
 crash the log scan restores it if it is the key's newest. Nothing waits or
 spins for room: on EBUSY/EAGAIN from `io_uring_submit` the SQEs, already
-published, are left for the poller to push after it reaps, since the
-submitter may be the poller itself.
+published, are left for the thread's next poll to push after it reaps,
+since the submitter may be that poll itself.
 
 Only the caller's operations report `-EAGAIN`. uDepot's own synchronous
 I/O (recovery, index persistence, GC) shares the queue, so it retries a
@@ -452,11 +472,11 @@ uDepot-ng/
 │       ├── backend.h            # IoBackend concept
 │       ├── posix.h              # pread/pwrite (sync)
 │       ├── o_direct.h           # pread/pwrite with O_DIRECT (sync)
-│       ├── aio.h                # Linux AIO + poller
+│       ├── aio.h                # Linux AIO, per-thread context
 │       ├── aio.cc
-│       ├── uring.h              # io_uring + poller
+│       ├── uring.h              # io_uring, per-thread ring
 │       ├── uring.cc
-│       ├── spdk.h               # SPDK/NVMe + poller, DMA buffers
+│       ├── spdk.h               # SPDK/NVMe, per-thread qpair, DMA buffers
 │       ├── spdk.cc
 │       ├── net.h                # socket I/O (epoll or io_uring)
 │       ├── net.cc

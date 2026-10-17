@@ -134,8 +134,8 @@ TEST_F(AioIOTest, MultipleSequentialOps) {
     }
 }
 
-// close() with I/O in flight must complete it rather than stop the poller
-// and leave those coroutines suspended forever. Blocks are written first:
+// close() with I/O in flight from the closing thread must complete it
+// rather than leave those coroutines suspended forever. Blocks are written first:
 // reads of never-written blocks complete without device I/O.
 TEST_F(AioIOTest, CloseCompletesInFlightIo) {
     constexpr int kInFlight = 512;  // within the 1024-event AIO context

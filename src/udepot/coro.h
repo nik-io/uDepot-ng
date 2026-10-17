@@ -13,20 +13,32 @@
 
 namespace udepot {
 
-// Completion polling for backends whose completions must be harvested by
-// the submitting thread (SPDK's per-thread queue pairs), as each uDepot TRT
-// thread ran its own poller task. A backend installs the hook on a thread
-// when that thread first submits; run_sync() then drives it while waiting.
-// The hook resumes completed coroutines and returns whether I/O submitted
-// from this thread is still outstanding.
+// Completion polling. Every async backend's completions are harvested by
+// the thread that submitted the I/O (SPDK's queue pairs, AIO's contexts,
+// io_uring's rings are all per thread), as each uDepot TRT thread ran its
+// own poller tasks. A backend installs its hook on a thread when that
+// thread first submits; run_sync() then drives the thread's hooks while
+// waiting. A hook resumes completed coroutines and returns whether I/O
+// submitted from this thread through it is still outstanding.
 using ThreadPollFn = bool (*)();
-inline thread_local ThreadPollFn tl_thread_poll = nullptr;
+// One per backend a thread has used: SPDK, AIO, io_uring.
+inline constexpr int kMaxThreadPolls = 4;
+inline thread_local ThreadPollFn tl_thread_polls[kMaxThreadPolls] = {};
+inline thread_local int tl_thread_poll_nr = 0;
 
-inline void set_thread_poll(ThreadPollFn fn) noexcept { tl_thread_poll = fn; }
+inline void set_thread_poll(ThreadPollFn fn) noexcept {
+    for (int i = 0; i < tl_thread_poll_nr; ++i)
+        if (tl_thread_polls[i] == fn) return;
+    assert(tl_thread_poll_nr < kMaxThreadPolls);
+    tl_thread_polls[tl_thread_poll_nr++] = fn;
+}
 
-// Poll once if this thread has a poller. Returns whether work is pending.
+// Poll each of this thread's backends once. Returns whether I/O is pending.
 inline bool poll_this_thread() {
-    return tl_thread_poll ? tl_thread_poll() : false;
+    bool pending = false;
+    for (int i = 0; i < tl_thread_poll_nr; ++i)
+        pending |= tl_thread_polls[i]();
+    return pending;
 }
 
 template <typename T = int>
@@ -108,13 +120,14 @@ public:
 
     // Drive to completion from non-coroutine code.
     // For sync backends (PosixIO), the coroutine completes eagerly.
-    // For async backends (AioIO), yields until the poller resumes it.
-    // TODO: reconsider busy-wait vs kernel-assisted wait (futex/eventfd)
-    // once we have real device latency measurements.
+    // For async backends, polls this thread's completions until the
+    // coroutine is done, as a TRT scheduler ran its poller tasks; it may
+    // also be completed by another thread (an operation resumed there,
+    // e.g. by the space waker), so it yields when nothing is pending here.
     T run_sync() {
         while (handle_.promise().continuation_.load(std::memory_order_acquire)
                != completed_tag()) {
-            if (!tl_thread_poll || !tl_thread_poll())
+            if (!poll_this_thread())
                 std::this_thread::yield();
         }
         T result = handle_.promise().result_;

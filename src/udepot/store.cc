@@ -1347,8 +1347,9 @@ int uDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
     // key can commit in between and leave the copy -- newer in recovery
     // order -- to win after a crash. Holding the lock across I/O is safe
     // only because the copy goes out with pwrite_sync, which needs no
-    // poller: a writer queued on these stripes on a poller thread cannot
-    // hold up the write it is waiting for.
+    // thread's poll: a writer blocked on these stripes, whose thread may
+    // have I/O of its own to reap, cannot hold up the write it is waiting
+    // for.
     return with_table_blocking(hash, [&](HashTable& table) -> int {
         // Only records the directory still points at matter; anything else
         // in the segment was overwritten, deleted or never committed.

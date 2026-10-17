@@ -13,7 +13,6 @@ namespace {
 struct SpdkTraits {
     using IO = udepot::SpdkIO;
     // Completions are harvested by the submitting thread's own poll.
-    static constexpr bool kPollerThread = false;
     // Every request of the queue pair taken: ENOMEM.
     static constexpr bool kQueueFills = true;
     // A depth only enlarges the request pool; no limit to test.

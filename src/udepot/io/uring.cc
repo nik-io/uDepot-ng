@@ -22,6 +22,67 @@ struct UringRequest {
     std::coroutine_handle<> handle;
 };
 
+namespace {
+
+// The calling thread's ring, as uDepot's thread_local UringState: only this
+// thread submits to it and reaps it, so it needs no synchronization.
+struct UringThread {
+    struct io_uring ring{};
+    bool initialized = false;
+    unsigned depth = 0;
+    size_t pending = 0;  // in the ring (queued or submitted), not reaped
+
+    // depth I/Os. Returns 0 or -errno.
+    int setup(unsigned n) {
+        struct io_uring r{};
+        if (int rc = io_uring_queue_init(n, &r, 0); rc < 0) return rc;
+        if (initialized) io_uring_queue_exit(&ring);
+        ring = r;
+        initialized = true;
+        depth = n;
+        return 0;
+    }
+
+    void submit() noexcept;
+
+    // A thread exits with no I/O of its own in flight (every operation it
+    // started has completed); reap any stragglers rather than tear the ring
+    // down under them.
+    ~UringThread() {
+        while (pending > 0) UringIO::poll_thread();
+        if (initialized) io_uring_queue_exit(&ring);
+    }
+};
+
+thread_local UringThread tl_uring;
+
+// SQEs queued before they are pushed to the kernel together, as uDepot's
+// UringState (iou_ioq_size_): fewer io_uring_enter calls when many I/Os
+// are issued at once. The thread's next poll pushes a smaller batch.
+constexpr unsigned kSubmitBatch = 128;
+
+}  // namespace
+
+std::atomic<unsigned> UringIO::new_ring_depth_{UringIO::kDefaultQueueDepth};
+
+// liburing has published the SQEs to the ring before io_uring_submit can
+// fail, so they cannot be withdrawn. EBUSY/EAGAIN clear as the thread
+// reaps, so they are left for its next poll to push again rather than spun
+// on here: this may be that poll itself, resuming a coroutine that
+// submits. Anything else means the ring itself is unusable.
+void UringThread::submit() noexcept {
+    while (io_uring_sq_ready(&ring) > 0) {
+        int rc = 0;
+        if (auto hook = UringIO::submit_test_hook.load(std::memory_order_relaxed))
+            rc = hook();
+        if (rc == 0) rc = io_uring_submit(&ring);
+        if (rc >= 0 || rc == -EINTR) continue;
+        if (rc == -EBUSY || rc == -EAGAIN) return;
+        fprintf(stderr, "io_uring_submit: %s\n", strerror(-rc));
+        abort();
+    }
+}
+
 struct UringSubmitAwaitable {
     UringRequest* req;
     UringIO* io;
@@ -33,9 +94,18 @@ struct UringSubmitAwaitable {
     bool await_ready() noexcept { return false; }
 
     bool await_suspend(std::coroutine_handle<> h) noexcept {
+        UringThread& t = tl_uring;
+        if (!t.initialized) {
+            int rc = t.setup(UringIO::new_ring_depth_.load(
+                std::memory_order_relaxed));
+            if (rc != 0) {
+                req->result = rc;
+                return false;
+            }
+            set_thread_poll(&UringIO::poll_thread);
+        }
         req->handle = h;
-        std::lock_guard<std::mutex> lock(io->sq_mutex_);
-        struct io_uring_sqe* sqe = io_uring_get_sqe(&io->ring_);
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&t.ring);
         if (!sqe) {  // full of SQEs the kernel refused for now
             req->result = -EAGAIN;
             return false;
@@ -47,40 +117,19 @@ struct UringSubmitAwaitable {
             io_uring_prep_read(sqe, io->fd_, buf,
                                static_cast<unsigned>(count), offset);
         io_uring_sqe_set_data(sqe, req);
-        io->pending_.fetch_add(1, std::memory_order_release);
+        ++t.pending;
         tsan_release_to_kernel(req);
 
         // From here the SQE belongs to the ring and will reach the kernel,
         // which completes it into req; so this must not resume the caller
-        // with an error, or req and buf would be freed under it.
-        io->submit_locked();
+        // with an error, or req and buf would be freed under it. It goes
+        // with a full batch, or at the thread's next poll.
+        if (io_uring_sq_ready(&t.ring) >= kSubmitBatch) t.submit();
         return true;
     }
 
     ssize_t await_resume() noexcept { return req->result; }
 };
-
-// liburing has published the SQEs to the ring before io_uring_submit can
-// fail, so they cannot be withdrawn. EBUSY/EAGAIN clear as the poller
-// reaps, so they are left for it to push again rather than spun on here:
-// this may be the poller itself, resuming a coroutine that submits.
-// Anything else means the ring itself is unusable.
-void UringIO::submit_locked() noexcept {
-    while (io_uring_sq_ready(&ring_) > 0) {
-        int rc = 0;
-        if (auto hook = submit_test_hook.load(std::memory_order_relaxed))
-            rc = hook();
-        if (rc == 0) rc = io_uring_submit(&ring_);
-        if (rc >= 0 || rc == -EINTR) continue;
-        if (rc == -EBUSY || rc == -EAGAIN) {
-            sq_backlog_.store(true, std::memory_order_release);
-            return;
-        }
-        fprintf(stderr, "io_uring_submit: %s\n", strerror(-rc));
-        abort();
-    }
-    sq_backlog_.store(false, std::memory_order_release);
-}
 
 UringIO::~UringIO() { close(); }
 
@@ -109,31 +158,25 @@ int UringIO::open(const char* path, size_t size) {
 
     size_ = size;
 
-    int rc = io_uring_queue_init(queue_depth_, &ring_, 0);
-    if (rc < 0) {
-        ::close(fd_);
-        fd_ = -1;
-        return rc;
+    // This thread's ring, at this store's depth, unless it has I/O in
+    // flight (as SpdkIO::open creates this thread's queue pair).
+    UringThread& t = tl_uring;
+    if (!t.initialized || (t.depth != queue_depth_ && t.pending == 0)) {
+        if (int rc = t.setup(queue_depth_); rc != 0) {
+            ::close(fd_);
+            fd_ = -1;
+            return rc;
+        }
+        set_thread_poll(&UringIO::poll_thread);
     }
-    ring_initialized_ = true;
-
-    running_.store(true, std::memory_order_relaxed);
-    poller_ = std::thread(&UringIO::poller_loop, this);
+    new_ring_depth_.store(queue_depth_, std::memory_order_relaxed);
     return 0;
 }
 
 void UringIO::close() {
-    if (running_.load(std::memory_order_relaxed)) {
-        running_.store(false, std::memory_order_release);
-        if (poller_.joinable())
-            poller_.join();
-    }
-
-    if (ring_initialized_) {
-        io_uring_queue_exit(&ring_);
-        ring_initialized_ = false;
-    }
-
+    // The I/O this thread has in flight completes first; other threads
+    // reap their own.
+    while (poll_thread()) {}
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
@@ -159,42 +202,28 @@ IoBuffer UringIO::alloc_buffer(size_t size) {
     return IoBuffer::alloc_aligned(aligned, 4096);
 }
 
-void UringIO::poller_loop() {
-    static constexpr int kMaxCqes = 64;
+// As uDepot's TRT io_uring poller task, run by the thread itself. The
+// completions are taken off the ring before any coroutine resumes, so one
+// that polls again (it may submit and wait) never sees them twice.
+bool UringIO::poll_thread() {
+    UringThread& t = tl_uring;
+    if (t.pending == 0) return false;
+    // Push what is queued (and what the kernel refused before), as uDepot's
+    // poller flushes before it peeks.
+    if (io_uring_sq_ready(&t.ring) > 0) t.submit();
+    static constexpr unsigned kMaxCqes = 64;
     struct io_uring_cqe* cqes[kMaxCqes];
-
-    // After close() clears running_, keep going until every submitted I/O
-    // has completed; returning earlier would leave those coroutines
-    // suspended forever.
-    while (running_.load(std::memory_order_acquire) ||
-           pending_.load(std::memory_order_acquire) > 0) {
-        int n = io_uring_peek_batch_cqe(&ring_, cqes, kMaxCqes);
-        if (n == 0) {
-            if (pending_.load(std::memory_order_acquire) > 0) {
-                struct io_uring_cqe* cqe;
-                struct __kernel_timespec ts = {0, 10'000'000};
-                io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
-            } else {
-                std::this_thread::yield();
-            }
-        }
-
-        for (int i = 0; i < n; ++i) {
-            auto* req = static_cast<UringRequest*>(
-                io_uring_cqe_get_data(cqes[i]));
-            tsan_acquire_from_kernel(req);
-            req->result = cqes[i]->res;
-            io_uring_cqe_seen(&ring_, cqes[i]);
-            pending_.fetch_sub(1, std::memory_order_relaxed);
-            req->handle.resume();
-        }
-
-        // SQEs the kernel refused: push them again now that it has reaped.
-        if (sq_backlog_.load(std::memory_order_acquire)) {
-            std::lock_guard<std::mutex> lock(sq_mutex_);
-            submit_locked();
-        }
+    const unsigned n = io_uring_peek_batch_cqe(&t.ring, cqes, kMaxCqes);
+    UringRequest* done[kMaxCqes];
+    for (unsigned i = 0; i < n; ++i) {
+        done[i] = static_cast<UringRequest*>(io_uring_cqe_get_data(cqes[i]));
+        tsan_acquire_from_kernel(done[i]);
+        done[i]->result = cqes[i]->res;
     }
+    io_uring_cq_advance(&t.ring, n);
+    t.pending -= n;
+    for (unsigned i = 0; i < n; ++i) done[i]->handle.resume();
+    return tl_uring.pending > 0;
 }
 
 }  // namespace udepot

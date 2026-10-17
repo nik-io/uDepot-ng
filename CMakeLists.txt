@@ -344,11 +344,16 @@ if(UDEPOT_BUILD_TESTS)
         target_compile_options(udepot_legacy_bench PRIVATE -Wno-error)
         # A legacy tree built with BUILD_SPDK=1 has its TRT SPDK backend in
         # libudepot.a; link it as uDepot's Makefile links udepot-test.
-        # Read at configure time: scripts/perf-regression.sh reconfigures
-        # after (re)building uDepot.
+        # Read at configure time; CMake reconfigures when it changes.
         set(_legacy_cfg "")
         if(EXISTS "${UDEPOT_ROOT}/.build-config")
             file(READ "${UDEPOT_ROOT}/.build-config" _legacy_cfg)
+            # Rebuilding uDepot with other flags reconfigures every build
+            # directory, not only the one the gate reconfigures: one left
+            # as it was linked the bench against an SPDK uDepot that was
+            # no longer there.
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                         "${UDEPOT_ROOT}/.build-config")
         endif()
         if(_legacy_cfg MATCHES "SPDK=1")
             set(_lspdk ${UDEPOT_ROOT}/trt/external/spdk)

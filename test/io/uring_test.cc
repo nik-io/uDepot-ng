@@ -169,8 +169,8 @@ TEST_F(UringIOTest, MoreInFlightThanCompletionQueue) {
     EXPECT_EQ(bad, 0);
 }
 
-// close() with I/O in flight must complete it rather than stop the poller
-// and leave those coroutines suspended forever.
+// close() with I/O in flight from the closing thread must complete it
+// rather than leave those coroutines suspended forever.
 TEST_F(UringIOTest, CloseCompletesInFlightIo) {
     constexpr int kInFlight = 4096;
     constexpr int kBlocks = 1024;

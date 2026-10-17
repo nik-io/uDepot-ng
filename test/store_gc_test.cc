@@ -327,8 +327,8 @@ TEST(StoreGcAioTest, DirectoryGrowsFromPollerThread) {
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             for (int base = 0; base < kPerThread; base += kBatch) {
-                // In flight together, so commits run on the poller while
-                // other puts' reads are outstanding.
+                // In flight together, so commits run as completions are
+                // reaped while other puts' reads are outstanding.
                 std::vector<std::string> keys, vals;
                 for (int i = base; i < base + kBatch; ++i) {
                     keys.push_back("p" + std::to_string(t) + "_" +

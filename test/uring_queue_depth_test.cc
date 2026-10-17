@@ -14,7 +14,6 @@ namespace {
 
 struct UringTraits {
     using IO = udepot::UringIO;
-    static constexpr bool kPollerThread = true;
     // The kernel takes submissions past the ring's size, keeping the
     // extra completions on its overflow list.
     static constexpr bool kQueueFills = false;
@@ -45,12 +44,12 @@ INSTANTIATE_TYPED_TEST_SUITE_P(Uring, QueueDepthTest, UringTraits);
 
 // The kernel refusing submissions (EBUSY/EAGAIN from io_uring_submit),
 // which this kernel never does, so it is injected. The refused SQEs stay in
-// the submission queue for the poller to push once it has reaped; nothing
-// spins (the submitter may be the poller itself), and once the queue is full
-// of them an operation fails with -EAGAIN. Before, the submitter spun until
-// the kernel took them: with the poller holding no completion to reap, a
-// hang.
-TEST(UringSubmit, RefusedSubmissionsAreRetriedByThePoller) {
+// the submission queue for the thread's next poll to push once it has
+// reaped; nothing spins (the submitter may be that poll itself, resuming a
+// coroutine), and once the queue is full of them an operation fails with
+// -EAGAIN. Before, the submitter spun until the kernel took them: with
+// nothing reaping meanwhile, a hang.
+TEST(UringSubmit, RefusedSubmissionsAreRetriedByThePoll) {
     static std::atomic<bool> refuse{false};
     udepot::UringIO::submit_test_hook = [] {
         return refuse.load() ? -EBUSY : 0;
@@ -96,7 +95,7 @@ TEST(UringSubmit, RefusedSubmissionsAreRetriedByThePoller) {
                   qd::make_val(i));
     }
     // The submission queue's 4 entries were taken by refused SQEs, which the
-    // poller then pushed; the rest found it full.
+    // poll then pushed; the rest found it full.
     EXPECT_GT(refused.size(), 0u);
     EXPECT_LT(refused.size(), static_cast<size_t>(kKeys));
     for (int i : refused) {

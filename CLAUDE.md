@@ -231,21 +231,26 @@ does: `--qd` TRT tasks per phase (`--trt-ntasks`, default 128), each a slice
 of the ops; uDepot-ng keeps `--qd` operations in flight. SPDK runs through
 `scripts/spdk-nvmef-test.sh <spdk-release-build> regression`, both stores on
 the target's whole namespace. The gate is not in CI (it needs uDepot built).
-Until 5d9c4e9 it only ever ran posix. First run on every backend (5000 ops,
-9 runs, uDepot-ng vs uDepot, `/dev/shm`):
+Until 5d9c4e9 it only ever ran posix. On its first run on every backend, aio
+and io_uring failed it (15–87% slower than uDepot, on main as well): each
+handed every completion from a poller thread to the waiting one. They now
+reap on the submitting thread, as uDepot's TRT and the SPDK backend do
+(per-thread AIO context and io_uring ring, io_uring submissions batched as
+uDepot's `UringState`). Since then (5000 ops, 9 runs, uDepot-ng vs uDepot,
+`/dev/shm` except SPDK):
 
 | backend | qd | PUT | GET | EXISTS | DEL |
 |---|---|---|---|---|---|
-| aio | 1 | −81% | −87% | −80% | −77% |
-| aio | 128 | −15% | −52% | −18% | −62% |
-| uring | 1 | −29% | −35% | −26% | −21% |
-| uring | 128 | −37% | −32% | −16% | −77% |
-| spdk (NVMe-oF) | 1 | +16% | −3% | +1% | +3% |
-| spdk (NVMe-oF) | 128 | +122% | +111% | +186% | +46% |
+| posix | 1 | +80% | +145% | +265% | +92% |
+| aio | 1 | +131% | +192% | +326% | +139% |
+| aio | 128 | +137% | +188% | +356% | +37% |
+| uring | 1 | +33% | +0.1% | +43% | +13% |
+| uring | 128 | +48% | +125% | +175% | +40% |
+| spdk (NVMe-oF) | 1 | +54% | +65% | +80% | +41% |
+| spdk (NVMe-oF) | 128 | +152% | +113% | +278% | +69% |
 
-**aio and uring fail the gate, on main as well.** Open. SPDK harvests its
-completions on the submitting thread, as uDepot's TRT poller task does; aio
-and uring hand every completion from a poller thread to the waiting one.
+io_uring GET at queue depth 1 is level with uDepot: on tmpfs an io_uring
+read costs ~30 µs either way.
 
 The posix speed gap is genuine, not a benchmark artifact. With both at -O3, uDepot-ng
 is 2-5x faster at 5000 ops, varying by host: PUT +127-182%, GET +174-227%,
