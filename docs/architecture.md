@@ -659,29 +659,30 @@ persistent source of truth is the log"*.
   written back, so slots sharing it stay on the device (uDepot writes the
   mapped slots back with it).
 - **Crash recovery** reads the whole log once (a crash should be rare, and
-  then a full read is the price), building the index, and only then charges
-  salsa, as uDepot's `restore()` does after a clean shutdown (its
-  `validity_map`): each segment with the grains of the records the index
-  points to. Dead grains, and an open segment's unwritten tail, are never
-  charged, and a segment with none live stays free. Index segments are
+  then a full read is the price), building the index, and only then
+  restores the segments to salsa, as uDepot's `restore()` does after a
+  clean shutdown (its `validity_map`): each segment with the grains of the
+  records the index points to as its valid grains, which salsa provisions
+  (counts as used). Dead grains, and an open segment's unwritten tail, are
+  never restored as valid, and a segment with none live stays free. Index segments are
   skipped: the index is rebuilt. Its tables live in memory alone until the
   walk is done (a segment taken earlier could be one whose records are
   still to be read), then take their segments once salsa's threads run.
-  uDepot's crash path instead charged every segment with valid metadata in
+  uDepot's crash path instead restored every segment with valid metadata in
   full (`prep_crash_recovery`), and invalidated the dead grains after; as
   a freed segment keeps its metadata until reused, on a churned device
   that is every segment, past the logical capacity (overprovisioning):
   salsa dropped the excess, checked by an assert only, and the
   invalidations underflowed its used count, so every write then failed.
-  salsa's `restore_grain_range` now charges first and refuses a range that
-  does not fit.
+  salsa's `restore_grain_range` now provisions first and refuses a range
+  that does not fit.
 - **More live data than the store may hold after a crash: open fails.**
   Rejected writes come back after a crash (§4.5), and can take the log
   past the logical capacity. The device is then full: `open()` fails with
   -ENOSPC, every time, with a message giving the live data and the
   capacity, left to an operator. The live data is summed and checked
-  against the capacity user writes get, before anything is charged:
-  `restore_grain_range` charges as GC relocation does, which may overshoot
+  against the capacity user writes get, before anything is restored:
+  `restore_grain_range` provisions as GC relocation does, which may overshoot
   the capacity by two segments, so it alone would let such a store through
   to fail later for want of index segments, under the wrong message.
 - **A read error at open fails the open (-EIO).** Only valid metadata

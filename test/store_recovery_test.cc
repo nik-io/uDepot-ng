@@ -880,17 +880,17 @@ TEST_P(StoreIndexTest, CrashRecoveryWithNoRoomForItsIndexDoesNotOpen) {
     }
 }
 
-// After a crash, the store charges salsa only for what the log still holds
-// live, so it takes as much new data as a fresh store less that. uDepot's
-// crash path charged every segment in full before invalidating the dead
-// grains: past the logical capacity salsa dropped the excess, and on a
+// After a crash, the store restores to salsa as valid only the grains the
+// log still holds live, so it takes as much new data as a fresh store less
+// that. uDepot's crash path restored every segment in full before
+// invalidating the dead grains: past the logical capacity salsa dropped the excess, and on a
 // churned device with little live data the used count underflowed, so
 // every write failed with -ENOSPC.
 //
 // Live includes the tombstones of deleted keys, and a key put again after
-// its delete no longer holds its tombstone: both are charged right, or the
+// its delete no longer holds its tombstone: both are counted right, or the
 // fill is off by thousands of grains.
-TEST_P(StoreIndexTest, CrashRecoveryChargesOnlyLiveData) {
+TEST_P(StoreIndexTest, CrashRecoveryRestoresOnlyLiveGrains) {
     config_.size = 4 * 1024 * 1024 + 4096;
     config_.segment_size = 64;  // 32 KiB
     auto fill = [](uDepot<PosixIO>& store, const std::string& prefix) {
@@ -923,7 +923,7 @@ TEST_P(StoreIndexTest, CrashRecoveryChargesOnlyLiveData) {
         uDepot<PosixIO> store;
         ASSERT_EQ(store.open(config()), 0);  // a new store
         // About 2.5 times the device: every segment carries valid
-        // metadata at the crash, and charged in full they exceed the
+        // metadata at the crash, and restored in full they exceed the
         // logical capacity.
         for (int round = 0; round < kRounds; ++round)
             for (int i = 0; i < kLive; ++i)
@@ -995,7 +995,7 @@ TEST_P(StoreIndexTest, CrashRecoveryBeyondCapacityDoesNotOpen) {
 }
 
 // Just past the capacity, by no more than salsa lets relocation overshoot
-// it (restore_grain_range charges as relocation does): the open fails for
+// it (restore_grain_range provisions as relocation does): the open fails for
 // the capacity. It used to restore the data, then fail for want of
 // segments for the index, which named the wrong cause.
 TEST_P(StoreIndexTest, CrashRecoveryJustBeyondCapacityNamesTheCapacity) {

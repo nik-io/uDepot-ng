@@ -239,7 +239,7 @@ Scm::restore_grain_range(const u64 grain, const u64 len, const u8 ctlr_id)
                         grain, len, ctlr_id);
 		return EINVAL;
 	}
-	// Charge the capacity first: a range that does not fit is refused, and
+	// Provision the grains first: a range that does not fit is refused, and
 	// the segment stays free. (It used to be restored uncounted, checked by
 	// an assert only, and the grains later invalidated in it underflowed
 	// the used count.)

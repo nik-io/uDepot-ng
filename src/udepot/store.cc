@@ -369,19 +369,20 @@ int uDepot<IO>::crash_recovery() {
         }
     }
 
-    // Only now, with the whole log read, charge salsa for what is live: as
+    // Only now, with the whole log read, restore the segments to salsa: as
     // uDepot's restore() after a clean shutdown (its validity_map), each
-    // segment with the grains of the records the index points to. Dead
-    // grains, and an open segment's unwritten tail, are never charged; a
-    // segment with none live stays free. (uDepot's crash path charged every
-    // segment in full first, and invalidated the dead grains after; past
-    // the logical capacity salsa dropped the excess, checked by an assert
-    // only, and the invalidations underflowed its used count.)
+    // segment with the grains of the records the index points to as its
+    // valid grains, which salsa provisions (counts as used). Dead grains,
+    // and an open segment's unwritten tail, are never restored as valid; a
+    // segment with none live stays free. (uDepot's crash path restored
+    // every segment in full first, and invalidated the dead grains after;
+    // past the logical capacity salsa dropped the excess, checked by an
+    // assert only, and the invalidations underflowed its used count.)
     //
     // The log can hold more live data than the store may: rejected writes
     // come back after a crash (paper §4.5). The device is then full; left
     // to an operator. Checked against the capacity user writes get, not
-    // the larger one restore_grain_range() allows (it charges as GC
+    // the larger one restore_grain_range() allows (it provisions as GC
     // relocation does).
     uint64_t live = 0;
     for (uint64_t v : valid) live += v;
