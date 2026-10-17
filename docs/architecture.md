@@ -418,6 +418,13 @@ stream.
     segment GC has reclaimed still counts until it is reused: its metadata
     and old records stay on disk, and recovery replays them. uDepot drops
     tombstones unconditionally.
+  - **Tombstone reclaim is lazy, by design.** GC usually frees older
+    segments than it keeps, so a victim is rarely older than every freed,
+    not yet reused one: tombstones go in windows and can linger on a busy
+    device, but are reclaimed eventually. Do not make it prompt (say, by
+    erasing a freed segment's metadata, a write per segment) without
+    agreement. `TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk` writes until
+    GC has had a window, rather than expecting one in a fixed workload.
 - **Recovery** reads each segment with valid metadata in one pass and replays
   its records; for each key the newest in recovery order (segment timestamp,
   then grain) wins, tombstones included. Grains holding no valid record are
