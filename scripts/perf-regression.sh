@@ -51,6 +51,10 @@ LEGACY_BIN="${NG_BUILD}/udepot_legacy_bench"
 UDEPOT_ROOT="${UDEPOT_ROOT:-${NG_ROOT}/../uDepot}"
 if [ -d "$UDEPOT_ROOT" ]; then
     echo "Building legacy uDepot at BUILD_TYPE=PERFORMANCE BUILD_SPDK=$LEGACY_SPDK..." >&2
+    # uDepot's Makefile updates libudepot.a in place (gcc-ar cr), so after a
+    # BUILD_SPDK flip it holds both libtrt.o and libtrt-rte.o and the bench
+    # fails to link: have it rebuilt from the current objects.
+    rm -f "${UDEPOT_ROOT:?}/libudepot.a"
     make -C "$UDEPOT_ROOT" BUILD_TYPE=PERFORMANCE BUILD_SPDK="$LEGACY_SPDK" \
         -j"$(nproc)" 2>&1 | tail -1 >&2
     # Reconfigure (the legacy bench links SPDK only if uDepot was built
@@ -63,10 +67,17 @@ fi
 NG_FILE="/dev/shm/udepot-ng-perf.store"
 LEGACY_FILE="/dev/shm/udepot-legacy-perf.store"
 SIZE=1077936129
+# SPDK: the whole namespace, on both sides. uDepot-ng's SPDK backend always
+# takes it whole; uDepot takes it whole at size 0 (as its own NVMe-oF test
+# runs udepot-test), and a larger size makes it try to ftruncate the
+# namespace, which fails.
+[ "$BACKEND" = "spdk" ] && SIZE=0
 GRAIN=512
 VAL=1024
 
-trap 'rm -f "$NG_FILE" "$LEGACY_FILE"' EXIT
+NG_ERR="$(mktemp)"
+LEGACY_ERR="$(mktemp)"
+trap 'rm -f "$NG_FILE" "$LEGACY_FILE" "$NG_ERR" "$LEGACY_ERR"' EXIT
 
 for bin in "$NG_BIN" "$LEGACY_BIN"; do
     if [ ! -x "$bin" ]; then
@@ -85,7 +96,7 @@ run_ng() {
     local out
     out=$("$NG_BIN" -w "$OPS" -f "$NG_FILE" --size "$SIZE" \
         --grain-size "$GRAIN" --val-size "$VAL" \
-        --backend "$BACKEND" --qd "$QD" 2>/dev/null)
+        --backend "$BACKEND" --qd "$QD" 2>"$NG_ERR")
     echo "$(extract PUT "$out") $(extract GET "$out") $(extract EXIST "$out") $(extract DEL "$out")"
 }
 
@@ -94,7 +105,7 @@ run_legacy() {
     local out
     out=$("$LEGACY_BIN" -w "$OPS" -f "$LEGACY_FILE" --size "$SIZE" \
         --grain-size "$GRAIN" --val-size "$VAL" \
-        --backend "$BACKEND" --qd "$QD" 2>/dev/null)
+        --backend "$BACKEND" --qd "$QD" 2>"$LEGACY_ERR")
     echo "$(extract PUT "$out") $(extract GET "$out") $(extract EXIST "$out") $(extract DEL "$out")"
 }
 
@@ -115,9 +126,12 @@ echo "Running $ITERS interleaved iterations @ $OPS ops each, backend=$BACKEND qd
 for iter in $(seq 1 "$ITERS"); do
     read -r lp lg le ld <<<"$(run_legacy)"
     read -r np ng_ ne nd <<<"$(run_ng)"
-    for v in "$lp" "$lg" "$le" "$ld" "$np" "$ng_" "$ne" "$nd"; do
-        if [ -z "$v" ]; then
-            echo "FATAL: a run produced no throughput (iter $iter)" >&2
+    for side in legacy ng; do
+        if [ "$side" = legacy ]; then vals="$lp $lg $le $ld"; err="$LEGACY_ERR"
+        else vals="$np $ng_ $ne $nd"; err="$NG_ERR"; fi
+        if [ "$(wc -w <<<"$vals")" -ne 4 ]; then
+            echo "FATAL: the $side run produced no throughput (iter $iter); its stderr ends:" >&2
+            grep -v -E '^(GC|XNP) ' "$err" | tail -15 >&2
             exit 2
         fi
     done
