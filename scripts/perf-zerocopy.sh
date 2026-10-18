@@ -30,16 +30,11 @@
 # store's own DMA buffers, which SPDK counts: a zero-copy run must copy no
 # I/O through a bounce buffer (exact).
 #
-# On a real device: ZC_DIR puts the store on another filesystem (default
-# /dev/shm), as CI does on the runner's disk, briefly. tmpfs takes O_DIRECT
-# but has no device behind it; on a disk the I/O is real, and so bound by
-# the device that timing cannot gate (zero copy's deltas there flip sign
-# run to run: measured on ext4, PUT -16% to +12% sparse, a GET at -4%
-# preallocated). So off tmpfs timing is reported, not gated
-# (ZC_GATE_TIMING=1 gates it anyway). Gated everywhere, exactly: zero-copy
-# batches copy no value between the caller's memory and uDepot's record
-# buffers, and copying ones copy every value. Whether the store is O_DIRECT
-# is reported; the unit tests are what require it (CLAUDE.md, "O_DIRECT").
+# Besides timing, an exact check: zero-copy batches copy no value between
+# the caller's memory and uDepot's record buffers, and copying ones copy
+# every value. O_DIRECT is not this script's to check: the unit tests run
+# AIO and io_uring over O_DIRECT (CLAUDE.md, "O_DIRECT"); this one stays on
+# tmpfs for low noise.
 #
 # Usage: perf-zerocopy.sh <backend> [build_dir] [batch] [runs] [min_gain%]
 #   <backend>  aio, uring or spdk. Not posix: PosixIO is buffered
@@ -82,19 +77,11 @@ case "$BUILD_DIR" in
     /*) BIN="$BUILD_DIR/udepot_ng_bench" ;;
     *)  BIN="$HERE/$BUILD_DIR/udepot_ng_bench" ;;
 esac
-ZC_DIR="${ZC_DIR:-/dev/shm}"
-FILE="${ZC_DIR}/udepot-ng-zc-${BACKEND}.store"
-trap 'rm -f "$FILE"' EXIT   # do not leave a ~1GB store behind
-# One line: a path mounted more than once (here /dev/shm) lists each.
-FSTYPE="$(findmnt -n -o FSTYPE -T "$ZC_DIR" 2>/dev/null | head -n1)"
-[ -n "$FSTYPE" ] || FSTYPE="$(stat -f -c %T "$ZC_DIR" 2>/dev/null || echo unknown)"
-GATE_TIMING=1
-if [ "$BACKEND" != "spdk" ] && [ "$FSTYPE" != "tmpfs" ]; then
-    GATE_TIMING="${ZC_GATE_TIMING:-0}"
-fi
+FILE="/dev/shm/udepot-ng-zc-${BACKEND}.store"
+trap 'rm -f "$FILE"' EXIT   # do not leave a ~1GB store on /dev/shm
 
 [ -x "$BIN" ] || { echo "FATAL: $BIN not found" >&2; exit 2; }
-WHERE="on ${ZC_DIR} (${FSTYPE})"
+WHERE="on /dev/shm"
 if [ "$BACKEND" = "spdk" ]; then
     if [ -z "${UDEPOT_NVMEF:-}" ]; then
         echo "FATAL: spdk needs UDEPOT_NVMEF; run it through scripts/spdk-nvmef-test.sh" >&2
@@ -111,17 +98,12 @@ fi
     if command -v lscpu >/dev/null; then
         lscpu | grep -E '^(Model name|L1d cache|L2 cache|L3 cache):' | sed 's/^/  /'
     fi
-    if [ "$BACKEND" != "spdk" ]; then
-        echo "  store: ${ZC_DIR} (${FSTYPE}), preallocated by the backend"
-        command -v findmnt >/dev/null && \
-            findmnt -n -o SOURCE,FSTYPE -T "$ZC_DIR" | sed 's/^/  device: /'
-    fi
 } >&2
 
 # One run; echo "put_delta get_delta bounced put_copy put_zc get_copy get_zc
-# copied_copy copied_zc direct" (bounced: SPDK only, else 0; throughputs in
-# Mops/s as the bench prints them, the medians of the run's batches; direct:
-# 1 or 0, "-" on SPDK).
+# copied_copy copied_zc" (bounced: SPDK only, else 0; throughputs in Mops/s
+# as the bench prints them, the medians of the run's batches; copied: values
+# the copying and zero-copy batches copied).
 run_compare() {
     rm -f "$FILE"
     local out
@@ -137,26 +119,23 @@ run_compare() {
     pz=$(grep '^CMP PUT' <<<"$out" | grep -oE 'zero_copy=[0-9.]+' | cut -d= -f2)
     gc=$(grep '^CMP GET' <<<"$out" | grep -oE ' copy=[0-9.]+' | cut -d= -f2)
     gz=$(grep '^CMP GET' <<<"$out" | grep -oE 'zero_copy=[0-9.]+' | cut -d= -f2)
-    local cc cz d
+    local cc cz
     cc=$(grep '^COPIES' <<<"$out" | grep -oE ' copy=[0-9]+' | cut -d= -f2)
     cz=$(grep '^COPIES' <<<"$out" | grep -oE 'zero_copy=[0-9]+' | cut -d= -f2)
-    d=$(grep '^DIRECT' <<<"$out" | awk '{print $2}')
-    [ "$BACKEND" = "spdk" ] && d=-
     # sort -n does not take a leading +
-    echo "${dp#+} ${dg#+} $b $pc $pz $gc $gz ${cc:-x} ${cz:-x} ${d:-x}"
+    echo "${dp#+} ${dg#+} $b $pc $pz $gc $gz ${cc:-x} ${cz:-x}"
 }
 
 median() { printf '%s\n' "$@" | sort -n | \
     awk '{a[NR]=$1} END{n=NR; if(n==0){print 0} else if(n%2){print a[(n+1)/2]} else {printf "%.6f",(a[n/2]+a[n/2+1])/2}}'; }
 
-dps=(); dgs=(); bounced=0; copied_copy=0; copied_zc=0; not_direct=0
+dps=(); dgs=(); bounced=0; copied_copy=0; copied_zc=0
 for it in $(seq 1 "$RUNS"); do
-    read -r dp dg b pc pz gc gz cc cz d <<<"$(run_compare)"
+    read -r dp dg b pc pz gc gz cc cz <<<"$(run_compare)"
     { [ -n "$dp" ] && [ -n "$dg" ] && [ -n "$b" ] && [ -n "$gz" ] && \
-      [ "$cc" != x ] && [ "$cz" != x ] && [ "$d" != x ]; } \
+      [ "$cc" != x ] && [ "$cz" != x ]; } \
         || { echo "a udepot_ng_bench --compare run produced no result" >&2; exit 2; }
     copied_copy=$((copied_copy + cc)); copied_zc=$((copied_zc + cz))
-    [ "$d" = 0 ] && not_direct=$((not_direct + 1))
     awk -v it="$it" -v dp="$dp" -v dg="$dg" -v pc="$pc" -v pz="$pz" \
         -v gc="$gc" -v gz="$gz" 'BEGIN{
         printf("  run %s: PUT delta=%s%% (copy %.1f, zero copy %.1f kops/s)" \
@@ -178,15 +157,8 @@ check_delta() {  # delta% phase-name
 }
 
 rc=0
-timing_rc=0
-if [ "$GATE_TIMING" = 1 ]; then
-    check_delta "$(median "${dps[@]}")" PUT || timing_rc=1
-    check_delta "$(median "${dgs[@]}")" GET || timing_rc=1
-else
-    awk -v p="$(median "${dps[@]}")" -v g="$(median "${dgs[@]}")" 'BEGIN{
-        printf("  PUT delta=%+.1f%%, GET delta=%+.1f%% (reported, not gated: device-bound)\n", p, g) > "/dev/stderr" }'
-fi
-rc=$timing_rc
+check_delta "$(median "${dps[@]}")" PUT || rc=1
+check_delta "$(median "${dgs[@]}")" GET || rc=1
 # Exact: the zero-copy path copied no value, the copying one every value.
 echo "  values copied: zero copy ${copied_zc} (fail if any), copy ${copied_copy}" >&2
 if [ "$copied_zc" -ne 0 ]; then
@@ -197,9 +169,6 @@ if [ "$copied_copy" -eq 0 ]; then
     echo "FAIL: the copying path copied nothing, so nothing was compared" >&2
     rc=1
 fi
-if [ "$BACKEND" != "spdk" ]; then
-    echo "  runs without O_DIRECT: ${not_direct} of ${RUNS} (reported; the unit tests require it)" >&2
-fi
 if [ "$BACKEND" = "spdk" ]; then
     echo "  zero-copy I/Os bounced through a DMA copy: ${bounced} (fail if any)" >&2
     if [ "$bounced" -ne 0 ]; then
@@ -208,7 +177,7 @@ if [ "$BACKEND" = "spdk" ]; then
     fi
 fi
 if [ "$rc" -eq 0 ]; then
-    [ "$GATE_TIMING" = 1 ] && echo "OK: zero-copy faster than copy on PUT and GET" >&2
+    echo "OK: zero-copy faster than copy on PUT and GET" >&2
     echo "OK: zero copy copied no value" >&2
     [ "$BACKEND" = "spdk" ] && \
         echo "OK: zero-copy put/get transferred straight from the store's DMA buffers" >&2

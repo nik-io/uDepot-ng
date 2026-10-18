@@ -166,7 +166,7 @@ ctest --test-dir build
   SPDK is built with `--target-arch=x86-64-v2` and its tree cached per
   submodule revision.
 - **zero-copy perf invariant**, below: one check for AIO and io_uring,
-  on `/dev/shm` and, over O_DIRECT, on the runner's disk; and
+  on `/dev/shm`; and
   **zero-copy perf invariant (SPDK)**, a second entry of the
   SPDK job (`spdk-nvmef-test.sh build perf`) on a Release build.
 - **O_DIRECT.** Every AIO and io_uring test makes its store in `/tmp` and
@@ -224,17 +224,14 @@ slower in CI, and on SPDK as anything from 37% slower to 52% faster, on
 code where every paired comparison has zero copy ahead. Never set
 throughputs from different runs against each other.
 
-**On a real device.** tmpfs takes O_DIRECT with no device behind it: a toy
-case. So CI also runs the check briefly (seconds) on the runner's disk
-(`ZC_DIR=$RUNNER_TEMP`, ext4), for AIO and io_uring. There the I/O is
-device-bound and zero copy's timing deltas flip sign run to run (ext4 here:
-PUT -16% to +12% sparse, a GET at -4% preallocated), so timing is
-reported, not gated. What is gated, there and on `/dev/shm` alike, is
-exact: the zero-copy batches copied no value between the caller's memory
-and uDepot's record buffers (`uDepot::thread_value_copies()`; the copying
-ones copy every value). A zero-copy put made to count a copy fails it.
-Whether the store was O_DIRECT is reported there; requiring it is the unit
-tests' job (see "O_DIRECT" under CI), short tests being enough for that.
+**O_DIRECT** is the unit tests' to cover, not this check's: the AIO and
+io_uring tests run over it in `/tmp` (see "O_DIRECT" under CI). The
+zero-copy check stays on `/dev/shm` for low noise; on a disk the I/O is
+device-bound and zero copy's deltas flip sign run to run (ext4 here: PUT
+-16% to +12%). Besides timing it gates one exact thing: the zero-copy
+batches copied no value between the caller's memory and uDepot's record
+buffers (`uDepot::thread_value_copies()`; the copying ones copy every
+value). A zero-copy put made to count a copy fails it.
 
 **SPDK** is gated the same way, as its own CI check, "zero-copy perf
 invariant (SPDK)": `scripts/spdk-nvmef-test.sh <build> perf` starts the

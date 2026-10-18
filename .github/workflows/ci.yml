@@ -262,17 +262,3 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: scripts/perf-zerocopy.sh uring build
-      # On a real device, briefly (seconds): the runner's disk (ext4), not
-      # tmpfs, which takes O_DIRECT with no device behind it. There the I/O
-      # is device-bound, and zero copy's timing deltas flip sign run to run,
-      # so timing is reported, not gated; what fails the step is exact: no
-      # value copied by a zero-copy put or get. O_DIRECT itself is required
-      # by the unit tests (the /tmp check above them).
-      - name: Zero-copy over O_DIRECT on disk (aio)
-        if: ${{ !cancelled() }}
-        timeout-minutes: 20
-        run: ZC_DIR="$RUNNER_TEMP" scripts/perf-zerocopy.sh aio build 200 3
-      - name: Zero-copy over O_DIRECT on disk (io_uring)
-        if: ${{ !cancelled() }}
-        timeout-minutes: 20
-        run: ZC_DIR="$RUNNER_TEMP" scripts/perf-zerocopy.sh uring build 200 3
