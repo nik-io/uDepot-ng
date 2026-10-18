@@ -252,9 +252,11 @@ static double median(std::vector<double> v) {
 // share the drift that separate processes do not. Prints, per phase, each
 // mode's median batch throughput and the median of the per-round ratios.
 //
-// As legacy's udepot-test: one buffer per mode, allocated before timing and
-// reused for every op (plain memory for copy, uDepot's buffers for zero
-// copy). Each put writes its key's tag into the value; each get checks it.
+// As legacy's udepot-test (perf-zerocopy.sh: --trt-ntasks 32): --qd
+// operations in flight on one thread, each slot with its own buffer per
+// mode, allocated before timing and reused for every op of the slot (plain
+// memory for copy, uDepot's buffers for zero copy). Each put writes its
+// key's tag into the value; each get checks it.
 template <typename IO>
 static int run_compare(uDepot<IO>& store, const BenchConfig& cfg) {
     const uint64_t batch = cfg.ops;
@@ -264,60 +266,96 @@ static int run_compare(uDepot<IO>& store, const BenchConfig& cfg) {
         return 1;
     }
     auto tag_of = [&](uint64_t i) { return (cfg.seed + i) * kPrime; };
-    uint64_t key[2] = {0, 0};  // one key size: a PutBuffer is per key size
-    const std::span<const uint8_t> key_span(
-        reinterpret_cast<const uint8_t*>(key), sizeof(key));
-
-    std::vector<uint8_t> put_copy(vsz, 0x5a), get_copy(vsz);
-    udepot::PutBuffer put_zc = store.alloc_put_buffer(sizeof(key), vsz);
-    udepot::GetBuffer get_zc = store.alloc_get_buffer(sizeof(key), vsz);
-    if (!put_zc.valid() || !get_zc.valid()) {
-        fprintf(stderr, "buffer allocation failed\n");
-        return 1;
-    }
-    std::fill(put_zc.value().begin(), put_zc.value().end(), 0x5a);
-
-    auto put_batch = [&](uint64_t first, bool zc) -> double {
-        const double t0 = now_secs();
-        for (uint64_t i = first; i < first + batch; ++i) {
-            const uint64_t tag = key[0] = tag_of(i);
-            uint8_t* val = zc ? put_zc.value().data() : put_copy.data();
-            std::memcpy(val, &tag, sizeof(tag));
-            const int rc =
-                zc ? store.put(key_span, put_zc).run_sync()
-                   : store.put(key_span, std::span<const uint8_t>(put_copy))
-                         .run_sync();
-            if (rc != 0) {
-                fprintf(stderr, "put failed: i=%lu rc=%d\n",
-                        static_cast<unsigned long>(i), rc);
-                return -1;
-            }
+    struct Slot {
+        uint64_t key[2] = {0, 0};  // one key size: a PutBuffer is per key size
+        std::vector<uint8_t> put_copy, get_copy;
+        udepot::PutBuffer put_zc;
+        udepot::GetBuffer get_zc;
+        std::optional<udepot::CoroTask<int>> task;
+        uint64_t i = 0;
+        size_t n = 0;  // copying get: the value's size
+        std::span<const uint8_t> key_span() const {
+            return {reinterpret_cast<const uint8_t*>(key), sizeof(key)};
         }
-        return now_secs() - t0;
     };
-    auto get_batch = [&](uint64_t first, bool zc) -> double {
-        const double t0 = now_secs();
-        for (uint64_t i = first; i < first + batch; ++i) {
-            key[0] = tag_of(i);
-            size_t n = 0;
-            int rc;
-            if (zc) {
-                rc = store.get(key_span, &get_zc).run_sync();
-                n = get_zc.value().size();
-            } else {
-                rc = store.get(key_span, get_copy.data(), vsz, &n).run_sync();
-            }
-            uint64_t tag = 0;
-            if (rc == 0)
-                std::memcpy(&tag, zc ? get_zc.value().data() : get_copy.data(),
-                            sizeof(tag));
-            if (rc != 0 || n != vsz || tag != key[0]) {
-                fprintf(stderr, "get failed: i=%lu rc=%d\n",
-                        static_cast<unsigned long>(i), rc);
-                return -1;
-            }
+    std::vector<Slot> slots(std::max<uint32_t>(cfg.qd, 1));
+    for (Slot& s : slots) {
+        s.put_copy.assign(vsz, 0x5a);
+        s.get_copy.assign(vsz, 0);
+        s.put_zc = store.alloc_put_buffer(sizeof(s.key), vsz);
+        s.get_zc = store.alloc_get_buffer(sizeof(s.key), vsz);
+        if (!s.put_zc.valid() || !s.get_zc.valid()) {
+            fprintf(stderr, "buffer allocation failed\n");
+            return 1;
         }
-        return now_secs() - t0;
+        std::fill(s.put_zc.value().begin(), s.put_zc.value().end(), 0x5a);
+    }
+
+    // A batch of ops [first, first + batch), up to slots.size() in flight.
+    // Returns its time, or -1 on a failed op once none is in flight.
+    auto run_batch = [&](uint64_t first, bool zc, bool puts) -> double {
+        std::vector<Slot*> free_slots;
+        for (Slot& s : slots) free_slots.push_back(&s);
+        bool failed = false;
+        auto reap = [&](Slot& s) {
+            const int rc = s.task->run_sync();
+            s.task.reset();
+            const uint64_t want = tag_of(s.i);
+            bool ok = rc == 0;
+            if (ok && !puts) {
+                const uint8_t* v =
+                    zc ? s.get_zc.value().data() : s.get_copy.data();
+                const size_t n = zc ? s.get_zc.value().size() : s.n;
+                uint64_t tag = 0;
+                std::memcpy(&tag, v, sizeof(tag));
+                ok = n == vsz && tag == want;
+            }
+            if (!ok && !failed) {
+                fprintf(stderr, "%s failed: i=%lu rc=%d\n",
+                        puts ? "put" : "get",
+                        static_cast<unsigned long>(s.i), rc);
+                failed = true;
+            }
+            free_slots.push_back(&s);
+        };
+        const double t0 = now_secs();
+        uint64_t next = first;
+        while (true) {
+            for (Slot& s : slots)
+                if (s.task && s.task->await_ready()) reap(s);
+            const bool issuing = next < first + batch && !failed;
+            if (!issuing && free_slots.size() == slots.size()) break;
+            if (issuing && !free_slots.empty()) {
+                Slot& s = *free_slots.back();
+                free_slots.pop_back();
+                s.i = next++;
+                const uint64_t tag = s.key[0] = tag_of(s.i);
+                if (puts) {
+                    uint8_t* val =
+                        zc ? s.put_zc.value().data() : s.put_copy.data();
+                    std::memcpy(val, &tag, sizeof(tag));
+                    s.task.emplace(
+                        zc ? store.put(s.key_span(), s.put_zc)
+                           : store.put(s.key_span(),
+                                       std::span<const uint8_t>(s.put_copy)));
+                } else {
+                    s.n = 0;
+                    s.task.emplace(
+                        zc ? store.get(s.key_span(), &s.get_zc)
+                           : store.get(s.key_span(), s.get_copy.data(), vsz,
+                                       &s.n));
+                }
+                continue;
+            }
+            udepot::poll_this_thread();
+        }
+        return failed ? -1 : now_secs() - t0;
+    };
+    auto put_batch = [&](uint64_t first, bool zc) {
+        return run_batch(first, zc, true);
+    };
+    auto get_batch = [&](uint64_t first, bool zc) {
+        return run_batch(first, zc, false);
     };
     struct Phase {
         std::vector<double> copy, zc, ratio;
@@ -459,7 +497,8 @@ static void usage() {
         "  --backend <b>  posix, aio, uring or spdk (default: posix); spdk\n"
         "                 uses the namespace UDEPOT_NVMEF names, whole\n"
         "  --compare <r>  Copy vs zero copy in one store: r rounds of a\n"
-        "                 batch of -w ops each way, order alternating\n"
+        "                 batch of -w ops each way, order alternating,\n"
+        "                 --qd of them in flight\n"
         "  --segment-size <grains>  Segment size, which also sizes the\n"
         "                 directory's tables; small values force grows\n"
         "  --latency      Print put latency percentiles\n"

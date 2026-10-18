@@ -55,6 +55,12 @@ RUNS="${4:-5}"
 # nothing, so it is strictly faster, never merely as fast.
 MIN_GAIN="${5:-0}"
 ROUNDS="${ROUNDS:-15}"    # 2 x 15 x 500 x 32 KiB fits the 1 GiB store
+# Operations in flight, as uDepot's script runs udepot-test with
+# --trt-ntasks 32 on one thread. One at a time, every io_uring operation on
+# tmpfs waited out a hand-off to an io-wq kernel worker (~20 us on a CI
+# EPYC 7763, against ~1 us for the copy zero copy avoids), so the gate
+# measured the scheduler: zero-copy GET read 11% slower there.
+QD="${QD:-32}"
 # Large enough that a value copy is a visible share of an operation: at
 # 1 KiB a copy costs ~30 ns of a ~1.6 us put, and a zero-copy path that
 # copied twice stayed inside the old 5% tolerance.
@@ -104,7 +110,8 @@ run_compare() {
     rm -f "$FILE"
     local out
     out=$("$BIN" --backend "$BACKEND" -f "$FILE" --size "$SIZE" -w "$BATCH" \
-        --val-size "$VAL" --grain-size 512 --compare "$ROUNDS" 2>/dev/null)
+        --val-size "$VAL" --grain-size 512 --compare "$ROUNDS" --qd "$QD" \
+        2>/dev/null)
     local dp dg b pc pz gc gz
     dp=$(grep '^CMP PUT' <<<"$out" | grep -oE 'delta=[-+0-9.]+' | cut -d= -f2)
     dg=$(grep '^CMP GET' <<<"$out" | grep -oE 'delta=[-+0-9.]+' | cut -d= -f2)
@@ -134,7 +141,7 @@ for it in $(seq 1 "$RUNS"); do
     bounced=$((bounced + b))
 done
 
-echo "${BACKEND}: median of ${RUNS} runs, each the median of ${ROUNDS} paired batches of ${BATCH} ops of ${VAL} B, ${WHERE}:" >&2
+echo "${BACKEND}: median of ${RUNS} runs, each the median of ${ROUNDS} paired batches of ${BATCH} ops of ${VAL} B, ${QD} in flight, ${WHERE}:" >&2
 
 # Gate each phase: fail unless zero copy is faster than copy by > MIN_GAIN%.
 check_delta() {  # delta% phase-name

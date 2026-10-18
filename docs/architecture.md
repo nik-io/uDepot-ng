@@ -252,9 +252,11 @@ What remains lives in `io/`:
   every wakeup). A thread spinning on its CQ then held off the very worker
   it waited for until preemption, so an operation took a scheduler slice
   rather than the I/O's time, and which of copy and zero copy won depended
-  on the CPU (zero-copy GET 11% slower on a CI EPYC 7763). Yielding roughly
-  doubled io_uring throughput on tmpfs. AIO needs none: `io_submit` does
-  that work before returning.
+  on the CPU. Yielding roughly doubled io_uring throughput on tmpfs on a
+  4-CPU Intel VM; on a CI EPYC 7763 it changed neither throughput nor the
+  zero-copy result much, since there the hand-off itself (~20 us) is what an
+  operation costs. AIO needs none: `io_submit` does that work before
+  returning.
 - **Awaitable** that bridges I/O completion to coroutine resume.
 - **Buffer allocation** utilities (tagged by backend).
 

@@ -175,13 +175,20 @@ or SPDK, the backends the store is built to perform on.
 The comparison is paired, inside one process: `udepot_ng_bench --compare`
 runs rounds of a copy batch and a zero-copy batch back to back on one store
 (which goes first alternates), and reports the median of the rounds'
-zero-copy/copy ratios; the gate is the median of 5 such runs. Zero copy is
+zero-copy/copy ratios; the gate is the median of 5 such runs. Each batch
+keeps 32 operations in flight on one thread (`--qd 32`), as uDepot's script
+runs `udepot-test --trt-ntasks 32`. The bench ran them one at a time until
+the gate failed on a CI EPYC 7763: on tmpfs every io_uring operation is
+handed to an io-wq kernel worker, ~20 us there against ~1 us for the copy
+zero copy avoids, and one at a time that hand-off is all an operation is,
+so io_uring's zero-copy GET read 11% slower. Zero copy is
 uDepot's property, not the caller's: given a buffer it handed out
 (`alloc_put_buffer()`, `alloc_get_buffer()`), put and get do their I/O on
 it directly, and given other memory they copy through one of their own. So
-the bench sets both modes up as legacy's `udepot-test` does: one buffer per
-mode, allocated before timing and reused for every operation, plain memory
-for copy and uDepot's buffers for zero copy. Each put writes its key's
+the bench sets both modes up as legacy's `udepot-test` does: each
+operation slot (a TRT task there) has one buffer per mode, allocated before
+timing and reused for every operation of the slot, plain memory for copy
+and uDepot's buffers for zero copy. Each put writes its key's
 8-byte tag into the value and each get checks it.
 
 Two earlier versions measured the wrong thing: one allocated a `PutBuffer`
