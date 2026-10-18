@@ -240,7 +240,14 @@ void EpollState::poller_loop() {
     struct epoll_event events[kMaxEvents];
 
     while (running_.load(std::memory_order_acquire)) {
-        int timeout = (pending_waits_.load(std::memory_order_relaxed) > 0) ? 10 : 100;
+        // A coroutine resumed here (a connection handler) runs its store
+        // operations on this thread, and their I/O completes only when this
+        // thread polls: as uDepot's TRT scheduler ran its epoll and I/O
+        // pollers side by side, poll it, and do not block while it is out.
+        const bool io_pending = poll_this_thread();
+        int timeout = io_pending ? 0
+                      : (pending_waits_.load(std::memory_order_relaxed) > 0) ? 10
+                                                                            : 100;
         int n = epoll_wait(epfd_, events, kMaxEvents, timeout);
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -256,6 +263,8 @@ void EpollState::poller_loop() {
                 notify_maybe(fd, EpollOpType::kOut);
         }
     }
+    // I/O this thread submitted completes before it exits.
+    while (poll_this_thread()) {}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

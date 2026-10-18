@@ -5,6 +5,9 @@
 #include "udepot/io/aio.h"
 
 #include <algorithm>
+#include <chrono>
+#include <atomic>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -12,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -258,4 +262,102 @@ TEST_F(AioStoreTest, IndexSurvivesACleanReopen) {
         store.close();
         std::filesystem::remove(path);
     }
+}
+
+// A thread's first I/O creates its AIO context. When none can be had (the
+// system's contexts hold fs.aio-max-nr requests; io_setup fails with
+// EAGAIN, injected here), that I/O fails with -ENOMEM: -EAGAIN would mean a
+// full queue that the thread's own completions clear, so a caller retrying
+// it, and uDepot's own I/O (which does), would spin forever. Before, close()
+// from such a thread spun in its index flush until a context was freed.
+TEST(AioContext, NoContextFailsTheIoInsteadOfSpinning) {
+    const auto path = std::filesystem::temp_directory_path() /
+                      "udepot_aio_no_context_test";
+    StoreConfig config;
+    config.path = path.c_str();
+    config.size = kStoreSize;
+    config.grain_size = 512;
+    config.force_destroy = true;
+    struct ResetHook {
+        ~ResetHook() { AioIO::setup_test_hook = nullptr; }
+    } reset_hook;
+
+    auto store = std::make_unique<uDepot<AioIO>>();
+    ASSERT_EQ(store->open(config), 0);  // this thread's context: made here
+    ASSERT_EQ(store->put("kept", "value").run_sync(), 0);
+
+    AioIO::setup_test_hook = [] { return -EAGAIN; };
+    int put_rc = 0;
+    ::testing::internal::CaptureStderr();
+    std::thread([&] { put_rc = store->put("k", "v").run_sync(); }).join();
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    EXPECT_EQ(put_rc, -ENOMEM);
+    // Not silent: the thread says why, and what to change.
+    EXPECT_NE(log.find("can get no AIO context"), std::string::npos) << log;
+    EXPECT_NE(log.find("fs.aio-max-nr"), std::string::npos) << log;
+
+    // close() from a thread that cannot get a context: its index flush
+    // fails (the next open scans the log) rather than retrying forever. A
+    // close() that spins never returns, so it runs on a thread of its own
+    // and the test ends the process if it is still running: joining it, or
+    // a std::future's destructor, would hang the test instead of failing it.
+    std::atomic<bool> closed{false};
+    std::thread([&] {
+        store->close();
+        closed = true;
+    }).detach();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (!closed && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!closed) {
+        std::fprintf(stderr, "FAIL: close() spun on the missing context\n");
+        std::fflush(nullptr);
+        std::_Exit(1);
+    }
+    AioIO::setup_test_hook = nullptr;
+
+    uDepot<AioIO> again;
+    config.force_destroy = false;
+    ASSERT_EQ(again.open(config), 0);
+    EXPECT_FALSE(again.index_restored());
+    uint8_t val[64];
+    size_t val_size = 0;
+    ASSERT_EQ(again.get("kept", val, sizeof(val), &val_size).run_sync(), 0);
+    EXPECT_EQ(std::string_view(reinterpret_cast<char*>(val), val_size),
+              "value");
+    again.close();
+    std::filesystem::remove(path);
+}
+
+// Zero copy is counted, not only timed: a copying put or get copies its
+// value between the caller's memory and uDepot's record buffer once, a
+// zero-copy one (PutBuffer, GetBuffer) never. The zero-copy gate checks
+// the same count over O_DIRECT (scripts/perf-zerocopy.sh).
+TEST_F(AioStoreTest, ValueCopiesAreCountedPerThread) {
+    const std::string v(4000, 'v');
+    auto copies = [] { return uDepot<AioIO>::thread_value_copies(); };
+    uint64_t c = copies();
+    ASSERT_EQ(store_.put("copy", v).run_sync(), 0);
+    EXPECT_EQ(copies() - c, 1u);
+
+    c = copies();
+    std::vector<uint8_t> out(v.size());
+    size_t n = 0;
+    ASSERT_EQ(store_.get("copy", out.data(), out.size(), &n).run_sync(), 0);
+    EXPECT_EQ(copies() - c, 1u);
+
+    const std::string key = "zero";
+    auto pb = store_.alloc_put_buffer(key.size(), v.size());
+    ASSERT_TRUE(pb.valid());
+    std::memcpy(pb.value().data(), v.data(), v.size());
+    auto gb = store_.alloc_get_buffer(key.size(), v.size());
+    ASSERT_TRUE(gb.valid());
+    c = copies();
+    ASSERT_EQ(store_.put(uDepot<AioIO>::as_bytes(key), pb).run_sync(), 0);
+    ASSERT_EQ(store_.get(uDepot<AioIO>::as_bytes(key), &gb).run_sync(), 0);
+    EXPECT_EQ(copies() - c, 0u);
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(gb.value().data()),
+                               gb.value().size()),
+              v);
 }

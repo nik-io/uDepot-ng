@@ -15,22 +15,32 @@ using Store = udepot::uDepot<udepot::AioIO>;
 
 extern "C" {
 
-void* uDepotOpen(const char* fname, uint64_t size, int force_destroy) {
-    (void)force_destroy;
+// Small tables for tests, nothing inherent to the bindings: a store sized
+// for real use passes its own (uDepotOpenTables). Each directory table
+// fills one segment and all of its memory is touched when it is created
+// (clear()), so the store's default would be up to 512 MiB per table. A
+// segment this small maps on 4 KiB pages, and open() says so.
+static constexpr uint64_t kDefaultTableBytes = uint64_t{2} << 20;
 
-    auto* store = new (std::nothrow) Store();
-    if (!store) return nullptr;
+void* uDepotOpenTables(const char* fname, uint64_t size, int force_destroy,
+                       uint64_t table_bytes) {
+    (void)force_destroy;
 
     udepot::StoreConfig config;
     config.path = fname;
     config.size = static_cast<size_t>(size);
     config.grain_size = 4096;
-    // 2 MiB segments. Each directory table fills one segment, and all of
-    // its memory is touched at open (clear()): with the default segment
-    // (512 MiB) that is up to 512 MiB per table, here 2 MiB for 2^17
-    // buckets. 2 MiB is the smallest segment that still maps on huge pages.
-    config.segment_size = (size_t{2} << 20) / config.grain_size;
+    if (int rc = udepot::segment_size_for_table(table_bytes, config.grain_size,
+                                                &config.segment_size);
+        rc != 0) {
+        fprintf(stderr, "uDepot-ng: table size %llu is not a power of two "
+                "of at least 4096 bytes, nor 0 (the default)\n",
+                static_cast<unsigned long long>(table_bytes));
+        return nullptr;
+    }
 
+    auto* store = new (std::nothrow) Store();
+    if (!store) return nullptr;
     int rc = store->open(config);
     if (rc != 0) {
         fprintf(stderr, "failed to init uDepot-ng err=%s\n", strerror(-rc));
@@ -38,6 +48,10 @@ void* uDepotOpen(const char* fname, uint64_t size, int force_destroy) {
         return nullptr;
     }
     return static_cast<void*>(store);
+}
+
+void* uDepotOpen(const char* fname, uint64_t size, int force_destroy) {
+    return uDepotOpenTables(fname, size, force_destroy, kDefaultTableBytes);
 }
 
 // As uDepot's uDepotClose: shut the store down and free it. The caller

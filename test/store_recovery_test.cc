@@ -3,7 +3,9 @@
 
 #include "udepot/store.h"
 #include "udepot/io/posix.h"
+#include "udepot/table_region.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <gtest/gtest.h>
@@ -42,6 +45,7 @@ protected:
 
     void TearDown() override {
         uDepot<PosixIO>::index_footer_test_hook = nullptr;
+        uDepot<PosixIO>::index_format_test_hook = nullptr;
         uDepot<PosixIO>::index_segment_test_hook = nullptr;
         uDepot<PosixIO>::internal_io_test_hook = nullptr;
         uDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
@@ -606,6 +610,40 @@ TEST_P(StoreIndexTest, IncompleteIndexFallsBackToTheLog) {
     store.close();
 }
 
+// An index persisted in another format is not restored: before PR #9 a
+// tag was the hash's top 8 bits, and read as uDepot's (the 8 above the
+// bucket) such an index would miss keys it holds. The log scan rebuilds
+// it, and the next close writes the current format.
+TEST_P(StoreIndexTest, AnIndexOfAnotherFormatIsRebuiltFromTheLog) {
+    config_.size = 16 * 1024 * 1024 + 4096;
+    config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
+    uDepot<PosixIO>::index_format_test_hook = [](uint32_t) {
+        return uint32_t{0};
+    };
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        for (int i = 0; i < 1000; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        store.close();
+    }
+    uDepot<PosixIO>::index_format_test_hook = nullptr;
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(reopen_config()), 0);
+        EXPECT_FALSE(store.index_restored());
+        for (int i = 0; i < 1000; ++i)
+            ASSERT_EQ(get_value(store, make_key(i)), make_val(i)) << make_key(i);
+        store.close();
+    }
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(reopen_config()), 0);
+    EXPECT_TRUE(store.index_restored());
+    for (int i = 0; i < 1000; ++i)
+        ASSERT_EQ(get_value(store, make_key(i)), make_val(i)) << make_key(i);
+    store.close();
+}
+
 // As uDepot's directory, each table keeps one index segment for its life:
 // close() writes it back there, and the next open restores it from there.
 TEST_P(StoreIndexTest, TablesKeepTheirSegmentsAcrossReopen) {
@@ -687,8 +725,7 @@ TEST_P(StoreIndexTest, RestoredTablesKeepTheirSegmentsUnderChurn) {
 }
 
 // As uDepot's KV_conf::sanitize_segment_size, a store's segment size is
-// whole pages; with it the default segment (2^29 bytes + 2 grains) becomes
-// a 2 MiB multiple, which a table maps on huge pages.
+// whole pages.
 TEST_P(StoreIndexTest, SegmentSizeIsWholePages) {
     config_.size = 64 * 1024 * 1024 + 4096;
     config_.segment_size = 4096 + 2;  // 2 MiB + 2 grains
@@ -698,6 +735,218 @@ TEST_P(StoreIndexTest, SegmentSizeIsWholePages) {
     EXPECT_EQ(region.map_bytes(), size_t{4096} * config_.grain_size);
     EXPECT_EQ(region.map_bytes() % udepot::TableRegion::kHugePage, 0u);
     store.close();
+}
+
+// The bindings size a store by its tables: 0 is the store's default
+// segment, a power of two of at least 4 KiB its fitted one, anything else
+// -EINVAL.
+TEST(FittedSegmentSize, SegmentSizeForTable) {
+    uint64_t seg = 1;
+    EXPECT_EQ(udepot::segment_size_for_table(0, 4096, &seg), 0);
+    EXPECT_EQ(seg, 0u);
+    EXPECT_EQ(udepot::segment_size_for_table(size_t{2} << 20, 4096, &seg), 0);
+    EXPECT_EQ(seg, udepot::fitted_segment_size(size_t{2} << 20, 4096));
+    EXPECT_EQ(udepot::segment_size_for_table(4096, 512, &seg), 0);
+    EXPECT_EQ(seg, udepot::fitted_segment_size(4096, 512));
+    seg = 7;
+    EXPECT_EQ(udepot::segment_size_for_table(2048, 512, &seg), -EINVAL);
+    EXPECT_EQ(udepot::segment_size_for_table(6 << 20, 512, &seg), -EINVAL);
+    EXPECT_EQ(udepot::segment_size_for_table(udepot::kMaxTableBytes * 2, 512,
+                                             &seg), -EINVAL);
+    EXPECT_EQ(udepot::segment_size_for_table(uint64_t{1} << 63, 512, &seg),
+              -EINVAL);
+    uint64_t largest = 0;
+    EXPECT_EQ(udepot::segment_size_for_table(udepot::kMaxTableBytes, 512,
+                                             &largest), 0);
+    EXPECT_GT(largest, 0u);
+    EXPECT_EQ(seg, 7u);  // untouched on failure
+}
+
+// A fitted segment's table holds exactly the buckets it was fitted for:
+// the next power of two does not fit, so the table fills more than half
+// of it, and all but the room it needs (header, footer, last neighborhood,
+// salsa metadata, rounded up to a page) when the table is large. A segment
+// of a power of two of bytes held half the table it was meant for.
+TEST(FittedSegmentSize, TheTableFillsItsSegment) {
+    for (uint32_t grain : {512u, 4096u}) {
+        const size_t md = std::max<size_t>(512, grain);  // salsa md grain
+        for (int k = 12; k <= 29; ++k) {
+            SCOPED_TRACE("grain " + std::to_string(grain) + ", table 2^" +
+                         std::to_string(k) + " bytes");
+            const uint64_t table = uint64_t{1} << k;
+            const uint64_t seg = udepot::fitted_segment_size(table, grain);
+            const uint64_t seg_bytes = seg * grain;
+            EXPECT_EQ(seg_bytes % 4096, 0u);  // whole pages
+            const uint32_t bits = udepot::HashTable::index_bits_for(
+                static_cast<size_t>(seg_bytes - md));
+            EXPECT_EQ(uint64_t{8} << bits, table);  // 8-byte slots
+            EXPECT_LE(seg_bytes - table, 2 * std::max<uint64_t>(4096, grain));
+        }
+        // A power of two of bytes holds half that table.
+        EXPECT_EQ(udepot::HashTable::index_bits_for((size_t{1} << 25) - md),
+                  21u);
+        EXPECT_EQ(udepot::HashTable::index_bits_for(
+                      udepot::fitted_segment_size(size_t{1} << 25, grain) *
+                          grain -
+                      md),
+                  22u);
+    }
+}
+
+// The default segment, halved until it fits the device, is a fitted one:
+// its table fills it. Also on devices that are an exact multiple of a
+// fitted size, which leave no tail for the device metadata at that size:
+// the search for a size that does must stay among fitted ones (it once
+// settled on a power of two of bytes, half of whose table went unused).
+// A segment whose tables would waste more than 1/8 of a huge-page
+// mapping maps them on 4 KiB pages, and open() says so, naming what that
+// costs: slower grows first. The bindings' (a 2 MiB table, 4 KiB grains)
+// is one; a 16 MiB table's segment keeps huge pages and says nothing.
+TEST_P(StoreIndexTest, OpenSaysWhenTablesMissHugePages) {
+    config_.grain_size = 4096;
+    auto open_log = [&](size_t table_bytes) {
+        const uint64_t seg =
+            udepot::fitted_segment_size(table_bytes, config_.grain_size);
+        config_.segment_size = seg;
+        config_.size = 32 * seg * config_.grain_size + 4096;
+        uDepot<PosixIO> store;
+        ::testing::internal::CaptureStderr();
+        const int rc = store.open(config());
+        std::string log = ::testing::internal::GetCapturedStderr();
+        EXPECT_EQ(rc, 0);
+        if (rc == 0) {
+            const auto& region =
+                store.directory().snapshot().tables[0]->region();
+            if (!udepot::TableRegion::wants_huge_pages(seg *
+                                                       config_.grain_size)) {
+                EXPECT_FALSE(region.huge());
+                EXPECT_EQ(region.map_bytes(), seg * config_.grain_size);
+            }
+            store.close();
+        }
+        std::filesystem::remove(path_);
+        return log;
+    };
+    const std::string small = open_log(size_t{2} << 20);
+    EXPECT_NE(small.find("index tables map on 4 KiB pages"), std::string::npos)
+        << small;
+    EXPECT_NE(small.find("directory grows to be slower"), std::string::npos)
+        << small;
+    const std::string large = open_log(size_t{16} << 20);
+    EXPECT_EQ(large.find("index tables map on 4 KiB pages"),
+              std::string::npos)
+        << large;
+}
+
+// A device too small for the segment asked for, or the default, makes it
+// smaller, and every table with it; open() says so, naming both. A device
+// with room for it says nothing.
+TEST_P(StoreIndexTest, OpenSaysWhenTheDeviceShrinksTheSegment) {
+    config_.grain_size = 4096;
+    auto open_log = [&](uint64_t segment_size, size_t device) {
+        config_.segment_size = segment_size;
+        config_.size = device;
+        uDepot<PosixIO> store;
+        ::testing::internal::CaptureStderr();
+        const int rc = store.open(config());
+        std::string log = ::testing::internal::GetCapturedStderr();
+        EXPECT_EQ(rc, 0);
+        if (rc == 0) {
+            EXPECT_EQ(store.put("k", "v").run_sync(), 0);
+            store.close();
+        }
+        std::filesystem::remove(path_);
+        return log;
+    };
+    const uint64_t seg =
+        udepot::fitted_segment_size(size_t{2} << 20, config_.grain_size);
+    const std::string small = open_log(seg, 4 << 20);
+    EXPECT_NE(small.find("the requested segments of 2056 KiB (index tables "
+                         "of 2048 KiB) do not fit"),
+              std::string::npos) << small;
+    const std::string fits =
+        open_log(seg, 32 * seg * config_.grain_size + 4096);
+    EXPECT_EQ(fits.find("do not fit"), std::string::npos) << fits;
+    const std::string dflt = open_log(0, 4 << 20);
+    EXPECT_NE(dflt.find("the default segments of"), std::string::npos) << dflt;
+    EXPECT_NE(dflt.find("do not fit"), std::string::npos) << dflt;
+}
+
+// No silent fallback: a table that wants huge pages and cannot have them
+// (none free) maps on 4 KiB pages, and the open says so, once, whether it
+// creates the table or restores it; the next open says it again. With
+// huge pages free, nothing is said.
+TEST_P(StoreIndexTest, OpenSaysWhenNoHugePagesAreFree) {
+    config_.grain_size = 4096;
+    const uint64_t seg =
+        udepot::fitted_segment_size(size_t{16} << 20, config_.grain_size);
+    const size_t seg_bytes = seg * config_.grain_size;
+    ASSERT_TRUE(udepot::TableRegion::wants_huge_pages(seg_bytes));
+    config_.segment_size = seg;
+    config_.size = 32 * seg_bytes + 4096;
+
+    auto count = [](const std::string& log) {
+        int n = 0;
+        for (size_t at = 0;
+             (at = log.find("no 2 MiB huge pages", at)) != std::string::npos;
+             ++at)
+            ++n;
+        return n;
+    };
+    for (int round = 0; round < 2; ++round) {
+        uDepot<PosixIO> store;
+        ::testing::internal::CaptureStderr();
+        const int rc = store.open(round == 0 ? config() : reopen_config());
+        const std::string log = ::testing::internal::GetCapturedStderr();
+        ASSERT_EQ(rc, 0);
+        // Whether it got huge pages, rather than a probe beforehand that a
+        // test running alongside could invalidate.
+        const auto& region = store.directory().snapshot().tables[0]->region();
+        EXPECT_EQ(count(log), region.huge() ? 0 : 1) << log;
+        if (!region.huge()) {
+            EXPECT_NE(region.huge_error(), 0);
+            EXPECT_NE(log.find("directory grows to be slower"),
+                      std::string::npos) << log;
+        }
+        ASSERT_EQ(store.put("k", "v").run_sync(), 0);
+        store.close();
+    }
+}
+
+TEST_P(StoreIndexTest, TheDefaultSegmentsTableFillsIt) {
+    std::vector<size_t> sizes = {256 * 1024 * 1024 + 4096};
+    for (int k : {21, 22, 23})
+        for (size_t n : {16u, 24u, 32u, 40u, 48u, 64u})
+            sizes.push_back(n * udepot::fitted_segment_size(size_t{1} << k,
+                                                            config_.grain_size) *
+                            config_.grain_size);
+    for (size_t size : sizes) {
+        SCOPED_TRACE("device " + std::to_string(size) + " B");
+        config_.size = size;
+        config_.segment_size = 0;
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        const auto& table = *store.directory().snapshot().tables[0];
+        const size_t used = 2 * udepot::TableRegion::kMdBytes +
+                            table.total_slots() * sizeof(uint64_t);
+        EXPECT_GT(used, table.region().net_bytes() * 9 / 10)
+            << "a table of 2^" << table.index_bits() << " buckets in a net "
+            << table.region().net_bytes() << " B segment";
+        EXPECT_EQ(table.region().net_bytes() + config_.grain_size,
+                  udepot::fitted_segment_size(size_t{8} << table.index_bits(),
+                                              config_.grain_size) *
+                      config_.grain_size);
+        for (int i = 0; i < 100; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        store.close();
+        uDepot<PosixIO> again;
+        ASSERT_EQ(again.open(reopen_config()), 0);
+        EXPECT_TRUE(again.index_restored());
+        for (int i = 0; i < 100; ++i)
+            ASSERT_EQ(get_value(again, make_key(i)), make_val(i));
+        again.close();
+        std::filesystem::remove(path_);
+    }
 }
 
 // The index holds its segments for the whole session, so a store full of

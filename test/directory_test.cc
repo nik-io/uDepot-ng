@@ -21,7 +21,7 @@ using udepot::hash_to_tag;
 
 static uint64_t make_hash(uint64_t bucket, uint8_t tag, uint32_t index_bits) {
     uint64_t mask = (1ULL << index_bits) - 1;
-    return (static_cast<uint64_t>(tag) << 56) | (bucket & mask);
+    return (static_cast<uint64_t>(tag) << index_bits) | (bucket & mask);
 }
 
 class DirectoryTest : public ::testing::Test {
@@ -43,6 +43,17 @@ TEST_F(DirectoryTest, InsertAndLookup) {
     EXPECT_EQ(found.key_tag(), 0xCC);
     EXPECT_EQ(found.pba(), 1000u);
     rcu_.read_unlock(rcu_idx_);
+}
+
+// As uDepot's hash_to_dir_idx_: a key's table is the top bits of its tag,
+// the 8 hash bits above the bucket's; the hash's own top bits play no part.
+TEST_F(DirectoryTest, TableIsTheTopBitsOfTheTag) {
+    MemTables source(10);
+    Directory dir(rcu_, source, source.initial(2));
+    const auto& snap = dir.snapshot();
+    ASSERT_EQ(snap.table_bits, 1u);
+    EXPECT_EQ(snap.table_index(make_hash(42, 0x80, 10)), 1u);
+    EXPECT_EQ(snap.table_index(make_hash(42, 0x7F, 10) | (1ULL << 63)), 0u);
 }
 
 TEST_F(DirectoryTest, LookupMiss) {

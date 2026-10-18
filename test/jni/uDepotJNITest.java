@@ -30,7 +30,15 @@ class uDepotJNITest {
 
     uDepotJNITest(String fname, long size) {
         KV = new uDepotJNI();
-        int rc = KV.init(fname, size, true);
+        // A table size that is not a power of two of at least 4096 bytes
+        // (nor 0, the store's default) is refused before anything opens.
+        check(KV.initWithTables(fname, size, true, 3000) == 22,
+              "initWithTables rejects a bad table size with EINVAL");
+        check(KV.initWithTables(fname, size, true, 2048) == 22,
+              "initWithTables rejects a table under 4 KiB with EINVAL");
+        // An explicit table size, through the call that takes one (init()
+        // passes DEFAULT_TABLE_SIZE to it).
+        int rc = KV.initWithTables(fname, size, true, 1L << 20);
         if (rc != 0)
             throw new RuntimeException("init failed: " + rc);
     }

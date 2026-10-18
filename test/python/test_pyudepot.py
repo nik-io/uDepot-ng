@@ -125,3 +125,84 @@ class TestClose:
         with pytest.raises(ValueError):
             kv.exists(_key("k"))
         kv._cleanup()  # closing twice is harmless
+
+
+class TestTableSize:
+    """The index table size is the caller's: 2 MiB by default, for tests;
+    any power of two of at least 4096 bytes, or 0 for the store's default.
+    A table too small for huge pages makes the store say so at open."""
+
+    def _open(self, tmp_path, **kwargs):
+        return pyudepot.uDepot(file_name=str(tmp_path / "tables"),
+                               size=STORE_SIZE, force_destroy=True, **kwargs)
+
+    def test_default_is_2_mib_and_says_so(self, tmp_path, capfd):
+        assert pyudepot.DEFAULT_TABLE_SIZE == 2 * 1024 * 1024
+        # Room for 32 segments of a 2 MiB table (2 MiB + 8 KiB each), and
+        # the device metadata's tail; a smaller device halves the segment.
+        kv = pyudepot.uDepot(file_name=str(tmp_path / "tables"),
+                             size=32 * (2 * 1024 * 1024 + 8192) + 4096,
+                             force_destroy=True)
+        assert kv.put(_key("k"), _val("v"))
+        kv._cleanup()
+        err = capfd.readouterr().err
+        assert "index tables map on 4 KiB pages" in err
+        assert "directory grows to be slower" in err
+        assert "do not fit" not in err  # the device has room for them
+
+    def test_a_device_too_small_for_the_tables_says_so(self, tmp_path, capfd):
+        # 4 MiB holds too few 2 MiB-table segments: the store makes them
+        # smaller, and with them the tables, and says so.
+        kv = self._open(tmp_path)
+        assert kv.put(_key("k"), _val("v"))
+        kv._cleanup()
+        err = capfd.readouterr().err
+        assert "the requested segments of" in err
+        assert "do not fit" in err
+
+    @pytest.mark.parametrize("table_size,named", [
+        (1024 * 1024, "the requested segments of 1032 KiB (index tables of 1024 KiB)"),
+        (2 * 1024 * 1024, "the requested segments of 2056 KiB (index tables of 2048 KiB)"),
+        (0, "the default segments of"),
+    ])
+    def test_the_table_size_reaches_the_store(self, tmp_path, capfd,
+                                              table_size, named):
+        # On a device too small for them the store names the tables it was
+        # asked for: the size given here, not the binding's default.
+        kv = self._open(tmp_path, table_size=table_size)
+        kv._cleanup()
+        assert named in capfd.readouterr().err
+
+    @staticmethod
+    def _fitting_size(table_size):
+        # Room for 32 segments of the table and the device metadata's tail.
+        page = 4096
+        seg = (table_size + 2 * 512 + 32 * 8 + page + page - 1) // page * page
+        return 32 * seg + 4096
+
+    @pytest.mark.parametrize("table_size", [4096, 1024 * 1024])
+    def test_configured_table_size_round_trips(self, tmp_path, capfd,
+                                               table_size):
+        kv = pyudepot.uDepot(file_name=str(tmp_path / "tables"),
+                             size=self._fitting_size(table_size),
+                             force_destroy=True, table_size=table_size)
+        assert kv.put(_key("k"), _val("v"))
+        out = np.zeros(1, dtype=np.uint8)
+        assert kv.get(_key("k"), out)
+        assert out.tobytes() == b"v"
+        kv._cleanup()
+        assert "do not fit" not in capfd.readouterr().err
+
+    def test_the_default_table_size_round_trips(self, tmp_path):
+        kv = self._open(tmp_path, table_size=0)
+        assert kv.put(_key("k"), _val("v"))
+        out = np.zeros(1, dtype=np.uint8)
+        assert kv.get(_key("k"), out)
+        assert out.tobytes() == b"v"
+        kv._cleanup()
+
+    @pytest.mark.parametrize("table_size",
+                             [3000, 2048, 6 * 1024 * 1024, 1 << 41, 1 << 63])
+    def test_invalid_table_size_fails_open(self, tmp_path, table_size):
+        with pytest.raises(IOError):
+            self._open(tmp_path, table_size=table_size)

@@ -3,9 +3,16 @@
 
 #include "udepot/io/uring.h"
 
+#include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <thread>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -169,8 +176,8 @@ TEST_F(UringIOTest, MoreInFlightThanCompletionQueue) {
     EXPECT_EQ(bad, 0);
 }
 
-// close() with I/O in flight must complete it rather than stop the poller
-// and leave those coroutines suspended forever.
+// close() with I/O in flight from the closing thread must complete it
+// rather than leave those coroutines suspended forever.
 TEST_F(UringIOTest, CloseCompletesInFlightIo) {
     constexpr int kInFlight = 4096;
     constexpr int kBlocks = 1024;
@@ -195,4 +202,137 @@ TEST_F(UringIOTest, CloseCompletesInFlightIo) {
     if (stranded == 0) {
         for (auto& t : tasks) EXPECT_EQ(t.run_sync(), ssize_t{kBlock});
     }
+}
+
+// A thread's ring is torn down when the thread exits, and the kernel may
+// map the next io_uring_queue_init's ring at the same addresses. Nothing
+// the program does orders the old thread's ring accesses before the new
+// thread's -- the kernel does -- so TSAN reported races on the SQEs and the
+// CQ head. Here each thread
+// starts only once the previous one is gone from the kernel, a wait TSAN
+// cannot see, and none is joined before the last has run; the kernel reuses
+// the address often enough that one of the generations hits it.
+TEST_F(UringIOTest, ANewThreadsRingMayReuseAnExitedThreadsRing) {
+    constexpr int kGenerations = 32;
+    UringIO io;
+    ASSERT_EQ(io.open(path_.c_str(), 4096), 0);
+    auto buf = io.alloc_buffer(4096);
+    ASSERT_NE(buf.data, nullptr);
+    std::memset(buf.data, 0x5a, 4096);
+    ASSERT_EQ(io.pwrite(buf.data, 4096, 0).run_sync(), ssize_t{4096});
+
+    struct Generation {
+        ssize_t rc = 0;
+        std::atomic<pid_t> tid{0};
+    };
+    std::vector<Generation> gens(kGenerations);
+    std::vector<std::thread> threads;
+    for (Generation& g : gens) {
+        threads.emplace_back([&io, &buf, &g] {
+            g.rc = io.pread(buf.data, 4096, 0).run_sync();
+            g.tid.store(gettid(), std::memory_order_relaxed);
+        });
+        pid_t tid;
+        while ((tid = g.tid.load(std::memory_order_relaxed)) == 0)
+            std::this_thread::yield();
+        // Gone from the kernel: its thread-local ring has been torn down.
+        while (syscall(SYS_tgkill, getpid(), tid, 0) == 0)
+            std::this_thread::yield();
+    }
+    for (std::thread& t : threads) t.join();
+    for (const Generation& g : gens) EXPECT_EQ(g.rc, ssize_t{4096});
+}
+
+// As uDepot, the store is opened O_DIRECT, so the device transfers straight
+// to and from the caller's buffers. On a filesystem that takes it (CI's
+// /tmp is ext4, and the workflow checks it does) the backend must have it,
+// not quietly fall back to buffered I/O.
+TEST_F(UringIOTest, OpensODirectWhereTheFilesystemTakesIt) {
+    const std::string probe = path_.string() + ".probe";
+    const int fd = ::open(probe.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0666);
+    const bool takes_it = fd >= 0;
+    if (fd >= 0) ::close(fd);
+    std::filesystem::remove(probe);
+
+    UringIO io;
+    ASSERT_EQ(io.open(path_.c_str(), 4096), 0);
+    EXPECT_EQ(io.direct(), takes_it);
+    EXPECT_EQ(::fcntl(io.fd_for_test(), F_GETFL) & O_DIRECT,
+              takes_it ? O_DIRECT : 0);
+    io.close();
+}
+
+// A filesystem that refuses O_DIRECT (injected) gets buffered I/O, which
+// copies every value through the page cache, and the open says so.
+TEST_F(UringIOTest, RefusedODirectFallsBackAndSaysSo) {
+    udepot::refuse_direct_test = true;
+    struct Reset {
+        ~Reset() { udepot::refuse_direct_test = false; }
+    } reset;
+    UringIO io;
+    ::testing::internal::CaptureStderr();
+    const int rc = io.open(path_.c_str(), 4096);
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    ASSERT_EQ(rc, 0);
+    EXPECT_FALSE(io.direct());
+    EXPECT_EQ(::fcntl(io.fd_for_test(), F_GETFL) & O_DIRECT, 0);
+    EXPECT_NE(log.find("does not take O_DIRECT"), std::string::npos) << log;
+    EXPECT_NE(log.find("no zero copy"), std::string::npos) << log;
+
+    auto buf = io.alloc_buffer(4096);
+    std::memset(buf.data, 0x5a, 4096);
+    ASSERT_EQ(io.pwrite(buf.data, 4096, 0).run_sync(), ssize_t{4096});
+    std::memset(buf.data, 0, 4096);
+    ASSERT_EQ(io.pread(buf.data, 4096, 0).run_sync(), ssize_t{4096});
+    EXPECT_EQ(static_cast<uint8_t*>(buf.data)[4095], 0x5a);
+    io.close();
+}
+
+// The store file is preallocated, not sparse (uDepot ftruncates): an
+// O_DIRECT write into a hole has to allocate, which it cannot do without
+// blocking. Reopening keeps what is there.
+TEST_F(UringIOTest, PreallocatesTheStoreAndKeepsItsData) {
+    constexpr size_t kSize = size_t{1} << 20;
+    {
+        UringIO io;
+        ASSERT_EQ(io.open(path_.c_str(), kSize), 0);
+        struct stat st;
+        ASSERT_EQ(::stat(path_.c_str(), &st), 0);
+        EXPECT_EQ(static_cast<size_t>(st.st_size), kSize);
+        EXPECT_GE(static_cast<size_t>(st.st_blocks) * 512, kSize)
+            << "sparse: not preallocated";
+        auto buf = io.alloc_buffer(4096);
+        std::memset(buf.data, 0x7e, 4096);
+        ASSERT_EQ(io.pwrite(buf.data, 4096, kSize - 4096).run_sync(),
+                  ssize_t{4096});
+        io.close();
+    }
+    UringIO io;
+    ASSERT_EQ(io.open(path_.c_str(), kSize), 0);
+    auto buf = io.alloc_buffer(4096);
+    ASSERT_EQ(io.pread(buf.data, 4096, kSize - 4096).run_sync(),
+              ssize_t{4096});
+    EXPECT_EQ(static_cast<uint8_t*>(buf.data)[0], 0x7e);
+    io.close();
+}
+
+// A filesystem that cannot preallocate (injected) gets a sparse file of
+// the size asked for, and the open says so.
+TEST_F(UringIOTest, CannotPreallocateFallsBackToSparseAndSaysSo) {
+    udepot::refuse_fallocate_test = true;
+    struct Reset {
+        ~Reset() { udepot::refuse_fallocate_test = false; }
+    } reset;
+    constexpr size_t kSize = size_t{1} << 20;
+    UringIO io;
+    ::testing::internal::CaptureStderr();
+    const int rc = io.open(path_.c_str(), kSize);
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    ASSERT_EQ(rc, 0);
+    EXPECT_NE(log.find("cannot be preallocated"), std::string::npos) << log;
+    struct stat st;
+    ASSERT_EQ(::stat(path_.c_str(), &st), 0);
+    EXPECT_EQ(static_cast<size_t>(st.st_size), kSize);
+    EXPECT_LT(static_cast<size_t>(st.st_blocks) * 512, kSize);  // sparse
+    io.close();
 }

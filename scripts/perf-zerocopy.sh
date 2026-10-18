@@ -30,6 +30,12 @@
 # store's own DMA buffers, which SPDK counts: a zero-copy run must copy no
 # I/O through a bounce buffer (exact).
 #
+# Besides timing, an exact check: zero-copy batches copy no value between
+# the caller's memory and uDepot's record buffers, and copying ones copy
+# every value. O_DIRECT is not this script's to check: the unit tests run
+# AIO and io_uring over O_DIRECT (CLAUDE.md, "O_DIRECT"); this one stays on
+# tmpfs for low noise.
+#
 # Usage: perf-zerocopy.sh <backend> [build_dir] [batch] [runs] [min_gain%]
 #   <backend>  aio, uring or spdk. Not posix: PosixIO is buffered
 #              pread/pwrite, so the kernel copies every value through the page
@@ -55,6 +61,12 @@ RUNS="${4:-5}"
 # nothing, so it is strictly faster, never merely as fast.
 MIN_GAIN="${5:-0}"
 ROUNDS="${ROUNDS:-15}"    # 2 x 15 x 500 x 32 KiB fits the 1 GiB store
+# Operations in flight, as uDepot's script runs udepot-test with
+# --trt-ntasks 32 on one thread. One at a time, every io_uring operation on
+# tmpfs waited out a hand-off to an io-wq kernel worker (~20 us on a CI
+# EPYC 7763, against ~1 us for the copy zero copy avoids), so the gate
+# measured the scheduler: zero-copy GET read 11% slower there.
+QD="${QD:-32}"
 # Large enough that a value copy is a visible share of an operation: at
 # 1 KiB a copy costs ~30 ns of a ~1.6 us put, and a zero-copy path that
 # copied twice stayed inside the old 5% tolerance.
@@ -66,7 +78,9 @@ case "$BUILD_DIR" in
     *)  BIN="$HERE/$BUILD_DIR/udepot_ng_bench" ;;
 esac
 FILE="/dev/shm/udepot-ng-zc-${BACKEND}.store"
-trap 'rm -f "$FILE"' EXIT   # do not leave a ~1GB store on /dev/shm
+ERRS="$(mktemp)"            # the bench's stderr, for its warnings
+SEEN="$(mktemp)"            # warnings already shown
+trap 'rm -f "$FILE" "$ERRS" "$SEEN"' EXIT   # do not leave a ~1GB store on /dev/shm
 
 [ -x "$BIN" ] || { echo "FATAL: $BIN not found" >&2; exit 2; }
 WHERE="on /dev/shm"
@@ -86,25 +100,23 @@ fi
     if command -v lscpu >/dev/null; then
         lscpu | grep -E '^(Model name|L1d cache|L2 cache|L3 cache):' | sed 's/^/  /'
     fi
-    if [ "$BACKEND" != "spdk" ]; then
-        # AIO and io_uring open the store O_DIRECT, falling back to buffered
-        # I/O where the filesystem refuses it.
-        if dd if=/dev/zero of="$FILE" bs=4096 count=1 oflag=direct status=none 2>/dev/null
-        then echo "  O_DIRECT on /dev/shm: yes"
-        else echo "  O_DIRECT on /dev/shm: no (the backend falls back to buffered I/O)"
-        fi
-        rm -f "$FILE"
-    fi
 } >&2
 
-# One run; echo "put_delta get_delta bounced put_copy put_zc get_copy get_zc"
-# (bounced: SPDK only, else 0; throughputs in Mops/s as the bench prints
-# them, the medians of the run's batches).
+# One run; echo "put_delta get_delta bounced put_copy put_zc get_copy get_zc
+# copied_copy copied_zc" (bounced: SPDK only, else 0; throughputs in Mops/s
+# as the bench prints them, the medians of the run's batches; copied: values
+# the copying and zero-copy batches copied).
 run_compare() {
     rm -f "$FILE"
     local out
     out=$("$BIN" --backend "$BACKEND" -f "$FILE" --size "$SIZE" -w "$BATCH" \
-        --val-size "$VAL" --grain-size 512 --compare "$ROUNDS" 2>/dev/null)
+        --val-size "$VAL" --grain-size 512 --compare "$ROUNDS" --qd "$QD" \
+        2>"$ERRS")
+    # No silent fallback: what the store said (buffered I/O, a sparse file,
+    # a shrunk segment...) is shown, once.
+    grep '^udepot:' "$ERRS" | while IFS= read -r line; do
+        grep -qxF -- "$line" "$SEEN" || { echo "$line" >> "$SEEN"; echo "  $line" >&2; }
+    done
     local dp dg b pc pz gc gz
     dp=$(grep '^CMP PUT' <<<"$out" | grep -oE 'delta=[-+0-9.]+' | cut -d= -f2)
     dg=$(grep '^CMP GET' <<<"$out" | grep -oE 'delta=[-+0-9.]+' | cut -d= -f2)
@@ -114,17 +126,23 @@ run_compare() {
     pz=$(grep '^CMP PUT' <<<"$out" | grep -oE 'zero_copy=[0-9.]+' | cut -d= -f2)
     gc=$(grep '^CMP GET' <<<"$out" | grep -oE ' copy=[0-9.]+' | cut -d= -f2)
     gz=$(grep '^CMP GET' <<<"$out" | grep -oE 'zero_copy=[0-9.]+' | cut -d= -f2)
-    echo "${dp#+} ${dg#+} $b $pc $pz $gc $gz"  # sort -n does not take a leading +
+    local cc cz
+    cc=$(grep '^COPIES' <<<"$out" | grep -oE ' copy=[0-9]+' | cut -d= -f2)
+    cz=$(grep '^COPIES' <<<"$out" | grep -oE 'zero_copy=[0-9]+' | cut -d= -f2)
+    # sort -n does not take a leading +
+    echo "${dp#+} ${dg#+} $b $pc $pz $gc $gz ${cc:-x} ${cz:-x}"
 }
 
 median() { printf '%s\n' "$@" | sort -n | \
     awk '{a[NR]=$1} END{n=NR; if(n==0){print 0} else if(n%2){print a[(n+1)/2]} else {printf "%.6f",(a[n/2]+a[n/2+1])/2}}'; }
 
-dps=(); dgs=(); bounced=0
+dps=(); dgs=(); bounced=0; copied_copy=0; copied_zc=0
 for it in $(seq 1 "$RUNS"); do
-    read -r dp dg b pc pz gc gz <<<"$(run_compare)"
-    { [ -n "$dp" ] && [ -n "$dg" ] && [ -n "$b" ] && [ -n "$gz" ]; } \
+    read -r dp dg b pc pz gc gz cc cz <<<"$(run_compare)"
+    { [ -n "$dp" ] && [ -n "$dg" ] && [ -n "$b" ] && [ -n "$gz" ] && \
+      [ "$cc" != x ] && [ "$cz" != x ]; } \
         || { echo "a udepot_ng_bench --compare run produced no result" >&2; exit 2; }
+    copied_copy=$((copied_copy + cc)); copied_zc=$((copied_zc + cz))
     awk -v it="$it" -v dp="$dp" -v dg="$dg" -v pc="$pc" -v pz="$pz" \
         -v gc="$gc" -v gz="$gz" 'BEGIN{
         printf("  run %s: PUT delta=%s%% (copy %.1f, zero copy %.1f kops/s)" \
@@ -134,7 +152,7 @@ for it in $(seq 1 "$RUNS"); do
     bounced=$((bounced + b))
 done
 
-echo "${BACKEND}: median of ${RUNS} runs, each the median of ${ROUNDS} paired batches of ${BATCH} ops of ${VAL} B, ${WHERE}:" >&2
+echo "${BACKEND}: median of ${RUNS} runs, each the median of ${ROUNDS} paired batches of ${BATCH} ops of ${VAL} B, ${QD} in flight, ${WHERE}:" >&2
 
 # Gate each phase: fail unless zero copy is faster than copy by > MIN_GAIN%.
 check_delta() {  # delta% phase-name
@@ -148,6 +166,18 @@ check_delta() {  # delta% phase-name
 rc=0
 check_delta "$(median "${dps[@]}")" PUT || rc=1
 check_delta "$(median "${dgs[@]}")" GET || rc=1
+# Exact: the zero-copy path copied no value, the copying one every value
+# (each of its puts and gets one: 2 phases x ROUNDS batches x BATCH ops).
+want_copies=$((RUNS * 2 * ROUNDS * BATCH))
+echo "  values copied: zero copy ${copied_zc} (fail if any), copy ${copied_copy} (fail unless ${want_copies})" >&2
+if [ "$copied_zc" -ne 0 ]; then
+    echo "FAIL: the zero-copy path copied ${copied_zc} values" >&2
+    rc=1
+fi
+if [ "$copied_copy" -ne "$want_copies" ]; then
+    echo "FAIL: the copying path copied ${copied_copy} values, not one per operation (${want_copies})" >&2
+    rc=1
+fi
 if [ "$BACKEND" = "spdk" ]; then
     echo "  zero-copy I/Os bounced through a DMA copy: ${bounced} (fail if any)" >&2
     if [ "$bounced" -ne 0 ]; then
@@ -157,6 +187,7 @@ if [ "$BACKEND" = "spdk" ]; then
 fi
 if [ "$rc" -eq 0 ]; then
     echo "OK: zero-copy faster than copy on PUT and GET" >&2
+    echo "OK: zero copy copied no value" >&2
     [ "$BACKEND" = "spdk" ] && \
         echo "OK: zero-copy put/get transferred straight from the store's DMA buffers" >&2
 fi

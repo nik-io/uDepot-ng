@@ -284,16 +284,17 @@ TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
 // not stop at the first tag match.
 
 // Search for a pair of short keys whose CityHash64 values share the same
-// tag (top 8 bits, so also the table) and bucket (low index_bits bits).
+// bucket (low index_bits bits) and tag (the 8 above them, which also pick
+// the table): uDepot's key fingerprint.
 static std::pair<std::string, std::string> find_colliding_keys(
     uint32_t index_bits) {
-    const uint64_t bucket_mask = (1ULL << index_bits) - 1;
+    const uint64_t fp_mask = (1ULL << (index_bits + 8)) - 1;
     // Birthday search: about 2^((8 + index_bits) / 2) keys find a pair.
     std::unordered_map<uint64_t, std::string> seen;
     for (int a = 0; a < (1 << 22); ++a) {
         std::string k = "col_" + std::to_string(a);
         uint64_t h = CityHash64(k.data(), k.size());
-        auto [it, inserted] = seen.emplace((h >> 56) << 40 | (h & bucket_mask), k);
+        auto [it, inserted] = seen.emplace(h & fp_mask, k);
         if (!inserted) return {it->second, k};
     }
     ADD_FAILURE() << "no colliding pair found";

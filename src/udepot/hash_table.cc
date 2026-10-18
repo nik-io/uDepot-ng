@@ -64,7 +64,7 @@ HashTable::~HashTable() = default;
 HashEntry HashTable::lookup(uint64_t hash, uint32_t start_offset,
                             bool include_deleted) const noexcept {
     uint64_t bucket = hash_to_bucket(hash);
-    uint8_t tag = hash_to_tag(hash);
+    uint8_t tag = tag_of(hash);
 
     for (uint32_t i = start_offset; i < HashEntry::kHopRange; ++i) {
         HashEntry entry = HashEntry::load(slot(bucket + i));
@@ -106,7 +106,7 @@ bool HashTable::remove(uint64_t hash, uint64_t pba) {
 
 int HashTable::insert_locked(uint64_t hash, uint16_t kv_size, uint64_t pba) {
     uint64_t bucket = hash_to_bucket(hash);
-    uint8_t tag = hash_to_tag(hash);
+    uint8_t tag = tag_of(hash);
 
     uint64_t free_idx = find_free_slot(bucket);
     if (free_idx >= total_slots()) return -1;
@@ -123,7 +123,7 @@ int HashTable::insert_locked(uint64_t hash, uint16_t kv_size, uint64_t pba) {
 
 uint64_t HashTable::find_pba(uint64_t hash, uint64_t pba) const noexcept {
     uint64_t bucket = hash_to_bucket(hash);
-    uint8_t tag = hash_to_tag(hash);
+    uint8_t tag = tag_of(hash);
     for (uint32_t i = 0; i < HashEntry::kHopRange; ++i) {
         HashEntry entry = HashEntry::load(slot(bucket + i),
                                           std::memory_order_relaxed);
@@ -143,7 +143,7 @@ bool HashTable::update_locked(uint64_t hash, uint64_t old_pba,
     uint64_t bucket = hash_to_bucket(hash);
     HashEntry::store(slot(idx),
                      HashEntry::make(static_cast<uint8_t>(idx - bucket),
-                                     hash_to_tag(hash), new_kv_size, new_pba));
+                                     tag_of(hash), new_kv_size, new_pba));
     return true;
 }
 

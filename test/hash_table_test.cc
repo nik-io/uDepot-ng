@@ -22,7 +22,7 @@ using udepot::test::make_table;
 // Construct a hash value that maps to a specific bucket and tag.
 static uint64_t make_hash(uint64_t bucket, uint8_t tag, uint32_t index_bits) {
     uint64_t mask = (1ULL << index_bits) - 1;
-    return (static_cast<uint64_t>(tag) << 56) | (bucket & mask);
+    return (static_cast<uint64_t>(tag) << index_bits) | (bucket & mask);
 }
 
 TEST(HashEntry, PackUnpack) {
@@ -50,6 +50,24 @@ TEST(HashEntry, DeletedEntryIsNeverEmpty) {
     EXPECT_FALSE(e.empty());
     EXPECT_TRUE(e.deleted());
     EXPECT_FALSE(HashEntry::make(0, 0, 1, 0).deleted());
+}
+
+// As uDepot's hash_to_keytag_: the tag is the 8 hash bits just above the
+// bucket's, so a key is matched on the hash's low index_bits + 8 bits (its
+// fingerprint) and the bits above them play no part.
+TEST(HashTable, TagIsTheEightBitsAboveTheBucket) {
+    constexpr uint32_t kBits = 10;
+    auto table = make_table(kBits);
+    const uint64_t hash = make_hash(42, 0xAB, kBits) | (0xFULL << 60);
+    ASSERT_EQ(table->insert(hash, 1, 7), 0);
+    HashEntry e = table->lookup(hash);
+    ASSERT_FALSE(e.empty());
+    EXPECT_EQ(e.key_tag(), 0xAB);
+    EXPECT_EQ(e.bucket_offset(), 0u);
+    // Above the fingerprint: the same key as far as the table can tell.
+    EXPECT_EQ(table->lookup(make_hash(42, 0xAB, kBits)).pba(), 7u);
+    // The tag's lowest bit, just above the bucket's: a different key.
+    EXPECT_TRUE(table->lookup(make_hash(42, 0xAA, kBits)).empty());
 }
 
 TEST(HashEntry, AtomicLoadStore) {
@@ -433,10 +451,10 @@ TEST(HashTable, ClearMarksEverySlotUnused) {
 
 // As uDepot (0e0b0a0): a table maps its whole segment, metadata tail
 // included, so the footer at the end of the net region is always inside
-// the mapping; on huge pages only when the segment is a 2 MiB multiple.
+// the mapping. A segment under 2 MiB maps on 4 KiB pages, exactly.
 TEST(TableRegion, MapsTheWholeSegment) {
     using udepot::TableRegion;
-    const size_t seg = (3 << 20) + 4096;  // not a 2 MiB multiple
+    const size_t seg = (1 << 20) + 4096;  // under 2 MiB
     const size_t net = seg - 512;
     TableRegion r = TableRegion::map(seg, net, 42);
     ASSERT_TRUE(r.valid());
@@ -455,18 +473,54 @@ TEST(TableRegion, MapsTheWholeSegment) {
     EXPECT_EQ(moved.base()[seg - 1], 1);
 }
 
-TEST(TableRegion, HugePagesWhenTheSegmentIsA2MiBMultiple) {
+// Huge pages when rounding the segment up to a 2 MiB multiple wastes at
+// most 1/8 of the mapping. A fitted segment is a power of two plus a page
+// or two, so that is a table of 16 MiB or more; the bindings' 2 MiB table
+// would take 4 MiB of huge pages, half of them unused.
+TEST(TableRegion, HugePagesOnlyWhenRoundingUpWastesLittle) {
     using udepot::TableRegion;
-    // Whether the system has a huge page to give.
-    void* probe = mmap(nullptr, TableRegion::kHugePage, PROT_READ | PROT_WRITE,
+    constexpr size_t kMiB = size_t{1} << 20;
+    EXPECT_FALSE(TableRegion::wants_huge_pages(kMiB + 4096));      // < 2 MiB
+    EXPECT_TRUE(TableRegion::wants_huge_pages(2 * kMiB));          // exact
+    EXPECT_FALSE(TableRegion::wants_huge_pages(2 * kMiB + 8192));  // 4 MiB
+    EXPECT_FALSE(TableRegion::wants_huge_pages(8 * kMiB + 8192));  // 10 MiB
+    EXPECT_TRUE(TableRegion::wants_huge_pages(16 * kMiB + 8192));  // 18 MiB
+    EXPECT_TRUE(TableRegion::wants_huge_pages(512 * kMiB + 4096));
+    // The bound itself: 1.25 MiB unused of a 10 MiB mapping is 1/8.
+    EXPECT_TRUE(TableRegion::wants_huge_pages(8 * kMiB + 3 * kMiB / 4));
+    EXPECT_FALSE(TableRegion::wants_huge_pages(8 * kMiB + 3 * kMiB / 4 - 4096));
+}
+
+// A segment that wants huge pages maps on them, rounded up to a 2 MiB
+// multiple: the mapping is anonymous, so it need not match the segment.
+// Without a huge page to give, and for a segment that does not want them,
+// 4 KiB pages map the segment exactly.
+TEST(TableRegion, HugePagesRoundedUpTo2MiB) {
+    using udepot::TableRegion;
+    constexpr size_t kMiB = size_t{1} << 20;
+    const size_t seg = 16 * kMiB + 8192;
+    const size_t huge_bytes = TableRegion::huge_map_bytes(seg);
+    ASSERT_EQ(huge_bytes, 18 * kMiB);
+    // Whether the system has the huge pages to give.
+    void* probe = mmap(nullptr, huge_bytes, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
     const bool available = probe != MAP_FAILED;
-    if (available) munmap(probe, TableRegion::kHugePage);
+    if (available) munmap(probe, huge_bytes);
 
-    TableRegion r =
-        TableRegion::map(TableRegion::kHugePage, TableRegion::kHugePage - 512,
-                         TableRegion::kNoSegment);
-    ASSERT_TRUE(r.valid());  // on 4 KiB pages if there is no huge page
+    TableRegion r = TableRegion::map(seg, seg - 512, TableRegion::kNoSegment);
+    ASSERT_TRUE(r.valid());
     EXPECT_EQ(r.huge(), available);
-    EXPECT_EQ(r.map_bytes(), TableRegion::kHugePage);
+    // Why it is not on huge pages, so the store can say.
+    EXPECT_EQ(r.huge_error(), available ? 0 : ENOMEM);
+    EXPECT_EQ(r.map_bytes(), available ? huge_bytes : seg);
+    EXPECT_EQ(r.net_bytes(), seg - 512);
+    r.base()[seg - 1] = 1;  // the whole segment is inside the mapping
+
+    const size_t small = 2 * kMiB + 8192;  // the bindings' segment
+    TableRegion b = TableRegion::map(small, small - 4096,
+                                     TableRegion::kNoSegment);
+    ASSERT_TRUE(b.valid());
+    EXPECT_FALSE(b.huge());
+    EXPECT_EQ(b.huge_error(), 0);  // never asked for them
+    EXPECT_EQ(b.map_bytes(), small);
 }

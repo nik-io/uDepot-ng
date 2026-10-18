@@ -122,9 +122,11 @@ private:
 
 static_assert(sizeof(HashEntry) == 8);
 
-// Extract an 8-bit tag from a hash value.
-inline uint8_t hash_to_tag(uint64_t hash) {
-    return static_cast<uint8_t>(hash >> 56);
+// The 8-bit tag of a hash, for a table of 2^bucket_bits buckets: the bits
+// just above the bucket's, as uDepot's uDepotMap::hash_to_keytag_. The
+// bucket and the tag together are the key's fingerprint (hash_to_keyfp_).
+inline uint8_t hash_to_tag(uint64_t hash, uint32_t bucket_bits) {
+    return static_cast<uint8_t>(hash >> bucket_bits);
 }
 
 }  // namespace udepot

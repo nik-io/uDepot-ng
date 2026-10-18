@@ -27,9 +27,20 @@ static bool store_open() {
     return g_open.load(std::memory_order_acquire);
 }
 
-JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_init(
-    JNIEnv* env, jobject, jstring fname, jlong size, jboolean force_destroy) {
+JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_initWithTables(
+    JNIEnv* env, jobject, jstring fname, jlong size, jboolean force_destroy,
+    jlong table_size) {
     (void)force_destroy;
+
+    udepot::StoreConfig config;
+    config.grain_size = 512;
+    // The Java side defaults to small tables, for tests; see
+    // uDepotJNI.DEFAULT_TABLE_SIZE.
+    if (table_size < 0 ||
+        udepot::segment_size_for_table(static_cast<uint64_t>(table_size),
+                                       config.grain_size,
+                                       &config.segment_size) != 0)
+        return EINVAL;
 
     const char* path = env->GetStringUTFChars(fname, nullptr);
     if (!path) return ENOMEM;
@@ -40,15 +51,8 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_init(
         return 0;
     }
 
-    udepot::StoreConfig config;
     config.path = path;
     config.size = static_cast<size_t>(size);
-    config.grain_size = 512;
-    // 2 MiB segments. Each directory table fills one segment, and all of
-    // its memory is touched at open (clear()): with the default segment
-    // (512 MiB) that is up to 512 MiB per table, here 2 MiB for 2^17
-    // buckets. 2 MiB is the smallest segment that still maps on huge pages.
-    config.segment_size = (size_t{2} << 20) / config.grain_size;
 
     int rc = g_store.open(config);
     env->ReleaseStringUTFChars(fname, path);

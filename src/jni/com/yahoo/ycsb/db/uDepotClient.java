@@ -26,6 +26,9 @@ import com.ibm.udepot.uDepotJNI;
  *   udepot.dev  - path to backing file/device (default: /dev/shm/udepot_test)
  *   udepot.size - capacity in bytes (default: 0 = full device)
  *   udepot.force-destroy - skip restore (default: true)
+ *   udepot.table-size - bytes per index table, a power of two of at least
+ *                  4096, or 0 for the store's default (default: 2 MiB,
+ *                  uDepotJNI.DEFAULT_TABLE_SIZE)
  */
 public class uDepotClient extends DB {
 
@@ -34,12 +37,14 @@ public class uDepotClient extends DB {
   public static final String SIZE_PROPERTY = "udepot.size";
   public static final String DEV_PROPERTY = "udepot.dev";
   public static final String FORCE_PROPERTY = "udepot.force-destroy";
+  public static final String TABLE_SIZE_PROPERTY = "udepot.table-size";
 
   private static synchronized void syncInit(String devname, long size,
-                                             boolean force_destroy) throws DBException {
+                                             boolean force_destroy,
+                                             long table_size) throws DBException {
     if (KV != null) return;
     KV = new uDepotJNI();
-    int err = KV.init(devname, size, force_destroy);
+    int err = KV.initWithTables(devname, size, force_destroy, table_size);
     if (err != 0)
       throw new RuntimeException("uDepot init failed: " + err);
   }
@@ -55,7 +60,9 @@ public class uDepotClient extends DB {
     String devname = props.getProperty(DEV_PROPERTY, "/dev/shm/udepot_test");
     boolean force_destroy = Boolean.valueOf(
         props.getProperty(FORCE_PROPERTY, "true"));
-    syncInit(devname, size, force_destroy);
+    long table_size = Long.valueOf(props.getProperty(
+        TABLE_SIZE_PROPERTY, String.valueOf(uDepotJNI.DEFAULT_TABLE_SIZE)));
+    syncInit(devname, size, force_destroy, table_size);
   }
 
   public void cleanup() throws DBException {

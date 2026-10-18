@@ -18,7 +18,12 @@ static inline int sys_io_setup(unsigned nr, aio_context_t* ctx) {
     return static_cast<int>(syscall(SYS_io_setup, nr, ctx));
 }
 
+// The context is the address of its completion ring, mapped and unmapped by
+// the kernel. A context another thread destroyed can come back at the same
+// address from io_setup, so the old thread's ring accesses are ordered
+// before the new one's by the kernel, which TSAN cannot see.
 static inline int sys_io_destroy(aio_context_t ctx) {
+    tsan_release_to_kernel(reinterpret_cast<void*>(ctx));
     return static_cast<int>(syscall(SYS_io_destroy, ctx));
 }
 
@@ -52,12 +57,13 @@ struct AioRing {
 static constexpr unsigned kAioRingMagic = 0xa10a10a1;
 
 static inline bool aio_ring_valid(aio_context_t ctx) {
-#ifdef NDEBUG
-    return reinterpret_cast<AioRing*>(ctx)->magic == kAioRingMagic;
-#else
-    (void)ctx;
-    return false;
+#ifndef NDEBUG
+    // Debug builds reap with io_getevents, as uDepot's, unless a test asks
+    // for the ring (AioIO::user_ring_test_override).
+    if (!AioIO::user_ring_test_override.load(std::memory_order_relaxed))
+        return false;
 #endif
+    return reinterpret_cast<AioRing*>(ctx)->magic == kAioRingMagic;
 }
 
 static inline int aio_ring_getevents(aio_context_t ctx, unsigned max,
@@ -86,27 +92,96 @@ struct AioRequest {
     std::coroutine_handle<> handle;
 };
 
+namespace {
+
+// The calling thread's context, as uDepot's thread_local AioState: only
+// this thread submits to it and reaps it, so it needs no synchronization.
+struct AioThread {
+    aio_context_t ctx = 0;
+    unsigned depth = 0;
+    size_t pending = 0;  // submitted, not yet reaped
+
+    // depth I/Os. Returns 0 or -errno: -EAGAIN when the system's AIO
+    // contexts already hold aio-max-nr requests between them (every thread
+    // has a context of its own, so a process with many threads doing AIO
+    // at once can reach it).
+    int setup(unsigned n) {
+        aio_context_t c = 0;
+        if (auto hook = AioIO::setup_test_hook.load(std::memory_order_relaxed))
+            if (int rc = hook(); rc != 0) return rc;
+        if (sys_io_setup(n, &c) < 0) return -errno;
+        tsan_acquire_from_kernel(reinterpret_cast<void*>(c));
+        if (ctx != 0) sys_io_destroy(ctx);
+        ctx = c;
+        depth = n;
+        return 0;
+    }
+
+    // A thread exits with no I/O of its own in flight (every operation it
+    // started has completed); reap any stragglers rather than destroy the
+    // context under them.
+    ~AioThread() {
+        while (pending > 0) AioIO::poll_thread();
+        if (ctx != 0) sys_io_destroy(ctx);
+    }
+};
+
+thread_local AioThread tl_aio;
+
+// No silent failure: a thread that can get no context says so, once (its
+// every I/O fails the same way until one is freed), with the remedy.
+void report_no_context(int rc, unsigned depth) {
+    static thread_local bool reported = false;
+    if (reported) return;
+    reported = true;
+    unsigned long max_nr = 0;
+    if (FILE* f = std::fopen("/proc/sys/fs/aio-max-nr", "r")) {
+        if (std::fscanf(f, "%lu", &max_nr) != 1) max_nr = 0;
+        std::fclose(f);
+    }
+    std::fprintf(stderr,
+                 "udepot: this thread can get no AIO context of %u I/Os (%s): "
+                 "every thread doing AIO takes one, and the system's already "
+                 "hold fs.aio-max-nr (%lu) between them. Its I/O fails with "
+                 "-ENOMEM until one is freed. Raise fs.aio-max-nr, lower "
+                 "StoreConfig::queue_depth, or use fewer threads.\n",
+                 depth, std::strerror(-rc), max_nr);
+}
+
+}  // namespace
+
+std::atomic<unsigned> AioIO::new_ctx_depth_{AioIO::kDefaultQueueDepth};
+
 struct AioSubmitAwaitable {
     AioRequest* req;
-    aio_context_t ctx;
-    std::atomic<size_t>* pending;
 
     bool await_ready() noexcept { return false; }
 
     bool await_suspend(std::coroutine_handle<> h) noexcept {
+        AioThread& t = tl_aio;
+        if (t.ctx == 0) {
+            const unsigned depth =
+                AioIO::new_ctx_depth_.load(std::memory_order_relaxed);
+            int rc = t.setup(depth);
+            if (rc != 0) {
+                // No context to be had: not a full queue (-EAGAIN), which
+                // the thread's own completions would clear.
+                req->result = rc == -EAGAIN ? -ENOMEM : rc;
+                report_no_context(rc, depth);
+                return false;
+            }
+            set_thread_poll(&AioIO::poll_thread);
+        }
         req->handle = h;
         struct iocb* cbs[1] = {&req->cb};
-        // Counted before submitting: the completion can arrive, and be
-        // counted down, before io_submit returns.
-        pending->fetch_add(1, std::memory_order_release);
         tsan_release_to_kernel(req);
-        int rc = sys_io_submit(ctx, 1, cbs);
+        int rc = sys_io_submit(t.ctx, 1, cbs);
         if (rc != 1) {
             // EAGAIN: the context is full.
             req->result = (rc < 0) ? -errno : -EIO;
-            pending->fetch_sub(1, std::memory_order_relaxed);
             return false;
         }
+        ++t.pending;
         return true;
     }
 
@@ -116,59 +191,41 @@ struct AioSubmitAwaitable {
 AioIO::~AioIO() { close(); }
 
 int AioIO::open(const char* path, size_t size) {
-    // Match uDepot: O_DIRECT | O_NOATIME.  Fall back to buffered I/O if the
-    // filesystem does not support O_DIRECT (e.g. tmpfs in tests).
-    fd_ = ::open(path, O_RDWR | O_CREAT | O_DIRECT | O_NOATIME, 0666);
-    if (fd_ < 0 && (errno == EINVAL || errno == ENOTSUP))
-        fd_ = ::open(path, O_RDWR | O_CREAT, 0666);
-    if (fd_ < 0) return -errno;
-
-    struct stat st;
-    if (::fstat(fd_, &st) < 0) {
-        int err = errno;
-        ::close(fd_);
+    fd_ = open_direct(path, &direct_);
+    if (fd_ < 0) {
+        const int err = fd_;
         fd_ = -1;
-        return -err;
+        return err;
     }
 
-    if (static_cast<size_t>(st.st_size) < size) {
-        if (::ftruncate(fd_, static_cast<off_t>(size)) < 0) {
-            int err = errno;
-            ::close(fd_);
-            fd_ = -1;
-            return -err;
-        }
+    if (int rc = size_direct_file(fd_, path, size); rc != 0) {
+        ::close(fd_);
+        fd_ = -1;
+        return rc;
     }
 
     size_ = size;
 
-    ctx_ = 0;
-    if (sys_io_setup(queue_depth_, &ctx_) < 0) {
-        // EAGAIN here means a depth past the system's AIO limit (aio-max-nr),
-        // not a retryable condition: report it as a bad depth.
-        int err = errno == EAGAIN ? EINVAL : errno;
-        ::close(fd_);
-        fd_ = -1;
-        return -err;
+    // This thread's context, at this store's depth, unless it has I/O in
+    // flight (as SpdkIO::open creates this thread's queue pair).
+    AioThread& t = tl_aio;
+    if (t.ctx == 0 || (t.depth != queue_depth_ && t.pending == 0)) {
+        if (int rc = t.setup(queue_depth_); rc != 0) {
+            ::close(fd_);
+            fd_ = -1;
+            // Not "retry": a depth past what aio-max-nr leaves.
+            return rc == -EAGAIN ? -EINVAL : rc;
+        }
+        set_thread_poll(&AioIO::poll_thread);
     }
-
-    running_.store(true, std::memory_order_relaxed);
-    poller_ = std::thread(&AioIO::poller_loop, this);
+    new_ctx_depth_.store(queue_depth_, std::memory_order_relaxed);
     return 0;
 }
 
 void AioIO::close() {
-    if (running_.load(std::memory_order_relaxed)) {
-        running_.store(false, std::memory_order_release);
-        if (poller_.joinable())
-            poller_.join();
-    }
-
-    if (ctx_ != 0) {
-        sys_io_destroy(ctx_);
-        ctx_ = 0;
-    }
-
+    // The I/O this thread has in flight completes first; other threads
+    // reap their own.
+    while (poll_thread()) {}
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
@@ -186,7 +243,7 @@ CoroTask<ssize_t> AioIO::pread(void* buf, size_t count, off_t offset) {
     req.cb.aio_offset = offset;
     req.cb.aio_data = reinterpret_cast<uint64_t>(&req);
 
-    ssize_t result = co_await AioSubmitAwaitable{&req, ctx_, &pending_};
+    ssize_t result = co_await AioSubmitAwaitable{&req};
     co_return result;
 }
 
@@ -201,7 +258,7 @@ CoroTask<ssize_t> AioIO::pwrite(const void* buf, size_t count, off_t offset) {
     req.cb.aio_offset = offset;
     req.cb.aio_data = reinterpret_cast<uint64_t>(&req);
 
-    ssize_t result = co_await AioSubmitAwaitable{&req, ctx_, &pending_};
+    ssize_t result = co_await AioSubmitAwaitable{&req};
     co_return result;
 }
 
@@ -210,39 +267,34 @@ IoBuffer AioIO::alloc_buffer(size_t size) {
     return IoBuffer::alloc_aligned(aligned, 4096);
 }
 
-void AioIO::poller_loop() {
+// As uDepot's TRT AIO poller task, run by the thread itself: the user ring
+// when the kernel maps one (release builds, as uDepot), io_getevents
+// without waiting otherwise. Events are taken off the ring before any
+// coroutine resumes, so one that polls again (it may submit and wait)
+// never sees them twice.
+bool AioIO::poll_thread() {
+    AioThread& t = tl_aio;
+    if (t.pending == 0) return false;
     static constexpr int kMaxEvents = 8;
     struct io_event events[kMaxEvents];
-
-    // After close() clears running_, keep going until every submitted I/O
-    // has completed; returning earlier would leave those coroutines
-    // suspended forever.
-    while (running_.load(std::memory_order_acquire) ||
-           pending_.load(std::memory_order_acquire) > 0) {
-        int n = 0;
-        if (aio_ring_valid(ctx_))
-            n = aio_ring_getevents(ctx_, kMaxEvents, events);
-        if (n == 0) {
-            struct timespec timeout = {0, 100'000'000};
-            n = sys_io_getevents(ctx_, 1, kMaxEvents, events, &timeout);
-        }
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-
-        for (int i = 0; i < n; ++i) {
-            auto* req = reinterpret_cast<AioRequest*>(events[i].data);
-            tsan_acquire_from_kernel(req);
-            if (events[i].res2 != 0) {
-                req->result = -EIO;
-            } else {
-                req->result = static_cast<ssize_t>(events[i].res);
-            }
-            pending_.fetch_sub(1, std::memory_order_relaxed);
-            req->handle.resume();
-        }
+    int n = 0;
+    if (aio_ring_valid(t.ctx)) {
+        n = aio_ring_getevents(t.ctx, kMaxEvents, events);
+    } else {
+        struct timespec zero = {0, 0};
+        n = sys_io_getevents(t.ctx, 0, kMaxEvents, events, &zero);
+        if (n < 0) n = 0;  // EINTR: nothing reaped this time
     }
+    t.pending -= static_cast<size_t>(n);
+    for (int i = 0; i < n; ++i) {
+        auto* req = reinterpret_cast<AioRequest*>(events[i].data);
+        tsan_acquire_from_kernel(req);
+        req->result = events[i].res2 != 0
+                          ? -EIO
+                          : static_cast<ssize_t>(events[i].res);
+        req->handle.resume();
+    }
+    return tl_aio.pending > 0;
 }
 
 }  // namespace udepot

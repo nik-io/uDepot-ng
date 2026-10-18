@@ -153,8 +153,18 @@ replaces an entry (live or deleted) that is older in recovery order — segment
 timestamp, then grain — otherwise it is rewritten, so recovery always
 reproduces the order writes were acknowledged in.
 
+**Tag.** As in uDepot (`uDepotMap::hash_to_keytag_`), an entry's 8-bit tag
+is the 8 hash bits just above its bucket's, so the bucket and the tag
+together are the hash's low `index_bits + 8` bits: the paper's key
+fingerprint. Until PR #9 the tag was the hash's top 8 bits, statistically
+no different, but not uDepot's layout. A persisted table records its format
+in the index header and footer (`format`, 1 for uDepot's tag); an index of
+any other format is not restored, and the log scan rebuilds it.
+
 **Directory.** As in uDepot's `hash_to_map`, a key's table is chosen by the
-top bits of its tag and its bucket by the low bits of its hash. `grow()`
+top bits of its tag and its bucket by the low bits of its hash. (The paper
+says the tag's LSBs index the directory; uDepot's code, `hash_to_dir_idx_`,
+takes its MSBs, and uDepot-ng follows the code.) `grow()`
 doubles the number of tables. Legacy excluded every operation for the grow
 (`rwpflock.write_enter()` + `write_wait_readers()`); uDepot-ng keeps that for
 writers only, using RCU:
@@ -172,7 +182,7 @@ writers only, using RCU:
 Readers never block: they keep reading the frozen tables during the copy.
 Grow is rare, so ordinary writes pay only a flag load under their stripe lock.
 Because `grow()` waits for a grace period it never runs inside a read section
-or on an I/O poller thread (which in-flight reads may be waiting on): a
+or on a thread whose own I/O in-flight reads may be waiting on: a
 writer that finds its table full leaves its section and suspends, and the
 store's waker thread runs the grow.
 
@@ -224,14 +234,45 @@ backend pollers. C++23 coroutines replace everything except the pollers.
 
 What remains lives in `io/`:
 
-- **Completion polling** per async backend. AIO and io_uring run a poller
-  thread that harvests completions and resumes the coroutines that completed.
-  SPDK follows uDepot's TRT model instead: each thread has its own queue pair
-  (`SpdkQpair`, no shared state), submits and suspends, and its own poll —
-  driven by `run_sync()` through a thread-local hook, the way a TRT scheduler
-  polled between tasks — harvests completions and resumes the coroutines.
-  One thread per `SpdkIO` polls the controllers' admin queues (~10x/s), which
-  keeps NVMe-oF keep-alives flowing.
+- **Completion polling** per async backend, as uDepot's TRT: each thread
+  has its own queue — an SPDK queue pair (`SpdkQpair`), an AIO context, an
+  io_uring ring, as TRT kept a `thread_local` `AioState` and `UringState`
+  per scheduler thread — shared by every store the thread uses, with no
+  shared state between threads. A thread submits and suspends, and its own
+  poll — driven by `run_sync()` through thread-local hooks (one per backend
+  it has used), the way a TRT scheduler polled between tasks — harvests the
+  completions and resumes the coroutines, so a coroutine stays on the thread
+  that submitted its I/O. io_uring queues SQEs and pushes them in batches of
+  up to 128, or at the thread's next poll, as uDepot's `UringState` does;
+  a ring smaller than that fills first, and the next I/O pushes it rather
+  than being refused. So an operation completes only when the thread that
+  started it polls (waiting in `run_sync()`, or driving
+  `poll_this_thread()`): waiting on it from another thread finishes only
+  once the starting thread polls, as a TRT task finishes on its own
+  scheduler thread. `store.h` states this on the API. A thread that
+  resumes operations it did not start (the space waker, a
+  memcache connection's epoll poller) polls its own queue too: their I/O is
+  now its own. One thread per `SpdkIO` polls the controllers' admin queues
+  (~10x/s), which keeps NVMe-oF keep-alives flowing.
+
+  AIO and io_uring used to hand every completion from a poller thread to the
+  waiting thread instead. Measured against uDepot (v0 gate, below), that
+  made them 15–87% slower than uDepot; reaped on the submitting thread they
+  are faster on every operation.
+
+  An io_uring poll that finds nothing completed spins by default, as
+  uDepot's poller does (it only yields to the TRT scheduler), for the
+  lowest latency. `StoreConfig::poll_yields` (process-wide, as rings are
+  per thread) makes it yield the CPU (`sched_yield`) instead. That is for
+  I/O the kernel cannot do inline (every request on tmpfs, buffered
+  writes, a device without nowait): it runs on an io-wq worker, which the
+  scheduler wakes on the submitting thread's own CPU (traced: every
+  wakeup), and a spinning thread holds it off until preemption. Measured
+  on tmpfs, yielding once roughly doubled io_uring throughput on a 4-CPU
+  Intel VM at queue depth 1, then made no consistent difference there
+  (24-32 kops/s spinning, 24-28 yielding, 4 KiB values), and changed little
+  on a CI EPYC 7763: measure before turning it on. AIO needs neither:
+  `io_submit` does that work before returning.
 - **Awaitable** that bridges I/O completion to coroutine resume.
 - **Buffer allocation** utilities (tagged by backend).
 
@@ -283,9 +324,9 @@ Six backends, all implementing the same `IoBackend` concept:
 | Backend | Completion model | Poller | Buffer | Notes |
 |---|---|---|---|---|
 | `PosixIO` | Synchronous | No | aligned malloc | pread/pwrite, never suspends |
-| `AioIO` | Async (io_getevents) | Yes | aligned malloc | Linux AIO |
-| `UringIO` | Async (CQ ring) | Yes | aligned malloc | io_uring |
-| `SpdkIO` | Async (qpair) | Yes | rte_malloc (DMA) | SPDK/NVMe, DPDK lcores |
+| `AioIO` | Async (per-thread context) | Submitting thread | aligned malloc | Linux AIO |
+| `UringIO` | Async (per-thread ring) | Submitting thread | aligned malloc | io_uring |
+| `SpdkIO` | Async (per-thread qpair) | Submitting thread | rte_malloc (DMA) | SPDK/NVMe, DPDK lcores |
 | `NetIO` | Async (epoll or uring) | Yes | malloc | Socket I/O for memcache server |
 | `ODirectIO` | Synchronous | No | aligned malloc | pread/pwrite with O_DIRECT |
 
@@ -303,9 +344,18 @@ concept IoBackend = requires(T io, void* buf, size_t n, off_t off) {
 **Queue depth.** The intended use: preallocate zero-copy buffers for the
 depth you choose (`alloc_put_buffer`, `alloc_get_buffer`), issue that many
 operations, wait for them, reuse the buffers. uDepot allocates no data
-buffers for depth. `StoreConfig::queue_depth` sizes each backend's queue for
-it: the AIO context (`io_setup`), the io_uring ring, and the SPDK request
-pool of queue pairs created afterwards (per thread). SPDK's own pool size
+buffers for depth. `StoreConfig::queue_depth` sizes each backend's
+per-thread queue for it: the opening thread's AIO context (`io_setup`) or
+io_uring ring (recreated if it is idle), and the contexts, rings and SPDK
+request pools of queue pairs that threads create afterwards; a thread's
+busy queue keeps its size.
+
+Per-thread queues cost kernel resources per thread, as in uDepot: an AIO
+context reserves its depth against the system-wide `fs.aio-max-nr` (65536
+by default, so 64 contexts of the default 1024 can exist at once across
+the system). A thread that cannot get a context fails its I/O with
+`-EAGAIN`. Many threads doing AIO at once (the memcache server runs two per
+connection) need a smaller `queue_depth` or a larger `aio-max-nr`. SPDK's own pool size
 stays the minimum: a large I/O takes several requests (one per transfer-size
 piece), so a pool sized to a small depth could never take it. Nothing in
 uDepot caps the depth below what the backend takes. A depth the backend
@@ -323,8 +373,8 @@ checks"): the directory is unchanged, so a clean restart, which restores
 the index, never sees the record; but it stays in the log, and after a
 crash the log scan restores it if it is the key's newest. Nothing waits or
 spins for room: on EBUSY/EAGAIN from `io_uring_submit` the SQEs, already
-published, are left for the poller to push after it reaps, since the
-submitter may be the poller itself.
+published, are left for the thread's next poll to push after it reaps,
+since the submitter may be that poll itself.
 
 Only the caller's operations report `-EAGAIN`. uDepot's own synchronous
 I/O (recovery, index persistence, GC) shares the queue, so it retries a
@@ -452,11 +502,11 @@ uDepot-ng/
 │       ├── backend.h            # IoBackend concept
 │       ├── posix.h              # pread/pwrite (sync)
 │       ├── o_direct.h           # pread/pwrite with O_DIRECT (sync)
-│       ├── aio.h                # Linux AIO + poller
+│       ├── aio.h                # Linux AIO, per-thread context
 │       ├── aio.cc
-│       ├── uring.h              # io_uring + poller
+│       ├── uring.h              # io_uring, per-thread ring
 │       ├── uring.cc
-│       ├── spdk.h               # SPDK/NVMe + poller, DMA buffers
+│       ├── spdk.h               # SPDK/NVMe, per-thread qpair, DMA buffers
 │       ├── spdk.cc
 │       ├── net.h                # socket I/O (epoll or io_uring)
 │       ├── net.cc
@@ -615,24 +665,61 @@ persistent source of truth is the log"*.
   plus one neighborhood, that fits between the header and the footer
   (`HashTable::index_bits_for`). The segment size is the only knob; tests
   get small tables from small segments. The directory starts with one
-  table, as uDepot's `init()` grows from none. A table's memory is all
-  touched at open, so the default segment (2^29 bytes) means up to 512 MiB
-  per table; the Python and JNI bindings open with 2 MiB segments instead,
-  the smallest that still map on huge pages (a table of 2^17 buckets).
+  table, as uDepot's `init()` grows from none.
+- **Fitted segments.** Besides its buckets a table needs its header and
+  footer, the last neighborhood's overflow slots and, past the footer, the
+  segment's salsa metadata: about 1.8 KiB. A segment of a power of two of
+  bytes falls just that short of its next table size, so its table filled
+  half of it — in uDepot as well (`tot-entries=2097184`, 2^21 buckets, in a
+  32 MiB segment). `fitted_segment_size(table_bytes, grain)` is the segment
+  whose table holds exactly `table_bytes` of buckets: the table plus that
+  room, rounded up to a page (512 MiB + 4 KiB for a 2^26-bucket table at
+  512 B grains). The default segment is the fitted one for a 2^29-byte
+  table (uDepot's default, 2^29 bytes + 2 grains, meant this and fell
+  short), and halving it for a small device halves the table and refits,
+  including where a fitted size leaves no tail for the device metadata. A
+  segment size the caller sets is used as given. A table's memory is all
+  touched at open, so the default means up to 512 MiB per table. The
+  Python and JNI bindings take the table size from the caller
+  (`table_size`, `initWithTables`, YCSB's `udepot.table-size`; a power of
+  two of at least 4 KiB, or 0 for the store's default,
+  `segment_size_for_table`); they default to 2 MiB tables (2^18 buckets),
+  small, for tests, which map on 4 KiB pages, and the store says so. A
+  device too small for the segment asked for (or the default) makes it
+  smaller, as uDepot does, and `open()` says so too, with both sizes and
+  how much of the smaller segment its table fills: a caller's size is
+  reduced as a size, not refitted as the default is.
 - **Memory** (`TableRegion`). An anonymous mapping of the whole segment,
   uDepot's mapping on its AIO and SPDK backends: read from the segment on
   restore, written back at close. As uDepot's fix for the shutdown overrun
   (0e0b0a0), the mapping always spans the full segment
-  (`get_seg_size() * grain`), on huge pages when that is a 2 MiB multiple
-  (segments tile the device from offset 0, so such a segment is 2 MiB
-  aligned as well), falling back to 4 KiB pages if no huge page is free;
-  any other size maps on 4 KiB pages. The footer at the end of the net
-  region is then always inside the mapping, and the segment's salsa
-  metadata in the tail past it is never written from it. As uDepot's
-  `KV_conf::sanitize_segment_size`, a store's segment size is whole pages,
-  which makes the default (2^29 bytes + 2 grains) a 2 MiB multiple for
-  grains under 2 KiB. Verified: with huge pages reserved, strace shows the
-  table's segment mapped `MAP_HUGETLB`, and the store suites pass on it.
+  (`get_seg_size() * grain`), so the footer at the end of the net region
+  is always inside it, and the segment's salsa metadata past the footer is
+  never written from it. A segment maps on huge pages, rounded up to a
+  2 MiB multiple, when that leaves at most 1/8 of the mapping unused
+  (`TableRegion::wants_huge_pages`): the mapping is anonymous, so it need
+  not match the segment's size or where it sits on the device, and a
+  fitted segment is never a 2 MiB multiple. (uDepot took huge pages only
+  for a segment that is a 2 MiB multiple, which is what left its tables
+  half full.) A fitted segment is a power of two plus a page or two, so
+  rounding costs nearly 2 MiB per table and nothing on the device: under
+  1/8 from a 16 MiB table up (the default's is 512 MiB, 0.4%), but half
+  of the bindings' 2 MiB one, which would take 4 MiB of huge pages each,
+  out of the pool SPDK's DMA buffers also come from, up to 512 MiB over a
+  grown directory's 256 tables. So the bindings' tables, and any segment
+  under 2 MiB, map on 4 KiB pages, the segment exactly; so does any table
+  when no huge page is free. The main cost is in grows: a grow faults each
+  new table in 4 KiB at a time (512 times the faults), and the puts
+  waiting on a full table wait for the whole grow; the copy and lookups
+  also miss the TLB more, a second-order cost. Neither fallback is silent:
+  `open()` prints a message whenever a segment of 2 MiB or more maps on
+  4 KiB pages by this rule, and the store prints one, once per open, the
+  first time a table that wants huge pages cannot have them (at open, or at
+  the grow that finds none free), with the mmap error and how many huge
+  pages a table takes. As uDepot's `KV_conf::sanitize_segment_size`, a store's
+  segment size is whole pages. Verified: with huge pages reserved, a
+  fitted 16 MiB + 8 KiB segment's table maps on huge pages as 18 MiB
+  (`TableRegion.HugePagesRoundedUpTo2MiB`), and the store suites pass.
 - **Layout**, as uDepot lays out a directory segment:
   `[IndexHdr 512 B | slots, 8 B each | ... | IndexFtr 512 B]`, the footer at
   the end of the net segment. Slots are `HashEntry`'s raw 64 bits, which use

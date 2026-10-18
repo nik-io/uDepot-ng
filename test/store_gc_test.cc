@@ -327,8 +327,8 @@ TEST(StoreGcAioTest, DirectoryGrowsFromPollerThread) {
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             for (int base = 0; base < kPerThread; base += kBatch) {
-                // In flight together, so commits run on the poller while
-                // other puts' reads are outstanding.
+                // In flight together, so commits run as completions are
+                // reaped while other puts' reads are outstanding.
                 std::vector<std::string> keys, vals;
                 for (int i = base; i < base + kBatch; ++i) {
                     keys.push_back("p" + std::to_string(t) + "_" +
@@ -367,11 +367,12 @@ TEST_F(StoreGcTest, RecoveryDoesNotDuplicateKeysSharingATag) {
     ASSERT_EQ(store_.open(config_), 0);
 
     // Two keys with the same tag and bucket.
-    const uint64_t bucket_mask =
-        (uint64_t{1} << store_.directory().snapshot().tables[0]->index_bits()) - 1;
+    // The bucket and the 8 bits above it: uDepot's key fingerprint.
+    const uint64_t fp_mask =
+        (uint64_t{1}
+         << (store_.directory().snapshot().tables[0]->index_bits() + 8)) - 1;
     auto tag_bucket = [&](const std::string& k) {
-        uint64_t h = store_.hash_key(uDepot<PosixIO>::as_bytes(k));
-        return (h >> 56) << 40 | (h & bucket_mask);
+        return store_.hash_key(uDepot<PosixIO>::as_bytes(k)) & fp_mask;
     };
     std::map<uint64_t, std::string> seen;
     std::string a, b;
@@ -750,9 +751,29 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
     // workload above meets none. (It passed anyway while close() flushed
     // the index with GC still running, which gave GC more time.) Keep
     // writing, other keys only, until GC has had one.
-    for (int i = 0; i < 200000 && drops.load() == 0; ++i)
-        ASSERT_EQ(store_.put("f" + std::to_string(i % kKeys), val).run_sync(),
-                  0);
+    //
+    // The writes must keep GC relocating, and keep the live data bounded:
+    // each puts a new key and deletes the one kWindow puts back. Two
+    // fillers that did not:
+    //   - kKeys fresh keys cycled: a late drop let them reach ~18 MiB on
+    //     top of the ~13 MiB of "k" keys, past the ~25 MiB the store
+    //     holds, and a put failed, rightly, with -ENOSPC;
+    //   - 1000 keys overwritten: every segment ends up all garbage, and
+    //     salsa frees those without calling the relocation callback, so GC
+    //     never chose a victim again and no tombstone could go (no drop in
+    //     6 of 8 runs over 200000 puts).
+    // Here a segment always holds valid grains (the latest puts, and the
+    // deletes' tombstones), so freeing it means relocating it: every run
+    // measured had a drop within 12444 of the 200000.
+    constexpr int kWindow = 1000;
+    for (int i = 0; i < 200000 && drops.load() == 0; ++i) {
+        ASSERT_EQ(store_.put("f" + std::to_string(i), val).run_sync(), 0);
+        if (i >= kWindow) {
+            ASSERT_EQ(store_.del("f" + std::to_string(i - kWindow))
+                          .run_sync(),
+                      0);
+        }
+    }
     store_.close();
     uDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
 

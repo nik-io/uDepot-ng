@@ -71,8 +71,9 @@ struct StoreConfig {
     size_t size = 0;
     uint32_t grain_size = 512;
     // Segment size in grains, sanitized to whole pages as uDepot's
-    // KV_conf::sanitize_segment_size. 0 = auto (uDepot default:
-    // (1<<29)/grain_size + 2, halved until it fits the device). It also
+    // KV_conf::sanitize_segment_size. 0 = auto: fitted_segment_size() of
+    // a 2^29-byte table (uDepot's default, 2^29 bytes + 2 grains, meant
+    // the same), halved as a table size until it fits the device. It also
     // sizes the directory's hash tables: each fills one index segment, as
     // in uDepot, so smaller segments make smaller tables.
     uint64_t segment_size = 0;
@@ -80,14 +81,40 @@ struct StoreConfig {
     uint32_t overprovision = 200;
     // Destroy any existing data on the device and start fresh.
     bool force_destroy = false;
-    // I/Os the caller expects to have in flight at once (per thread on
-    // SPDK). It sizes the backend's queue (AIO context, io_uring ring,
-    // SPDK request pool); uDepot allocates no data buffers for it, see
-    // alloc_put_buffer() and alloc_get_buffer(). An operation whose I/O
-    // the backend refuses because its queue is full fails with -EAGAIN.
-    // 0 = the backend's default.
+    // I/Os the caller expects to have in flight at once on a thread. It
+    // sizes each thread's queue (AIO context, io_uring ring, SPDK queue
+    // pair and request pool): the opening thread's at open(), and those
+    // other threads create from then on; uDepot allocates no data buffers
+    // for it, see alloc_put_buffer() and alloc_get_buffer(). An operation
+    // whose I/O the backend refuses because its queue is full fails with
+    // -EAGAIN. 0 = the backend's default.
     unsigned queue_depth = 0;
+    // io_uring only: whether a thread's poll that finds none of its I/O
+    // completed yields the CPU instead of spinning. Off by default: it
+    // spins, as uDepot's poller does, for the lowest latency. Worth turning
+    // on where the kernel cannot do the I/O inline (tmpfs, buffered writes,
+    // a device without nowait support): it hands each request to an io-wq
+    // worker, woken on the submitting thread's CPU, which a spinning thread
+    // holds off until it is preempted. Process-wide: the last open() sets it.
+    bool poll_yields = false;
 };
+
+// The segment size, in grains, whose directory table holds table_bytes of
+// buckets (a power of two of 8-byte slots) and fills it: the buckets plus
+// the table's header, footer and last neighborhood, and the segment's
+// salsa metadata, rounded up to whole pages. A segment of a power of two
+// of bytes falls ~2 KiB short of its next table size, so half of it would
+// go unused. Its table maps on huge pages when rounding it up to 2 MiB
+// wastes little (TableRegion::wants_huge_pages).
+uint64_t fitted_segment_size(uint64_t table_bytes, uint32_t grain_size);
+
+// The StoreConfig::segment_size for tables of table_bytes, for callers that
+// size a store by its tables (the Python and JNI bindings): 0 for the
+// store's default, else the fitted segment of a table of table_bytes,
+// which must be a power of two from 4 KiB to kMaxTableBytes. 0 or -EINVAL.
+inline constexpr uint64_t kMaxTableBytes = uint64_t{1} << 40;  // 1 TiB
+int segment_size_for_table(uint64_t table_bytes, uint32_t grain_size,
+                           uint64_t* segment_size);
 
 // Condition a put() must satisfy, checked atomically with the write.
 enum class PutMode {
@@ -168,7 +195,17 @@ public:
     //
     // Any operation fails with -EAGAIN if the backend cannot take another
     // I/O (its queue is full of the caller's operations); it may be retried
-    // once some of those complete. See StoreConfig::queue_depth.
+    // once some of those complete. See StoreConfig::queue_depth. On AIO, an
+    // operation that is a thread's first I/O fails with -ENOMEM if the
+    // thread can get no context (the system's hold fs.aio-max-nr requests).
+    //
+    // An operation's I/O goes to the queue of the thread that starts it,
+    // and completes only when that thread polls: while it waits in
+    // run_sync() on any of its operations, or drives poll_this_thread()
+    // itself, as uDepot's TRT tasks complete on their own scheduler thread.
+    // Waiting from another thread (run_sync() on a task started elsewhere)
+    // finishes only once the starting thread polls; a thread that starts
+    // operations and stops polling stalls them.
     int open(const StoreConfig& config);
     void close();
 
@@ -251,6 +288,13 @@ public:
         return exists(as_bytes(key), val_size_out);
     }
 
+    // How many values the calling thread's operations copied between the
+    // caller's memory and uDepot's record buffers: one per copying put or
+    // get, none for a zero-copy one (PutBuffer, GetBuffer). Per thread, so
+    // counting adds no shared write; an operation's copy is counted on the
+    // thread that runs that part of it.
+    static uint64_t thread_value_copies() noexcept { return tl_value_copies_; }
+
     uint64_t hash_key(std::span<const uint8_t> key) const {
         return CityHash64(reinterpret_cast<const char*>(key.data()),
                           key.size());
@@ -299,6 +343,13 @@ public:
     using FooterHook = bool (*)();
     inline static std::atomic<FooterHook> index_footer_test_hook{nullptr};
 
+    // Test seam, never set in production: close() writes the format it
+    // returns, given the current one, into each index header and footer,
+    // as an older release would have written its own.
+    using IndexFormatHook = uint32_t (*)(uint32_t format);
+    inline static std::atomic<IndexFormatHook> index_format_test_hook{
+        nullptr};
+
     // Test seam, never set in production: called before allocating an
     // index segment for a new table; returning -errno fails the allocation
     // with it, as on a device with no segment to give (-ENOSPC) or none
@@ -329,7 +380,12 @@ private:
     Rcu rcu_;
     IO io_;
     Directory* directory_ = nullptr;
+    inline static thread_local uint64_t tl_value_copies_ = 0;
     bool index_restored_ = false;
+    // Whether this open has reported a table that wanted huge pages and
+    // could not have them (report_huge_fallback).
+    std::atomic<bool> huge_fallback_reported_{false};
+    void report_huge_fallback(const TableRegion& region);
     uint32_t grain_size_ = 512;
     uint64_t total_grains_ = 0;
 

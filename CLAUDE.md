@@ -29,7 +29,8 @@
 7. **Deliver what was asked, at the scope intended.** Finish the whole task.
    Check in only when different readings would lead to materially different
    work.
-8. **Delegate to a subagent only for large, genuinely independent tasks.**
+8. **Delegate to a subagent only for large, genuinely independent tasks,**
+   and for the independent review of rule 12.
 9. **This is a refactoring of uDepot — preserve its design choices.** uDepot-ng
    must persist uDepot's architecture and implementation choices except for the
    specific changes identified at the beginning of the rewrite (userspace RCU
@@ -48,12 +49,57 @@
     consequences already decided: empty values are valid (tombstones need their
     own encoding); each directory table maps to an index segment of its own
     for its life, as large as the segment allows (smaller tables come from a
-    smaller segment size, never from a separate setting), is written back
+    smaller segment size, never from a separate setting; the default
+    segment and its halvings are fitted to a power-of-two table,
+    `fitted_segment_size`, and a table maps on huge pages rounded up to
+    2 MiB when that leaves at most 1/8 of the mapping unused, else on 4 KiB
+    pages, never silently: a message at open, or when no huge page is free,
+    since grows are slower then: agreed in
+    PR #9, diverging from uDepot, whose power-of-two segments left every
+    table half full), is written back
     there at close and restored from it on a clean start, with the log scan
     only after a crash; the directory grows
     by freeze-and-copy, not the paper's incremental resize (tried in PR #8,
-    dropped: see `docs/udepot-paper.md`, §4.3); PUT writes before it checks, and
+    dropped: see `docs/udepot-paper.md`, §4.3); an entry's tag is the 8 hash
+    bits above its bucket's, as uDepot's `hash_to_keytag_` (the top 8 bits
+    until PR #9; persisted indexes carry a format number, and an older one is
+    rebuilt from the log); an io_uring poll that finds nothing completed
+    spins, as uDepot's, unless `StoreConfig::poll_yields` asks it to yield
+    the CPU (agreed in PR #9: configurable, legacy's spin the default); the
+    AIO and io_uring store file is preallocated (`size_direct_file`;
+    uDepot ftruncates it sparse), so an O_DIRECT write never allocates
+    (agreed in PR #9), never silently sparse; PUT
+    writes before it checks, and
     Memcache paths may carry weaker durability than the store.
+
+11. **One concern per PR.** A PR does what its title says and nothing
+    else. Whatever turns up along the way, a bug, a missing message, a
+    better default, goes on the PR's follow-up list (its description) for
+    a PR of its own, unless it breaks this PR's own change. After a review,
+    fix what the review found, and only that. PR #9 began as per-thread
+    completion polling and absorbed fitted segments, huge pages, the tag
+    layout, poll_yields, O_DIRECT, preallocation and the bindings' table
+    size; each of its two independent reviews found real problems, and the
+    second's were nearly all in code added in answer to the first.
+12. **Pre-push checklist.** Before any push, and before telling the
+    maintainer something is done:
+    - **Tests bite.** Every new or changed test has been seen to fail with
+      the fix undone (a mutant), and to fail rather than hang.
+    - **Claims are checked.** Every statement in the commit message, PR
+      description, comments, docs and CLAUDE.md is checked against the
+      code or the CI workflow, not written from memory or intent.
+    - **No silent paths.** Every new fallback or error path prints what
+      happened and what it costs, and a test checks the message.
+    - **Every CI configuration.** Release, Debug, Debug TSAN (as CI runs
+      it), the bindings, and the SPDK build, all passing, no TSAN report;
+      and `scripts/perf-zerocopy.sh` (and the SPDK one, over the NVMe-oF
+      target) when the data path or the script changes.
+    - **Adversarial re-read.** Read the whole diff once more asking what a
+      reviewer or CI would reject: error paths, fd and memory leaks, test
+      seams left set, devices too small for the geometry, stale text.
+    - **Independent review.** For a PR-sized change, run a review agent
+      on the diff and fix what it finds before reporting the work as done:
+      the maintainer sees the reviewed result, not the draft.
 
 ## Project Overview
 
@@ -84,6 +130,55 @@ These are foundational constraints. Every change must preserve them.
    not from spawning threads. A `multi_get` of 100 keys uses one thread
    and 100 coroutines, not 100 threads. This is what the coroutine rewrite
    exists to deliver.
+
+## Settled decisions — do not re-argue
+
+Agreed with the maintainer, mostly in PR #9. Details are in the sections
+cited; change any of these only with explicit consent (rule 4).
+
+**O_DIRECT and zero copy**
+- AIO and io_uring open the store O_DIRECT (`open_direct`) and preallocate
+  it (`size_direct_file`), as a device would be. tmpfs takes O_DIRECT with
+  no device behind it: a toy case, never on its own evidence of O_DIRECT
+  behaviour or performance.
+- O_DIRECT correctness is the unit tests' job: they run on a real
+  filesystem (`/tmp`, ext4 in CI, checked by the workflow) and assert the
+  backends got O_DIRECT. SPDK's run over the NVMe-oF target. Short tests
+  are enough; no long or perf runs on a disk in CI.
+- The zero-copy perf check stays on `/dev/shm` (low noise), 32 operations
+  in flight as uDepot's `--trt-ntasks 32`, copy and zero copy paired in
+  one process, zero copy strictly faster on PUT and GET, plus the exact
+  gate that zero copy copies no value. Never add a tolerance, never gate
+  timing on a disk (device-bound: deltas flip sign), never move it off
+  tmpfs. A failure is a bug to root-cause, in the code or in a bench that
+  drifted from uDepot's setup, not a threshold to relax.
+- No silent fallback, anywhere: buffered I/O, a sparse file, 4 KiB pages
+  for a table, a segment shrunk by a small device, no AIO context. Each
+  prints what happened and what it costs.
+
+**Legacy first**
+- uDepot's behaviour is the default. A divergence is agreed first, and
+  where it is a trade-off it is an option with uDepot's choice the default
+  (e.g. `StoreConfig::poll_yields`: spin by default). Read uDepot's code
+  before deciding and cite file:line.
+
+**Measuring**
+- The dev container is a Firecracker VM: first touches of memory fault to
+  the host, so absolute throughput swings 3-4x between runs, and a gap seen
+  in one run (a "collapse", a "2x") is often the VM. Only paired,
+  interleaved comparisons in one run count, repeated; and CI CPUs differ
+  (EPYC 7763, 9V45). Do not report a speedup or slowdown from one local
+  run, and do not push a speculative CI fix: reproduce or explain first.
+
+**Tests**
+- A new test is only coverage once it has been seen to fail with the fix
+  undone (a mutant). Hollow tests have shipped here: a refusal test that
+  never refused, an AIO TSAN test whose path only release builds take (CI's
+  TSAN build is Debug), collision tests left searching for the old tag.
+- A test's device must be large enough for the geometry it tests, or the
+  store shrinks the segment and the test measures something else.
+- The Python and JNI bindings' 2 MiB tables are a test-size default, not a
+  limit: the table size is the caller's (`table_size`, `initWithTables`).
 
 ## Style Guide
 
@@ -150,8 +245,16 @@ ctest --test-dir build
   SPDK is built with `--target-arch=x86-64-v2` and its tree cached per
   submodule revision.
 - **zero-copy perf invariant**, below: one check for AIO and io_uring,
-  and **zero-copy perf invariant (SPDK)**, a second entry of the
+  on `/dev/shm`; and
+  **zero-copy perf invariant (SPDK)**, a second entry of the
   SPDK job (`spdk-nvmef-test.sh build perf`) on a Release build.
+- **O_DIRECT.** Every AIO and io_uring test makes its store in `/tmp` and
+  opens it O_DIRECT, as uDepot does; the unit-test jobs first check that
+  `/tmp` takes O_DIRECT (ext4 on the runners), and
+  `OpensODirectWhereTheFilesystemTakesIt` that the backends got it. A
+  filesystem that refuses it gets buffered I/O, never silently: the open
+  says so (`open_direct`). SPDK's tests run over the NVMe-oF target, which
+  transfers straight to and from the store's DMA buffers.
 
 ### Zero-copy perf invariant
 
@@ -171,13 +274,20 @@ or SPDK, the backends the store is built to perform on.
 The comparison is paired, inside one process: `udepot_ng_bench --compare`
 runs rounds of a copy batch and a zero-copy batch back to back on one store
 (which goes first alternates), and reports the median of the rounds'
-zero-copy/copy ratios; the gate is the median of 5 such runs. Zero copy is
+zero-copy/copy ratios; the gate is the median of 5 such runs. Each batch
+keeps 32 operations in flight on one thread (`--qd 32`), as uDepot's script
+runs `udepot-test --trt-ntasks 32`. The bench ran them one at a time until
+the gate failed on a CI EPYC 7763: on tmpfs every io_uring operation is
+handed to an io-wq kernel worker, ~20 us there against ~1 us for the copy
+zero copy avoids, and one at a time that hand-off is all an operation is,
+so io_uring's zero-copy GET read 11% slower. Zero copy is
 uDepot's property, not the caller's: given a buffer it handed out
 (`alloc_put_buffer()`, `alloc_get_buffer()`), put and get do their I/O on
 it directly, and given other memory they copy through one of their own. So
-the bench sets both modes up as legacy's `udepot-test` does: one buffer per
-mode, allocated before timing and reused for every operation, plain memory
-for copy and uDepot's buffers for zero copy. Each put writes its key's
+the bench sets both modes up as legacy's `udepot-test` does: each
+operation slot (a TRT task there) has one buffer per mode, allocated before
+timing and reused for every operation of the slot, plain memory for copy
+and uDepot's buffers for zero copy. Each put writes its key's
 8-byte tag into the value and each get checks it.
 
 Two earlier versions measured the wrong thing: one allocated a `PutBuffer`
@@ -192,6 +302,15 @@ to ~1.7x between processes, and that read as AIO's zero-copy GET 13.7%
 slower in CI, and on SPDK as anything from 37% slower to 52% faster, on
 code where every paired comparison has zero copy ahead. Never set
 throughputs from different runs against each other.
+
+**O_DIRECT** is the unit tests' to cover, not this check's: the AIO and
+io_uring tests run over it in `/tmp` (see "O_DIRECT" under CI). The
+zero-copy check stays on `/dev/shm` for low noise; on a disk the I/O is
+device-bound and zero copy's deltas flip sign run to run (ext4 here: PUT
+-16% to +12%). Besides timing it gates one exact thing: the zero-copy
+batches copied no value between the caller's memory and uDepot's record
+buffers (`uDepot::thread_value_copies()`; the copying ones copy every
+value). A zero-copy put made to count a copy fails it.
 
 **SPDK** is gated the same way, as its own CI check, "zero-copy perf
 invariant (SPDK)": `scripts/spdk-nvmef-test.sh <build> perf` starts the
@@ -231,21 +350,26 @@ does: `--qd` TRT tasks per phase (`--trt-ntasks`, default 128), each a slice
 of the ops; uDepot-ng keeps `--qd` operations in flight. SPDK runs through
 `scripts/spdk-nvmef-test.sh <spdk-release-build> regression`, both stores on
 the target's whole namespace. The gate is not in CI (it needs uDepot built).
-Until 5d9c4e9 it only ever ran posix. First run on every backend (5000 ops,
-9 runs, uDepot-ng vs uDepot, `/dev/shm`):
+Until 5d9c4e9 it only ever ran posix. On its first run on every backend, aio
+and io_uring failed it (15–87% slower than uDepot, on main as well): each
+handed every completion from a poller thread to the waiting one. They now
+reap on the submitting thread, as uDepot's TRT and the SPDK backend do
+(per-thread AIO context and io_uring ring, io_uring submissions batched as
+uDepot's `UringState`). Since then (5000 ops, 9 runs, uDepot-ng vs uDepot,
+`/dev/shm` except SPDK):
 
 | backend | qd | PUT | GET | EXISTS | DEL |
 |---|---|---|---|---|---|
-| aio | 1 | −81% | −87% | −80% | −77% |
-| aio | 128 | −15% | −52% | −18% | −62% |
-| uring | 1 | −29% | −35% | −26% | −21% |
-| uring | 128 | −37% | −32% | −16% | −77% |
-| spdk (NVMe-oF) | 1 | +16% | −3% | +1% | +3% |
-| spdk (NVMe-oF) | 128 | +122% | +111% | +186% | +46% |
+| posix | 1 | +80% | +145% | +265% | +92% |
+| aio | 1 | +131% | +192% | +326% | +139% |
+| aio | 128 | +137% | +188% | +356% | +37% |
+| uring | 1 | +33% | +0.1% | +43% | +13% |
+| uring | 128 | +48% | +125% | +175% | +40% |
+| spdk (NVMe-oF) | 1 | +54% | +65% | +80% | +41% |
+| spdk (NVMe-oF) | 128 | +152% | +113% | +278% | +69% |
 
-**aio and uring fail the gate, on main as well.** Open. SPDK harvests its
-completions on the submitting thread, as uDepot's TRT poller task does; aio
-and uring hand every completion from a poller thread to the waiting one.
+io_uring GET at queue depth 1 is level with uDepot: on tmpfs an io_uring
+read costs ~30 µs either way.
 
 The posix speed gap is genuine, not a benchmark artifact. With both at -O3, uDepot-ng
 is 2-5x faster at 5000 ops, varying by host: PUT +127-182%, GET +174-227%,

@@ -14,7 +14,6 @@ namespace {
 
 struct AioTraits {
     using IO = udepot::AioIO;
-    static constexpr bool kPollerThread = true;
     // io_submit fails with EAGAIN once the context is full.
     static constexpr bool kQueueFills = true;
     // A depth past the kernel's limits fails open().

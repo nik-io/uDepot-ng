@@ -13,9 +13,12 @@ DirSnapshot::DirSnapshot(std::vector<std::unique_ptr<HashTable>> tables,
                          uint64_t generation)
     : tables(std::move(tables)),
       table_bits(static_cast<uint32_t>(std::countr_zero(this->tables.size()))),
+      bucket_bits(this->tables.empty() ? 0 : this->tables[0]->index_bits()),
       generation(generation) {
     assert(std::has_single_bit(this->tables.size()) &&
            table_bits <= kMaxTableBits);
+    for ([[maybe_unused]] const auto& t : this->tables)
+        assert(t->index_bits() == bucket_bits);
 }
 
 Directory::Directory(Rcu& rcu, TableSource& source,
@@ -114,6 +117,7 @@ int Directory::grow(uint64_t seen) {
     }
     auto* new_snap = new DirSnapshot(std::move(tables),
                                      old_snap->generation + 1);
+    assert(new_snap->bucket_bits == old_snap->bucket_bits);
 
     // As uDepot's rwpflock write_enter + write_wait_readers, for writers
     // only: new writers see the flag and back off, and the grace period
@@ -126,10 +130,12 @@ int Directory::grow(uint64_t seen) {
         for (uint64_t s = 0; s < old_table->total_slots(); ++s) {
             HashEntry entry = old_table->load_slot(s);
             if (entry.empty()) continue;
-            // An entry holds its tag and home bucket: enough for both the
-            // new table index (tag bits) and the bucket.
+            // An entry holds its tag and home bucket, the hash's low
+            // bucket_bits + 8 bits: enough for both the new table index (tag
+            // bits) and the bucket.
             uint64_t home_bucket = s - entry.bucket_offset();
-            uint64_t hash = (static_cast<uint64_t>(entry.key_tag()) << 56) |
+            uint64_t hash = (static_cast<uint64_t>(entry.key_tag())
+                             << old_snap->bucket_bits) |
                             home_bucket;
             // Splitting a table halves its load, so the copy always fits.
             int rc = new_snap->table_for_hash(hash).insert_locked(

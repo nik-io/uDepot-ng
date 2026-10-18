@@ -3,9 +3,14 @@
 
 #include "net/memcache.h"
 #include "udepot/store.h"
+#include "udepot/io/aio.h"
 #include "udepot/io/posix.h"
+#ifdef UDEPOT_BUILD_URING
+#include "udepot/io/uring.h"
+#endif
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -713,4 +718,99 @@ TEST_F(MemcacheLargeGrainTest, AppendBeyondMaxValueIsRefused) {
     auto result = client.recv_get_response();
     EXPECT_TRUE(result.found);
     EXPECT_TRUE(result.data == val);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Over the async backends
+//
+// A connection's handler is resumed by its EpollState's poller thread, so
+// its store operations submit their I/O from that thread, and only that
+// thread reaps it (each thread polls its own AIO context or io_uring ring,
+// as uDepot's TRT scheduler ran epoll and I/O pollers side by side). If the
+// epoll loop did not poll it, every get and set would wait forever; the
+// client's receive timeout turns that into a failure.
+// ─────────────────────────────────────────────────────────────────────────────
+template <typename IO>
+class MemcacheAsyncTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        path_ = std::filesystem::temp_directory_path() /
+                ("udepot_memcache_async_test_" + std::to_string(getpid()));
+        StoreConfig config;
+        config.path = path_.c_str();
+        config.size = kStoreSize;
+        config.grain_size = 512;
+        config.force_destroy = true;
+        ASSERT_EQ(store_.open(config), 0);
+        typename MemcacheServer<uDepot<IO>>::Config mc_config;
+        mc_config.bind_addr = "127.0.0.1";
+        mc_config.port = 0;
+        ASSERT_EQ(server_.start(mc_config), 0);
+        port_ = server_.port();
+        ASSERT_GT(port_, 0);
+    }
+
+    void TearDown() override {
+        server_.stop();
+        store_.close();
+        std::filesystem::remove(path_);
+    }
+
+    std::filesystem::path path_;
+    uDepot<IO> store_;
+    MemcacheServer<uDepot<IO>> server_{store_};
+    uint16_t port_ = 0;
+};
+
+#ifdef UDEPOT_BUILD_URING
+using AsyncBackends = ::testing::Types<udepot::AioIO, udepot::UringIO>;
+#else
+using AsyncBackends = ::testing::Types<udepot::AioIO>;
+#endif
+TYPED_TEST_SUITE(MemcacheAsyncTest, AsyncBackends);
+
+// Several connections at once, each its own thread and poller, each setting,
+// getting, overwriting and deleting keys of its own.
+TYPED_TEST(MemcacheAsyncTest, ConnectionsDoTheirIoOnTheirPollers) {
+    constexpr int kConns = 3;
+    constexpr int kKeys = 50;
+    std::vector<std::thread> threads;
+    std::atomic<int> failures{0};
+    for (int c = 0; c < kConns; ++c) {
+        threads.emplace_back([&, c] {
+            McClient client;
+            if (!client.connect(this->port_)) { ++failures; return; }
+            auto key = [&](int i) {
+                return "c" + std::to_string(c) + "k" + std::to_string(i);
+            };
+            auto val = [&](int i, char fill) {
+                return std::string(100 + i * 7, fill);
+            };
+            for (char fill : {'a', 'b'}) {
+                for (int i = 0; i < kKeys; ++i) {
+                    const std::string v = val(i, fill);
+                    client.send_cmd("set " + key(i) + " 0 0 " +
+                                    std::to_string(v.size()) + "\r\n" + v +
+                                    "\r\n");
+                    if (client.recv_line() != "STORED") { ++failures; return; }
+                }
+                for (int i = 0; i < kKeys; ++i) {
+                    client.send_cmd("get " + key(i) + "\r\n");
+                    auto r = client.recv_get_response();
+                    if (!r.found || r.data != val(i, fill)) {
+                        ++failures;
+                        return;
+                    }
+                }
+            }
+            for (int i = 0; i < kKeys; ++i) {
+                client.send_cmd("delete " + key(i) + "\r\n");
+                if (client.recv_line() != "DELETED") { ++failures; return; }
+                client.send_cmd("get " + key(i) + "\r\n");
+                if (client.recv_line() != "END") { ++failures; return; }
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+    EXPECT_EQ(failures.load(), 0);
 }

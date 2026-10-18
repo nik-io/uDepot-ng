@@ -427,9 +427,35 @@ int uDepot<IO>::crash_recovery() {
 // table is on the device, and the open that restores them clears the
 // footers again.
 
+uint64_t fitted_segment_size(uint64_t table_bytes, uint32_t grain_size) {
+    const uint64_t md_bytes = align_up(sizeof(salsa::salsa_seg_md), grain_size);
+    const uint64_t room = 2 * TableRegion::kMdBytes +
+                          HashEntry::kHopRange * sizeof(uint64_t) + md_bytes;
+    const uint64_t page = std::max<uint64_t>(4096, grain_size);
+    return align_up(table_bytes + room, page) / grain_size;
+}
+
+int segment_size_for_table(uint64_t table_bytes, uint32_t grain_size,
+                           uint64_t* segment_size) {
+    if (table_bytes == 0) {
+        *segment_size = 0;
+        return 0;
+    }
+    if (!std::has_single_bit(table_bytes) || table_bytes < 4096 ||
+        table_bytes > kMaxTableBytes)
+        return -EINVAL;
+    *segment_size = fitted_segment_size(table_bytes, grain_size);
+    return 0;
+}
+
 namespace {
 
 constexpr size_t kIndexMdBytes = TableRegion::kMdBytes;
+// How a persisted table's entries are to be read. 1: each entry's tag is
+// the 8 hash bits above its bucket's, as uDepot's. An index of any other
+// format (0: the top 8 bits, before PR #9) is not restored; the log scan
+// rebuilds it.
+constexpr uint32_t kIndexFormat = 1;
 constexpr size_t kIndexIoChunk = size_t{4} << 20;
 
 // uDepot's dirmap_hdr fields first; the rest are uDepot-ng's, checked
@@ -440,7 +466,7 @@ struct __attribute__((packed)) IndexHdr {
     uint32_t csum;
     uint64_t ts;
     uint32_t index_bits;
-    uint32_t reserved;
+    uint32_t format;   // kIndexFormat
     uint64_t slot_nr;  // slots in the table
 };
 
@@ -454,7 +480,7 @@ struct __attribute__((packed)) IndexFtr {
     uint64_t used_bytes_kv;
     uint64_t tot_bytes_kv;
     uint32_t index_bits;
-    uint32_t reserved;
+    uint32_t format;
     uint64_t slot_nr;
 };
 
@@ -464,7 +490,8 @@ static_assert(sizeof(IndexFtr) <= kIndexMdBytes);
 template <typename T>
 bool same_identity(const IndexHdr& h, const T& f) {
     return h.dir_size == f.dir_size && h.idx == f.idx && h.ts == f.ts &&
-           h.index_bits == f.index_bits && h.slot_nr == f.slot_nr;
+           h.index_bits == f.index_bits && h.format == f.format &&
+           h.slot_nr == f.slot_nr;
 }
 
 }  // namespace
@@ -552,9 +579,32 @@ int uDepot<IO>::new_index_table(std::unique_ptr<HashTable>* table) {
         index_ctlr_->release_grains(grain, net_grains);
     }
     if (!region.valid()) return -ENOMEM;
+    report_huge_fallback(region);
     *table = std::make_unique<HashTable>(std::move(region));
     (*table)->clear();
     return 0;
+}
+
+// No silent fallback: a table that wants huge pages and gets 4 KiB ones
+// says so, the first time in an open (at open, for the first table, or at
+// the grow that runs out of huge pages), with what it costs.
+template <typename IO>
+void uDepot<IO>::report_huge_fallback(const TableRegion& region) {
+    if (region.huge_error() == 0 ||
+        huge_fallback_reported_.exchange(true, std::memory_order_relaxed))
+        return;
+    const size_t seg_bytes = static_cast<size_t>(scm_->get_seg_size()) *
+                             grain_size_;
+    std::fprintf(
+        stderr,
+        "udepot: no 2 MiB huge pages for an index table (mmap MAP_HUGETLB: "
+        "%s); it maps on 4 KiB pages, and so will others while none are "
+        "free. Expect directory grows to be slower: each new table is "
+        "faulted in 4 KiB at a time, and the copy into it misses the TLB "
+        "more. Lookups take more TLB misses too. Each table of this store "
+        "takes %zu huge pages (vm.nr_hugepages).\n",
+        std::strerror(region.huge_error()),
+        TableRegion::huge_map_bytes(seg_bytes) / TableRegion::kHugePage);
 }
 
 template <typename IO>
@@ -629,6 +679,9 @@ int uDepot<IO>::flush_index() {
 
     // Header and slots, as uDepot's shutdown() writes each table back; the
     // footer stays clear.
+    uint32_t format = kIndexFormat;
+    if (auto hook = index_format_test_hook.load(std::memory_order_relaxed))
+        format = hook(format);
     for (uint32_t idx = 0; idx < snap.size(); ++idx) {
         const HashTable& table = *snap.tables[idx];
         const TableRegion& r = table.region();
@@ -637,6 +690,7 @@ int uDepot<IO>::flush_index() {
         hdr.idx = static_cast<uint16_t>(idx);
         hdr.ts = ts;
         hdr.index_bits = table.index_bits();
+        hdr.format = format;
         hdr.slot_nr = table.total_slots();
         hdr.csum = index_md_csum(hdr);
         std::memset(r.base(), 0, kIndexMdBytes);
@@ -659,6 +713,7 @@ int uDepot<IO>::flush_index() {
         ftr.idx = static_cast<uint16_t>(idx);
         ftr.ts = ts;
         ftr.index_bits = table.index_bits();
+        ftr.format = format;
         ftr.slot_nr = table.total_slots();
         ftr.csum = index_md_csum(ftr);
         uint8_t* f = r.base() + r.footer_offset();
@@ -780,7 +835,8 @@ int uDepot<IO>::restore_index(bool* restored) {
         for (const Found* f : set) {
             const IndexHdr& h = f->hdr;
             if (h.dir_size != dir_size || h.idx >= dir_size ||
-                h.index_bits != index_bits || h.slot_nr != total_slots ||
+                h.index_bits != index_bits || h.format != kIndexFormat ||
+                h.slot_nr != total_slots ||
                 seen[h.idx]) {
                 ok = false;
                 break;
@@ -803,6 +859,7 @@ int uDepot<IO>::restore_index(bool* restored) {
                 ok = false;
                 break;
             }
+            report_huge_fallback(region);
             for (size_t off = 0; off < used && ok; off += kIndexIoChunk) {
                 const size_t n = std::min(kIndexIoChunk, used - off);
                 ssize_t r = pread_internal(
@@ -925,6 +982,8 @@ int uDepot<IO>::open(const StoreConfig& config) {
 
     if constexpr (requires { io_.set_queue_depth(config.queue_depth); })
         io_.set_queue_depth(config.queue_depth);
+    if constexpr (requires { io_.set_poll_yields(config.poll_yields); })
+        io_.set_poll_yields(config.poll_yields);
     int rc = io_.open(config.path, config.size);
     if (rc != 0) return rc;
 
@@ -959,8 +1018,15 @@ int uDepot<IO>::open(const StoreConfig& config) {
                 (static_cast<uint64_t>(ts.tv_sec) << 20);
     }
 
-    if (segment_size == 0)
-        segment_size = (1ULL << 29) / grain_size_ + 2;
+    // The default as uDepot's, a segment for a 2^29-byte table (it adds 2
+    // grains, too few for what the table needs besides its buckets), and
+    // halved as a table size so that every halving fills its segment too.
+    // 0 once the size is the caller's or no longer a fitted one.
+    uint64_t fitted_table = 0;  // bytes
+    if (segment_size == 0) {
+        fitted_table = uint64_t{1} << 29;
+        segment_size = fitted_segment_size(fitted_table, grain_size_);
+    }
 
     // Relocating GC with uDepot's non-memcache parameters
     // (uDepotSalsa::init: init_local(14, 2, 4)).
@@ -986,10 +1052,12 @@ int uDepot<IO>::open(const StoreConfig& config) {
     };
     // As uDepot's KV_conf::validate_and_sanitize_parameters, for a store's
     // own segment size (a restored store keeps the one it was made with).
-    // It also makes the default segment (2^29 bytes + 2 grains) a 2 MiB
-    // multiple wherever a page holds more than two grains, so the
-    // directory's tables map on huge pages (TableRegion).
+    // Fitted sizes are whole pages already.
     if (!restored) segment_size = sanitize(segment_size);
+    // What was asked for (or the default), to say so if the device makes
+    // it smaller.
+    const uint64_t wanted_segment = segment_size;
+    const bool wanted_default = fitted_table != 0;
 
     // Halving retry loop (matches uDepot): if the segment size is too
     // large for the device, halve and try again.
@@ -998,6 +1066,21 @@ int uDepot<IO>::open(const StoreConfig& config) {
             if (restored) {
                 io_.close();
                 return -EINVAL;
+            }
+            if (fitted_table != 0) {
+                // A smaller fitted segment, not the least-waste size below
+                // this one: that is a plain one, half of whose table
+                // would go unused.
+                fitted_table /= 2;
+                segment_size = fitted_table >= 4096
+                                   ? fitted_segment_size(fitted_table,
+                                                         grain_size_)
+                                   : 0;
+                if (segment_size <= 1) {
+                    io_.close();
+                    return -EINVAL;
+                }
+                continue;
             }
             const uint64_t net = dev_size - grain_size_;
             uint64_t best = 0;
@@ -1045,11 +1128,70 @@ int uDepot<IO>::open(const StoreConfig& config) {
 
         delete scm_;
         scm_ = nullptr;
-        segment_size /= 2;
+        if (fitted_table != 0) {
+            fitted_table /= 2;
+            segment_size = fitted_table >= 4096
+                               ? fitted_segment_size(fitted_table, grain_size_)
+                               : 0;
+        } else {
+            segment_size /= 2;
+        }
         if (segment_size <= 1) {
             io_.close();
             return -EINVAL;
         }
+    }
+
+    // A device that does not fit the segment asked for (or the default):
+    // too few of them, or no tail left for the device metadata, made it
+    // smaller, as uDepot does, and with it every index table: say so. A
+    // segment the caller set is halved as a size, not refitted as the
+    // default is, so its table may fill only part of it.
+    if (!restored && segment_size != wanted_segment) {
+        auto table_bytes = [&](uint64_t seg) -> uint64_t {
+            const uint32_t bits = HashTable::index_bits_for(
+                static_cast<size_t>(seg - seg_md_grains_) * grain_size_);
+            return bits == 0 ? 0 : uint64_t{8} << bits;
+        };
+        const uint64_t got_table = table_bytes(segment_size);
+        const uint64_t net_bytes =
+            (segment_size - seg_md_grains_) * uint64_t{grain_size_};
+        std::fprintf(
+            stderr,
+            "udepot: %s segments of %llu KiB (index tables of %llu KiB) do "
+            "not fit a %llu KiB device: too few of them fit, or none of it is "
+            "left past the last for the device metadata. Using segments of "
+            "%llu KiB, whose tables hold %llu KiB (%llu%% of the segment). "
+            "Smaller tables fill sooner, so the directory grows sooner and "
+            "more often. Give the store a larger device, or ask for smaller "
+            "tables (StoreConfig::segment_size, fitted_segment_size; the "
+            "Python and JNI bindings' table size).\n",
+            wanted_default ? "the default" : "the requested",
+            static_cast<unsigned long long>(wanted_segment * grain_size_ >> 10),
+            static_cast<unsigned long long>(table_bytes(wanted_segment) >> 10),
+            static_cast<unsigned long long>(dev_size >> 10),
+            static_cast<unsigned long long>(segment_size * grain_size_ >> 10),
+            static_cast<unsigned long long>(got_table >> 10),
+            static_cast<unsigned long long>(
+                net_bytes == 0 ? 0 : got_table * 100 / net_bytes));
+    }
+
+    // A segment too large for 4 KiB pages to be free, whose tables still
+    // map on them: say so, once per open, with what it costs.
+    if (const size_t seg_bytes = scm_->get_seg_size() * grain_size_;
+        seg_bytes >= TableRegion::kHugePage &&
+        !TableRegion::wants_huge_pages(seg_bytes)) {
+        const size_t map_bytes = TableRegion::huge_map_bytes(seg_bytes);
+        std::fprintf(
+            stderr,
+            "udepot: index tables map on 4 KiB pages, not 2 MiB huge pages: "
+            "a %zu KiB segment would leave %zu KiB of each %zu KiB huge-page "
+            "mapping unused (more than 1/%zu). Expect directory grows to be "
+            "slower: each new table is faulted in 4 KiB at a time, and the "
+            "copy into it misses the TLB more. Lookups take more TLB misses "
+            "too. A larger segment keeps huge pages.\n",
+            seg_bytes >> 10, (map_bytes - seg_bytes) >> 10, map_bytes >> 10,
+            TableRegion::kMaxHugeWaste);
     }
 
     // Initialize our SalsaCtlr with 1 stream, 1 relocation stream.
@@ -1093,6 +1235,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
 
     index_ts_ = 0;
     index_restored_ = false;
+    huge_fallback_reported_.store(false, std::memory_order_relaxed);
     index_unbacked_ = false;
     if (restored) {
         // As uDepot's init: the persisted index after a clean shutdown,
@@ -1347,8 +1490,9 @@ int uDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
     // key can commit in between and leave the copy -- newer in recovery
     // order -- to win after a crash. Holding the lock across I/O is safe
     // only because the copy goes out with pwrite_sync, which needs no
-    // poller: a writer queued on these stripes on a poller thread cannot
-    // hold up the write it is waiting for.
+    // thread's poll: a writer blocked on these stripes, whose thread may
+    // have I/O of its own to reap, cannot hold up the write it is waiting
+    // for.
     return with_table_blocking(hash, [&](HashTable& table) -> int {
         // Only records the directory still points at matter; anything else
         // in the segment was overwritten, deleted or never committed.
@@ -1697,9 +1841,10 @@ CoroTask<int> uDepot<IO>::put(std::span<const uint8_t> key,
     int rc = check_sizes(key.size(), val.size());
     if (rc == 0) {
         rec = alloc_put_buffer(key.size(), val.size());
-        if (rec.valid())
+        if (rec.valid()) {
             std::memcpy(rec.value().data(), val.data(), val.size());
-        else
+            ++tl_value_copies_;
+        } else
             rc = -ENOMEM;
     }
     return put_record(key, nullptr, std::move(rec), rc, mode, if_version);
@@ -1928,6 +2073,7 @@ CoroTask<int> uDepot<IO>::get_record(std::span<const uint8_t> key,
             size_t to_copy = std::min(val_buf_size,
                                       static_cast<size_t>(hdr.val_size));
             std::memcpy(val_out, p + sizeof(hdr) + hdr.key_size, to_copy);
+            ++tl_value_copies_;
         }
 
         co_return 0;

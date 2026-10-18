@@ -37,13 +37,16 @@ public:
 //
 // As in uDepot's uDepotDirectoryMap::hash_to_map, a key's table is chosen by
 // the top bits of its tag, which every entry stores; the bucket comes from
-// the low bits. Those must be different bits, or each table would only ever
-// use a fraction of its buckets and growing would add no capacity.
+// the low bits and the tag from the 8 just above them (hash_to_tag). Those
+// must be different bits, or each table would only ever use a fraction of
+// its buckets and growing would add no capacity. Every table of a
+// directory has the same number of buckets: each fills an index segment.
 struct DirSnapshot {
     static constexpr uint32_t kMaxTableBits = 8;  // the tag's width
 
     std::vector<std::unique_ptr<HashTable>> tables;
     uint32_t table_bits;
+    uint32_t bucket_bits;  // every table's index_bits()
     // Counts grows. Identifies a snapshot after it is freed, when its
     // address may already belong to a newer one.
     uint64_t generation;
@@ -60,7 +63,9 @@ struct DirSnapshot {
     }
 
     uint32_t table_index(uint64_t hash) const noexcept {
-        return table_bits == 0 ? 0 : hash_to_tag(hash) >> (8 - table_bits);
+        return table_bits == 0
+                   ? 0
+                   : hash_to_tag(hash, bucket_bits) >> (8 - table_bits);
     }
 
     HashTable& table_for_hash(uint64_t hash) noexcept {

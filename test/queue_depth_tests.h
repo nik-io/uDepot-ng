@@ -21,9 +21,6 @@
 //
 //   struct Traits {
 //       using IO = ...;
-//       // Completions are resumed on a backend thread (AIO, io_uring),
-//       // not by the submitting thread's poll (SPDK).
-//       static constexpr bool kPollerThread = ...;
 //       // The backend refuses submissions past a full queue (AIO, SPDK);
 //       // io_uring's kernel takes them.
 //       static constexpr bool kQueueFills = ...;
@@ -127,29 +124,6 @@ struct ReadCtx {
     uint8_t val[128];
     size_t val_size = 0;
 };
-
-// Gets `key`, then holds the thread that resumed it, the backend's poller,
-// until *state is 2, so nothing is reaped meanwhile. Sets *state to 1 once
-// holding, or to 3 if the get completed without suspending (nothing to
-// hold). Then gets the key again: a submission from the poller thread
-// itself, while the queue is full.
-template <typename Store>
-udepot::CoroTask<int> hold_completions(Store& store, std::string key,
-                                       std::atomic<int>* state) {
-    const auto caller = std::this_thread::get_id();
-    ReadCtx ctx;
-    int rc = co_await store.get(key, ctx.val, sizeof(ctx.val), &ctx.val_size);
-    if (std::this_thread::get_id() == caller) {
-        state->store(3, std::memory_order_release);
-        co_return rc;
-    }
-    state->store(1, std::memory_order_release);
-    while (state->load(std::memory_order_acquire) != 2)
-        std::this_thread::yield();
-    if (rc == 0)
-        rc = co_await store.get(key, ctx.val, sizeof(ctx.val), &ctx.val_size);
-    co_return rc;
-}
 
 }  // namespace qd
 
@@ -359,44 +333,18 @@ protected:
     }
 
     // Issues an operation on each key first + idx[k], all at once, while
-    // nothing is being reaped, so far more are outstanding than the
-    // backend's queue holds; then lets completions run. On a backend whose
-    // completions are resumed by a poller thread, a coroutine holds that
-    // thread; on SPDK, nothing polls until the tasks are waited on. Each
-    // operation must succeed, with its data, or fail with -EAGAIN: those
-    // are returned, for the caller to retry.
+    // nothing is being reaped (every backend's completions are reaped by
+    // the submitting thread, which polls only once the tasks are waited
+    // on), so far more are outstanding than the backend's queue holds; then
+    // lets completions run. Each operation must succeed, with its data, or
+    // fail with -EAGAIN: those are returned, for the caller to retry.
     std::vector<int> issue_beyond_the_queue(int first,
                                             const std::vector<int>& idx,
                                             Op op) {
         ensure_buffers(static_cast<int>(idx.size()));
-        std::atomic<int> state{0};
-        std::optional<udepot::CoroTask<int>> holder;
-        if constexpr (Traits::kPollerThread) {
-            holder.emplace(qd::hold_completions(store_, qd::make_key(0),
-                                                &state));
-            const double deadline = qd::now_secs() + 30;
-            while (state.load(std::memory_order_acquire) == 0 &&
-                   qd::now_secs() < deadline)
-                std::this_thread::yield();
-            if (state.load() != 1) {
-                ADD_FAILURE() << "the poller was never held";
-                state.store(2);
-                if (state.load() == 2 && holder) (void)holder->run_sync();
-                return {};
-            }
-        }
-
         std::vector<std::string> keys;
         std::vector<udepot::CoroTask<int>> tasks;
         issue(op, first, idx, keys, tasks);
-
-        state.store(2, std::memory_order_release);  // let the poller go
-        if (holder) {
-            // Its second get is submitted from the poller thread itself,
-            // into a full queue: it may be refused, never stuck.
-            const int rc = holder->run_sync();
-            EXPECT_TRUE(rc == 0 || rc == -EAGAIN) << "rc=" << rc;
-        }
         const std::vector<int> rcs = wait_all(tasks);
 
         std::vector<int> refused;
@@ -425,6 +373,11 @@ protected:
             // about a full one.
             EXPECT_GT(todo.size(), 0u)
                 << "no operation found the queue full; raise the depth";
+        } else {
+            // The kernel takes them all; a refusal is the backend's own
+            // (io_uring's ring full of SQEs it had not yet pushed).
+            EXPECT_EQ(todo.size(), 0u) << "refused, though the kernel takes "
+                                          "submissions past the queue";
         }
         std::vector<std::string> keys;
         std::vector<udepot::CoroTask<int>> tasks;
@@ -495,8 +448,8 @@ TYPED_TEST_P(QueueDepthTest, DepthBeyondTheBackendQueue) {
     const int depth = std::max(4096, 16 * get_nprocs_conf() + 1024);
     using Op = typename TestFixture::Op;
     this->reopen(kQueueDepth);
-    this->put_keys(0, 1);  // the key hold_completions gets
-    // A fresh thread: on SPDK its queue pair is created at the new size.
+    // A fresh thread: its queue pair, AIO context or ring is created at the
+    // new size.
     std::thread t([&] {
         for (Op op : {Op::kPut, Op::kGet, Op::kExists})
             this->beyond_the_queue_until_done(1, depth, op, kQueueDepth);
@@ -513,7 +466,7 @@ TYPED_TEST_P(QueueDepthTest, LargeValuesAtTheSmallestQueueDepth) {
     // Above the 128 KiB transfer limit of SPDK's TCP target.
     constexpr size_t kValBytes = 200 * 1024;
     this->reopen(1);
-    std::thread t([&] {  // on SPDK, a queue pair created at depth 1
+    std::thread t([&] {  // a queue pair, context or ring created at depth 1
         for (int i = 0; i < 4; ++i) {
             const std::string val(kValBytes, static_cast<char>('a' + i));
             ASSERT_EQ(this->store_.put(qd::make_key(i), val).run_sync(), 0)
