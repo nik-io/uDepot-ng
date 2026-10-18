@@ -101,6 +101,55 @@ These are foundational constraints. Every change must preserve them.
    and 100 coroutines, not 100 threads. This is what the coroutine rewrite
    exists to deliver.
 
+## Settled decisions — do not re-argue
+
+Agreed with the maintainer, mostly in PR #9. Details are in the sections
+cited; change any of these only with explicit consent (rule 4).
+
+**O_DIRECT and zero copy**
+- AIO and io_uring open the store O_DIRECT (`open_direct`) and preallocate
+  it (`size_direct_file`), as a device would be. tmpfs takes O_DIRECT with
+  no device behind it: a toy case, never on its own evidence of O_DIRECT
+  behaviour or performance.
+- O_DIRECT correctness is the unit tests' job: they run on a real
+  filesystem (`/tmp`, ext4 in CI, checked by the workflow) and assert the
+  backends got O_DIRECT. SPDK's run over the NVMe-oF target. Short tests
+  are enough; no long or perf runs on a disk in CI.
+- The zero-copy perf check stays on `/dev/shm` (low noise), 32 operations
+  in flight as uDepot's `--trt-ntasks 32`, copy and zero copy paired in
+  one process, zero copy strictly faster on PUT and GET, plus the exact
+  gate that zero copy copies no value. Never add a tolerance, never gate
+  timing on a disk (device-bound: deltas flip sign), never move it off
+  tmpfs. A failure is a bug to root-cause, in the code or in a bench that
+  drifted from uDepot's setup, not a threshold to relax.
+- No silent fallback, anywhere: buffered I/O, a sparse file, 4 KiB pages
+  for a table, a segment shrunk by a small device, no AIO context. Each
+  prints what happened and what it costs.
+
+**Legacy first**
+- uDepot's behaviour is the default. A divergence is agreed first, and
+  where it is a trade-off it is an option with uDepot's choice the default
+  (e.g. `StoreConfig::poll_yields`: spin by default). Read uDepot's code
+  before deciding and cite file:line.
+
+**Measuring**
+- The dev container is a Firecracker VM: first touches of memory fault to
+  the host, so absolute throughput swings 3-4x between runs, and a gap seen
+  in one run (a "collapse", a "2x") is often the VM. Only paired,
+  interleaved comparisons in one run count, repeated; and CI CPUs differ
+  (EPYC 7763, 9V45). Do not report a speedup or slowdown from one local
+  run, and do not push a speculative CI fix: reproduce or explain first.
+
+**Tests**
+- A new test is only coverage once it has been seen to fail with the fix
+  undone (a mutant). Hollow tests have shipped here: a refusal test that
+  never refused, an AIO TSAN test whose path only release builds take (CI's
+  TSAN build is Debug), collision tests left searching for the old tag.
+- A test's device must be large enough for the geometry it tests, or the
+  store shrinks the segment and the test measures something else.
+- The Python and JNI bindings' 2 MiB tables are a test-size default, not a
+  limit: the table size is the caller's (`table_size`, `initWithTables`).
+
 ## Style Guide
 
 Follow the [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html).
