@@ -29,7 +29,8 @@
 7. **Deliver what was asked, at the scope intended.** Finish the whole task.
    Check in only when different readings would lead to materially different
    work.
-8. **Delegate to a subagent only for large, genuinely independent tasks.**
+8. **Delegate to a subagent only for large, genuinely independent tasks,**
+   and for the independent review of rule 12.
 9. **This is a refactoring of uDepot — preserve its design choices.** uDepot-ng
    must persist uDepot's architecture and implementation choices except for the
    specific changes identified at the beginning of the rewrite (userspace RCU
@@ -70,6 +71,35 @@
     (agreed in PR #9), never silently sparse; PUT
     writes before it checks, and
     Memcache paths may carry weaker durability than the store.
+
+11. **One concern per PR.** A PR does what its title says and nothing
+    else. Whatever turns up along the way, a bug, a missing message, a
+    better default, goes on the PR's follow-up list (its description) for
+    a PR of its own, unless it breaks this PR's own change. After a review,
+    fix what the review found, and only that. PR #9 began as per-thread
+    completion polling and absorbed fitted segments, huge pages, the tag
+    layout, poll_yields, O_DIRECT, preallocation and the bindings' table
+    size; each of its two independent reviews found real problems, and the
+    second's were nearly all in code added in answer to the first.
+12. **Pre-push checklist.** Before any push, and before telling the
+    maintainer something is done:
+    - **Tests bite.** Every new or changed test has been seen to fail with
+      the fix undone (a mutant), and to fail rather than hang.
+    - **Claims are checked.** Every statement in the commit message, PR
+      description, comments, docs and CLAUDE.md is checked against the
+      code or the CI workflow, not written from memory or intent.
+    - **No silent paths.** Every new fallback or error path prints what
+      happened and what it costs, and a test checks the message.
+    - **Every CI configuration.** Release, Debug, Debug TSAN (as CI runs
+      it), the bindings, and the SPDK build, all passing, no TSAN report;
+      and `scripts/perf-zerocopy.sh` (and the SPDK one, over the NVMe-oF
+      target) when the data path or the script changes.
+    - **Adversarial re-read.** Read the whole diff once more asking what a
+      reviewer or CI would reject: error paths, fd and memory leaks, test
+      seams left set, devices too small for the geometry, stale text.
+    - **Independent review.** For a PR-sized change, run a review agent
+      on the diff and fix what it finds before reporting the work as done:
+      the maintainer sees the reviewed result, not the draft.
 
 ## Project Overview
 
