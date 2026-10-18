@@ -750,9 +750,15 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
     // so the chances come in windows, and about one run in thirty of the
     // workload above meets none. (It passed anyway while close() flushed
     // the index with GC still running, which gave GC more time.) Keep
-    // writing, other keys only, until GC has had one.
+    // writing, other keys only, until GC has had one. Overwriting a small
+    // set (1000 records of ~3 KiB) keeps the live data well inside the
+    // store however long that takes: cycling through kKeys new keys, a late
+    // drop let them reach ~18 MiB on top of the ~13 MiB of "k" keys, past
+    // the ~25 MiB the store holds, and the put failed with -ENOSPC, rightly.
+    constexpr int kFillerKeys = 1000;
     for (int i = 0; i < 200000 && drops.load() == 0; ++i)
-        ASSERT_EQ(store_.put("f" + std::to_string(i % kKeys), val).run_sync(),
+        ASSERT_EQ(store_.put("f" + std::to_string(i % kFillerKeys), val)
+                      .run_sync(),
                   0);
     store_.close();
     uDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
