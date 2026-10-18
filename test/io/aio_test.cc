@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -263,5 +264,54 @@ TEST_F(AioIOTest, RefusedODirectFallsBackAndSaysSo) {
     std::memset(buf.data, 0, 4096);
     ASSERT_EQ(io.pread(buf.data, 4096, 0).run_sync(), ssize_t{4096});
     EXPECT_EQ(static_cast<uint8_t*>(buf.data)[4095], 0x5a);
+    io.close();
+}
+
+// The store file is preallocated, not sparse (uDepot ftruncates): an
+// O_DIRECT write into a hole has to allocate, which it cannot do without
+// blocking. Reopening keeps what is there.
+TEST_F(AioIOTest, PreallocatesTheStoreAndKeepsItsData) {
+    constexpr size_t kSize = size_t{1} << 20;
+    {
+        AioIO io;
+        ASSERT_EQ(io.open(path_.c_str(), kSize), 0);
+        struct stat st;
+        ASSERT_EQ(::stat(path_.c_str(), &st), 0);
+        EXPECT_EQ(static_cast<size_t>(st.st_size), kSize);
+        EXPECT_GE(static_cast<size_t>(st.st_blocks) * 512, kSize)
+            << "sparse: not preallocated";
+        auto buf = io.alloc_buffer(4096);
+        std::memset(buf.data, 0x7e, 4096);
+        ASSERT_EQ(io.pwrite(buf.data, 4096, kSize - 4096).run_sync(),
+                  ssize_t{4096});
+        io.close();
+    }
+    AioIO io;
+    ASSERT_EQ(io.open(path_.c_str(), kSize), 0);
+    auto buf = io.alloc_buffer(4096);
+    ASSERT_EQ(io.pread(buf.data, 4096, kSize - 4096).run_sync(),
+              ssize_t{4096});
+    EXPECT_EQ(static_cast<uint8_t*>(buf.data)[0], 0x7e);
+    io.close();
+}
+
+// A filesystem that cannot preallocate (injected) gets a sparse file of
+// the size asked for, and the open says so.
+TEST_F(AioIOTest, CannotPreallocateFallsBackToSparseAndSaysSo) {
+    udepot::refuse_fallocate_test = true;
+    struct Reset {
+        ~Reset() { udepot::refuse_fallocate_test = false; }
+    } reset;
+    constexpr size_t kSize = size_t{1} << 20;
+    AioIO io;
+    ::testing::internal::CaptureStderr();
+    const int rc = io.open(path_.c_str(), kSize);
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    ASSERT_EQ(rc, 0);
+    EXPECT_NE(log.find("cannot be preallocated"), std::string::npos) << log;
+    struct stat st;
+    ASSERT_EQ(::stat(path_.c_str(), &st), 0);
+    EXPECT_EQ(static_cast<size_t>(st.st_size), kSize);
+    EXPECT_LT(static_cast<size_t>(st.st_blocks) * 512, kSize);  // sparse
     io.close();
 }

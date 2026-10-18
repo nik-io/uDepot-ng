@@ -64,7 +64,10 @@
     until PR #9; persisted indexes carry a format number, and an older one is
     rebuilt from the log); an io_uring poll that finds nothing completed
     spins, as uDepot's, unless `StoreConfig::poll_yields` asks it to yield
-    the CPU (agreed in PR #9: configurable, legacy's spin the default); PUT
+    the CPU (agreed in PR #9: configurable, legacy's spin the default); the
+    AIO and io_uring store file is preallocated (`size_direct_file`;
+    uDepot ftruncates it sparse), so an O_DIRECT write never allocates
+    (agreed in PR #9), never silently sparse; PUT
     writes before it checks, and
     Memcache paths may carry weaker durability than the store.
 
@@ -171,7 +174,8 @@ ctest --test-dir build
   `/tmp` takes O_DIRECT (ext4 on the runners), and
   `OpensODirectWhereTheFilesystemTakesIt` that the backends got it. A
   filesystem that refuses it gets buffered I/O, never silently: the open
-  says so (`open_direct`).
+  says so (`open_direct`). SPDK's tests run over the NVMe-oF target, which
+  transfers straight to and from the store's DMA buffers.
 
 ### Zero-copy perf invariant
 
@@ -220,16 +224,17 @@ slower in CI, and on SPDK as anything from 37% slower to 52% faster, on
 code where every paired comparison has zero copy ahead. Never set
 throughputs from different runs against each other.
 
-**O_DIRECT on a real device.** tmpfs takes O_DIRECT with no device behind
-it: a toy case. So CI also runs the check on the runner's disk
-(`ZC_DIR=$RUNNER_TEMP`, ext4), store file preallocated as a device would be,
-for AIO and io_uring. There the I/O is device-bound and zero copy's timing
-deltas flip sign run to run (ext4 here: PUT -16% to +12% sparse, a GET at
--4% preallocated), so timing is reported, not gated. What is gated, there
-and on `/dev/shm` alike, is exact: the backend opened the store O_DIRECT,
-and the zero-copy batches copied no value between the caller's memory and
-uDepot's record buffers (`uDepot::thread_value_copies()`; the copying ones
-copy every value). A zero-copy put made to count a copy fails it.
+**On a real device.** tmpfs takes O_DIRECT with no device behind it: a toy
+case. So CI also runs the check briefly (seconds) on the runner's disk
+(`ZC_DIR=$RUNNER_TEMP`, ext4), for AIO and io_uring. There the I/O is
+device-bound and zero copy's timing deltas flip sign run to run (ext4 here:
+PUT -16% to +12% sparse, a GET at -4% preallocated), so timing is
+reported, not gated. What is gated, there and on `/dev/shm` alike, is
+exact: the zero-copy batches copied no value between the caller's memory
+and uDepot's record buffers (`uDepot::thread_value_copies()`; the copying
+ones copy every value). A zero-copy put made to count a copy fails it.
+Whether the store was O_DIRECT is reported there; requiring it is the unit
+tests' job (see "O_DIRECT" under CI), short tests being enough for that.
 
 **SPDK** is gated the same way, as its own CI check, "zero-copy perf
 invariant (SPDK)": `scripts/spdk-nvmef-test.sh <build> perf` starts the

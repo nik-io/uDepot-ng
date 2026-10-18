@@ -30,19 +30,16 @@
 # store's own DMA buffers, which SPDK counts: a zero-copy run must copy no
 # I/O through a bounce buffer (exact).
 #
-# O_DIRECT on a real device: ZC_DIR puts the store on another filesystem
-# (default /dev/shm), as CI does on the runner's disk. tmpfs takes O_DIRECT
+# On a real device: ZC_DIR puts the store on another filesystem (default
+# /dev/shm), as CI does on the runner's disk, briefly. tmpfs takes O_DIRECT
 # but has no device behind it; on a disk the I/O is real, and so bound by
 # the device that timing cannot gate (zero copy's deltas there flip sign
-# run to run: measured on ext4, PUT -16% to +12% with a sparse file, still
-# one GET at -4% preallocated). So off tmpfs the file is preallocated, as a
-# device would be, and timing is reported, not gated (ZC_GATE_TIMING=1 gates
-# it anyway); what is gated is exact:
-#   - O_DIRECT is in effect (the backend reports it; a filesystem that
-#     refuses it gets buffered I/O, which copies every value);
-#   - zero-copy batches copy no value between the caller's memory and
-#     uDepot's record buffers, and copying ones copy every value;
-# both on every filesystem, tmpfs included.
+# run to run: measured on ext4, PUT -16% to +12% sparse, a GET at -4%
+# preallocated). So off tmpfs timing is reported, not gated
+# (ZC_GATE_TIMING=1 gates it anyway). Gated everywhere, exactly: zero-copy
+# batches copy no value between the caller's memory and uDepot's record
+# buffers, and copying ones copy every value. Whether the store is O_DIRECT
+# is reported; the unit tests are what require it (CLAUDE.md, "O_DIRECT").
 #
 # Usage: perf-zerocopy.sh <backend> [build_dir] [batch] [runs] [min_gain%]
 #   <backend>  aio, uring or spdk. Not posix: PosixIO is buffered
@@ -88,12 +85,12 @@ esac
 ZC_DIR="${ZC_DIR:-/dev/shm}"
 FILE="${ZC_DIR}/udepot-ng-zc-${BACKEND}.store"
 trap 'rm -f "$FILE"' EXIT   # do not leave a ~1GB store behind
-FSTYPE="$(findmnt -n -o FSTYPE -T "$ZC_DIR" 2>/dev/null || stat -f -c %T "$ZC_DIR" 2>/dev/null || echo unknown)"
+# One line: a path mounted more than once (here /dev/shm) lists each.
+FSTYPE="$(findmnt -n -o FSTYPE -T "$ZC_DIR" 2>/dev/null | head -n1)"
+[ -n "$FSTYPE" ] || FSTYPE="$(stat -f -c %T "$ZC_DIR" 2>/dev/null || echo unknown)"
 GATE_TIMING=1
-PREALLOCATE=0
 if [ "$BACKEND" != "spdk" ] && [ "$FSTYPE" != "tmpfs" ]; then
     GATE_TIMING="${ZC_GATE_TIMING:-0}"
-    PREALLOCATE=1
 fi
 
 [ -x "$BIN" ] || { echo "FATAL: $BIN not found" >&2; exit 2; }
@@ -115,7 +112,7 @@ fi
         lscpu | grep -E '^(Model name|L1d cache|L2 cache|L3 cache):' | sed 's/^/  /'
     fi
     if [ "$BACKEND" != "spdk" ]; then
-        echo "  store: ${ZC_DIR} (${FSTYPE})$([ "$PREALLOCATE" = 1 ] && echo ', preallocated')"
+        echo "  store: ${ZC_DIR} (${FSTYPE}), preallocated by the backend"
         command -v findmnt >/dev/null && \
             findmnt -n -o SOURCE,FSTYPE -T "$ZC_DIR" | sed 's/^/  device: /'
     fi
@@ -127,10 +124,6 @@ fi
 # 1 or 0, "-" on SPDK).
 run_compare() {
     rm -f "$FILE"
-    if [ "$PREALLOCATE" = 1 ]; then
-        fallocate -l "$SIZE" "$FILE" \
-            || { echo "FATAL: cannot preallocate $FILE" >&2; exit 2; }
-    fi
     local out
     out=$("$BIN" --backend "$BACKEND" -f "$FILE" --size "$SIZE" -w "$BATCH" \
         --val-size "$VAL" --grain-size 512 --compare "$ROUNDS" --qd "$QD" \
@@ -205,11 +198,7 @@ if [ "$copied_copy" -eq 0 ]; then
     rc=1
 fi
 if [ "$BACKEND" != "spdk" ]; then
-    echo "  runs without O_DIRECT: ${not_direct} of ${RUNS} (fail if any)" >&2
-    if [ "$not_direct" -ne 0 ]; then
-        echo "FAIL: ${ZC_DIR} did not take O_DIRECT: buffered I/O copies every value" >&2
-        rc=1
-    fi
+    echo "  runs without O_DIRECT: ${not_direct} of ${RUNS} (reported; the unit tests require it)" >&2
 fi
 if [ "$BACKEND" = "spdk" ]; then
     echo "  zero-copy I/Os bounced through a DMA copy: ${bounced} (fail if any)" >&2
@@ -220,7 +209,7 @@ if [ "$BACKEND" = "spdk" ]; then
 fi
 if [ "$rc" -eq 0 ]; then
     [ "$GATE_TIMING" = 1 ] && echo "OK: zero-copy faster than copy on PUT and GET" >&2
-    echo "OK: zero copy copied no value$([ "$BACKEND" != spdk ] && echo ', over O_DIRECT')" >&2
+    echo "OK: zero copy copied no value" >&2
     [ "$BACKEND" = "spdk" ] && \
         echo "OK: zero-copy put/get transferred straight from the store's DMA buffers" >&2
 fi

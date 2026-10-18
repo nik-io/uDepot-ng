@@ -168,21 +168,10 @@ int UringIO::open(const char* path, size_t size) {
         return err;
     }
 
-    struct stat st;
-    if (::fstat(fd_, &st) < 0) {
-        int err = errno;
+    if (int rc = size_direct_file(fd_, path, size); rc != 0) {
         ::close(fd_);
         fd_ = -1;
-        return -err;
-    }
-
-    if (static_cast<size_t>(st.st_size) < size) {
-        if (::ftruncate(fd_, static_cast<off_t>(size)) < 0) {
-            int err = errno;
-            ::close(fd_);
-            fd_ = -1;
-            return -err;
-        }
+        return rc;
     }
 
     size_ = size;

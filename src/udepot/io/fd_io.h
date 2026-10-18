@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -64,6 +65,40 @@ inline int open_direct(const char* path, bool* direct) {
                  "zero copy, a copy each way on every read and write.\n",
                  path, std::strerror(refused));
     return fd;
+}
+
+// Test seam, never set in production: size_direct_file() takes the
+// filesystem as unable to preallocate (EOPNOTSUPP).
+inline std::atomic<bool> refuse_fallocate_test{false};
+
+// Sizes the O_DIRECT backends' store to `size` bytes. A regular file is
+// preallocated (fallocate; uDepot ftruncates it, leaving it sparse), so no
+// write has to allocate blocks: an O_DIRECT write into a hole cannot be
+// done without blocking (io_uring hands it to an io-wq worker), and a
+// store too large for the filesystem fails here with -ENOSPC rather than
+// on some write later. Data already there is kept. A filesystem that
+// cannot preallocate gets a sparse file, and the open says so. Anything
+// else (a block device) is sized as before. Returns 0 or -errno.
+inline int size_direct_file(int fd, const char* path, size_t size) {
+    struct stat st;
+    if (::fstat(fd, &st) < 0) return -errno;
+    if (S_ISREG(st.st_mode)) {
+        int rc = refuse_fallocate_test.load(std::memory_order_relaxed)
+                     ? (errno = EOPNOTSUPP, -1)
+                     : ::fallocate(fd, 0, 0, static_cast<off_t>(size));
+        if (rc == 0) return 0;
+        if (errno != EOPNOTSUPP) return -errno;
+        std::fprintf(stderr,
+                     "udepot: %s cannot be preallocated (%s); the store is a "
+                     "sparse file, and a write to a block not yet written "
+                     "allocates it: O_DIRECT cannot do that without blocking "
+                     "(io_uring hands it to a kernel worker).\n",
+                     path, std::strerror(EOPNOTSUPP));
+    }
+    if (static_cast<size_t>(st.st_size) < size &&
+        ::ftruncate(fd, static_cast<off_t>(size)) < 0)
+        return -errno;
+    return 0;
 }
 
 }  // namespace udepot
