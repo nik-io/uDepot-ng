@@ -85,6 +85,13 @@ static thread_local uint64_t tl_idle_yields = 0;
 
 uint64_t UringIO::thread_idle_yields() noexcept { return tl_idle_yields; }
 
+// The only place an empty poll gives up the CPU, so what thread_idle_yields
+// counts is the yields themselves.
+static void idle_yield() {
+    ++tl_idle_yields;
+    std::this_thread::yield();
+}
+
 // liburing has published the SQEs to the ring before io_uring_submit can
 // fail, so they cannot be withdrawn. EBUSY/EAGAIN clear as the thread
 // reaps, so they are left for its next poll to push again rather than spun
@@ -238,10 +245,7 @@ bool UringIO::poll_thread() {
     // inline is woken on this thread's CPU, and spinning here holds it off
     // until preemption (set_poll_yields, docs/architecture.md).
     if (n == 0) {
-        if (poll_yields_.load(std::memory_order_relaxed)) {
-            ++tl_idle_yields;
-            std::this_thread::yield();
-        }
+        if (poll_yields_.load(std::memory_order_relaxed)) idle_yield();
         return true;
     }
     UringRequest* done[kMaxCqes];

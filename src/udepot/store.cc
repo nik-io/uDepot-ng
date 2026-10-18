@@ -441,7 +441,8 @@ int segment_size_for_table(uint64_t table_bytes, uint32_t grain_size,
         *segment_size = 0;
         return 0;
     }
-    if (!std::has_single_bit(table_bytes) || table_bytes < 4096)
+    if (!std::has_single_bit(table_bytes) || table_bytes < 4096 ||
+        table_bytes > kMaxTableBytes)
         return -EINVAL;
     *segment_size = fitted_segment_size(table_bytes, grain_size);
     return 0;
@@ -1141,7 +1142,8 @@ int uDepot<IO>::open(const StoreConfig& config) {
         }
     }
 
-    // A device too small for the segment asked for (or the default) made it
+    // A device that does not fit the segment asked for (or the default):
+    // too few of them, or no tail left for the device metadata, made it
     // smaller, as uDepot does, and with it every index table: say so. A
     // segment the caller set is halved as a size, not refitted as the
     // default is, so its table may fill only part of it.
@@ -1156,17 +1158,18 @@ int uDepot<IO>::open(const StoreConfig& config) {
             (segment_size - seg_md_grains_) * uint64_t{grain_size_};
         std::fprintf(
             stderr,
-            "udepot: a %llu KiB device is too small for %s segments of "
-            "%llu KiB (index tables of %llu KiB); using segments of %llu KiB, "
-            "whose tables hold %llu KiB (%llu%% of the segment). Smaller "
-            "tables fill sooner, so the directory grows sooner and more "
-            "often. Give the store a larger device, or ask for smaller "
+            "udepot: %s segments of %llu KiB (index tables of %llu KiB) do "
+            "not fit a %llu KiB device: too few of them fit, or none of it is "
+            "left past the last for the device metadata. Using segments of "
+            "%llu KiB, whose tables hold %llu KiB (%llu%% of the segment). "
+            "Smaller tables fill sooner, so the directory grows sooner and "
+            "more often. Give the store a larger device, or ask for smaller "
             "tables (StoreConfig::segment_size, fitted_segment_size; the "
             "Python and JNI bindings' table size).\n",
-            static_cast<unsigned long long>(dev_size >> 10),
             wanted_default ? "the default" : "the requested",
             static_cast<unsigned long long>(wanted_segment * grain_size_ >> 10),
             static_cast<unsigned long long>(table_bytes(wanted_segment) >> 10),
+            static_cast<unsigned long long>(dev_size >> 10),
             static_cast<unsigned long long>(segment_size * grain_size_ >> 10),
             static_cast<unsigned long long>(got_table >> 10),
             static_cast<unsigned long long>(

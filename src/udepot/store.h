@@ -111,7 +111,8 @@ uint64_t fitted_segment_size(uint64_t table_bytes, uint32_t grain_size);
 // The StoreConfig::segment_size for tables of table_bytes, for callers that
 // size a store by its tables (the Python and JNI bindings): 0 for the
 // store's default, else the fitted segment of a table of table_bytes,
-// which must be a power of two of at least 4 KiB. 0 or -EINVAL.
+// which must be a power of two from 4 KiB to kMaxTableBytes. 0 or -EINVAL.
+inline constexpr uint64_t kMaxTableBytes = uint64_t{1} << 40;  // 1 TiB
 int segment_size_for_table(uint64_t table_bytes, uint32_t grain_size,
                            uint64_t* segment_size);
 

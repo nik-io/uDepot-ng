@@ -6,7 +6,8 @@
 
 #include <algorithm>
 #include <chrono>
-#include <future>
+#include <atomic>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -287,15 +288,33 @@ TEST(AioContext, NoContextFailsTheIoInsteadOfSpinning) {
 
     AioIO::setup_test_hook = [] { return -EAGAIN; };
     int put_rc = 0;
+    ::testing::internal::CaptureStderr();
     std::thread([&] { put_rc = store->put("k", "v").run_sync(); }).join();
+    const std::string log = ::testing::internal::GetCapturedStderr();
     EXPECT_EQ(put_rc, -ENOMEM);
+    // Not silent: the thread says why, and what to change.
+    EXPECT_NE(log.find("can get no AIO context"), std::string::npos) << log;
+    EXPECT_NE(log.find("fs.aio-max-nr"), std::string::npos) << log;
 
     // close() from a thread that cannot get a context: its index flush
-    // fails (the next open scans the log) rather than retrying forever.
-    auto closed = std::async(std::launch::async, [&] { store->close(); });
-    ASSERT_EQ(closed.wait_for(std::chrono::seconds(20)),
-              std::future_status::ready)
-        << "close() spun on the missing context";
+    // fails (the next open scans the log) rather than retrying forever. A
+    // close() that spins never returns, so it runs on a thread of its own
+    // and the test ends the process if it is still running: joining it, or
+    // a std::future's destructor, would hang the test instead of failing it.
+    std::atomic<bool> closed{false};
+    std::thread([&] {
+        store->close();
+        closed = true;
+    }).detach();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (!closed && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!closed) {
+        std::fprintf(stderr, "FAIL: close() spun on the missing context\n");
+        std::fflush(nullptr);
+        std::_Exit(1);
+    }
     AioIO::setup_test_hook = nullptr;
 
     uDepot<AioIO> again;

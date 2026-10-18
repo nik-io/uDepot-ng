@@ -72,6 +72,15 @@ struct BenchConfig {
     bool poll_yields = false;
 };
 
+// Removes the store if it is a regular file the bench made: -f may name a
+// device (SPDK aside, a block device for AIO or io_uring), whose node must
+// not be unlinked.
+static void remove_store_file(const std::string& path) {
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(path, ec))
+        std::filesystem::remove(path, ec);
+}
+
 static double now_secs() {
     auto t = std::chrono::steady_clock::now();
     return std::chrono::duration<double>(t.time_since_epoch()).count();
@@ -571,7 +580,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::filesystem::remove(cfg.file);
+    remove_store_file(cfg.file);
     int rc;
     if (cfg.backend == "posix") {
         rc = run_bench<PosixIO>(cfg);
@@ -598,6 +607,6 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Unknown backend: %s\n", cfg.backend.c_str());
         return 1;
     }
-    std::filesystem::remove(cfg.file);
+    remove_store_file(cfg.file);
     return rc;
 }

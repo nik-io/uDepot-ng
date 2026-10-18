@@ -128,6 +128,26 @@ struct AioThread {
 
 thread_local AioThread tl_aio;
 
+// No silent failure: a thread that can get no context says so, once (its
+// every I/O fails the same way until one is freed), with the remedy.
+void report_no_context(int rc, unsigned depth) {
+    static thread_local bool reported = false;
+    if (reported) return;
+    reported = true;
+    unsigned long max_nr = 0;
+    if (FILE* f = std::fopen("/proc/sys/fs/aio-max-nr", "r")) {
+        if (std::fscanf(f, "%lu", &max_nr) != 1) max_nr = 0;
+        std::fclose(f);
+    }
+    std::fprintf(stderr,
+                 "udepot: this thread can get no AIO context of %u I/Os (%s): "
+                 "every thread doing AIO takes one, and the system's already "
+                 "hold fs.aio-max-nr (%lu) between them. Its I/O fails with "
+                 "-ENOMEM until one is freed. Raise fs.aio-max-nr, lower "
+                 "StoreConfig::queue_depth, or use fewer threads.\n",
+                 depth, std::strerror(-rc), max_nr);
+}
+
 }  // namespace
 
 std::atomic<unsigned> AioIO::new_ctx_depth_{AioIO::kDefaultQueueDepth};
@@ -140,12 +160,14 @@ struct AioSubmitAwaitable {
     bool await_suspend(std::coroutine_handle<> h) noexcept {
         AioThread& t = tl_aio;
         if (t.ctx == 0) {
-            int rc = t.setup(AioIO::new_ctx_depth_.load(
-                std::memory_order_relaxed));
+            const unsigned depth =
+                AioIO::new_ctx_depth_.load(std::memory_order_relaxed);
+            int rc = t.setup(depth);
             if (rc != 0) {
                 // No context to be had: not a full queue (-EAGAIN), which
                 // the thread's own completions would clear.
                 req->result = rc == -EAGAIN ? -ENOMEM : rc;
+                report_no_context(rc, depth);
                 return false;
             }
             set_thread_poll(&AioIO::poll_thread);

@@ -78,7 +78,9 @@ case "$BUILD_DIR" in
     *)  BIN="$HERE/$BUILD_DIR/udepot_ng_bench" ;;
 esac
 FILE="/dev/shm/udepot-ng-zc-${BACKEND}.store"
-trap 'rm -f "$FILE"' EXIT   # do not leave a ~1GB store on /dev/shm
+ERRS="$(mktemp)"            # the bench's stderr, for its warnings
+SEEN="$(mktemp)"            # warnings already shown
+trap 'rm -f "$FILE" "$ERRS" "$SEEN"' EXIT   # do not leave a ~1GB store on /dev/shm
 
 [ -x "$BIN" ] || { echo "FATAL: $BIN not found" >&2; exit 2; }
 WHERE="on /dev/shm"
@@ -109,7 +111,12 @@ run_compare() {
     local out
     out=$("$BIN" --backend "$BACKEND" -f "$FILE" --size "$SIZE" -w "$BATCH" \
         --val-size "$VAL" --grain-size 512 --compare "$ROUNDS" --qd "$QD" \
-        2>/dev/null)
+        2>"$ERRS")
+    # No silent fallback: what the store said (buffered I/O, a sparse file,
+    # a shrunk segment...) is shown, once.
+    grep '^udepot:' "$ERRS" | while IFS= read -r line; do
+        grep -qxF -- "$line" "$SEEN" || { echo "$line" >> "$SEEN"; echo "  $line" >&2; }
+    done
     local dp dg b pc pz gc gz
     dp=$(grep '^CMP PUT' <<<"$out" | grep -oE 'delta=[-+0-9.]+' | cut -d= -f2)
     dg=$(grep '^CMP GET' <<<"$out" | grep -oE 'delta=[-+0-9.]+' | cut -d= -f2)
@@ -159,14 +166,16 @@ check_delta() {  # delta% phase-name
 rc=0
 check_delta "$(median "${dps[@]}")" PUT || rc=1
 check_delta "$(median "${dgs[@]}")" GET || rc=1
-# Exact: the zero-copy path copied no value, the copying one every value.
-echo "  values copied: zero copy ${copied_zc} (fail if any), copy ${copied_copy}" >&2
+# Exact: the zero-copy path copied no value, the copying one every value
+# (each of its puts and gets one: 2 phases x ROUNDS batches x BATCH ops).
+want_copies=$((RUNS * 2 * ROUNDS * BATCH))
+echo "  values copied: zero copy ${copied_zc} (fail if any), copy ${copied_copy} (fail unless ${want_copies})" >&2
 if [ "$copied_zc" -ne 0 ]; then
     echo "FAIL: the zero-copy path copied ${copied_zc} values" >&2
     rc=1
 fi
-if [ "$copied_copy" -eq 0 ]; then
-    echo "FAIL: the copying path copied nothing, so nothing was compared" >&2
+if [ "$copied_copy" -ne "$want_copies" ]; then
+    echo "FAIL: the copying path copied ${copied_copy} values, not one per operation (${want_copies})" >&2
     rc=1
 fi
 if [ "$BACKEND" = "spdk" ]; then

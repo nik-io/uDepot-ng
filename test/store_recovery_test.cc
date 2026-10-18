@@ -737,11 +737,6 @@ TEST_P(StoreIndexTest, SegmentSizeIsWholePages) {
     store.close();
 }
 
-// A fitted segment's table holds exactly the buckets it was fitted for:
-// the next power of two does not fit, so the table fills more than half
-// of it, and all but the room it needs (header, footer, last neighborhood,
-// salsa metadata, rounded up to a page) when the table is large. A segment
-// of a power of two of bytes held half the table it was meant for.
 // The bindings size a store by its tables: 0 is the store's default
 // segment, a power of two of at least 4 KiB its fitted one, anything else
 // -EINVAL.
@@ -756,9 +751,22 @@ TEST(FittedSegmentSize, SegmentSizeForTable) {
     seg = 7;
     EXPECT_EQ(udepot::segment_size_for_table(2048, 512, &seg), -EINVAL);
     EXPECT_EQ(udepot::segment_size_for_table(6 << 20, 512, &seg), -EINVAL);
+    EXPECT_EQ(udepot::segment_size_for_table(udepot::kMaxTableBytes * 2, 512,
+                                             &seg), -EINVAL);
+    EXPECT_EQ(udepot::segment_size_for_table(uint64_t{1} << 63, 512, &seg),
+              -EINVAL);
+    uint64_t largest = 0;
+    EXPECT_EQ(udepot::segment_size_for_table(udepot::kMaxTableBytes, 512,
+                                             &largest), 0);
+    EXPECT_GT(largest, 0u);
     EXPECT_EQ(seg, 7u);  // untouched on failure
 }
 
+// A fitted segment's table holds exactly the buckets it was fitted for:
+// the next power of two does not fit, so the table fills more than half
+// of it, and all but the room it needs (header, footer, last neighborhood,
+// salsa metadata, rounded up to a page) when the table is large. A segment
+// of a power of two of bytes held half the table it was meant for.
 TEST(FittedSegmentSize, TheTableFillsItsSegment) {
     for (uint32_t grain : {512u, 4096u}) {
         const size_t md = std::max<size_t>(512, grain);  // salsa md grain
@@ -853,14 +861,15 @@ TEST_P(StoreIndexTest, OpenSaysWhenTheDeviceShrinksTheSegment) {
     const uint64_t seg =
         udepot::fitted_segment_size(size_t{2} << 20, config_.grain_size);
     const std::string small = open_log(seg, 4 << 20);
-    EXPECT_NE(small.find("too small for the requested segments of 2056 KiB"),
+    EXPECT_NE(small.find("the requested segments of 2056 KiB (index tables "
+                         "of 2048 KiB) do not fit"),
               std::string::npos) << small;
     const std::string fits =
         open_log(seg, 32 * seg * config_.grain_size + 4096);
-    EXPECT_EQ(fits.find("too small"), std::string::npos) << fits;
+    EXPECT_EQ(fits.find("do not fit"), std::string::npos) << fits;
     const std::string dflt = open_log(0, 4 << 20);
-    EXPECT_NE(dflt.find("too small for the default segments"),
-              std::string::npos) << dflt;
+    EXPECT_NE(dflt.find("the default segments of"), std::string::npos) << dflt;
+    EXPECT_NE(dflt.find("do not fit"), std::string::npos) << dflt;
 }
 
 // No silent fallback: a table that wants huge pages and cannot have them

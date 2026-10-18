@@ -249,7 +249,8 @@ What remains lives in `io/`:
   started it polls (waiting in `run_sync()`, or driving
   `poll_this_thread()`): waiting on it from another thread finishes only
   once the starting thread polls, as a TRT task finishes on its own
-  scheduler thread. `store.h` states this on the API. A thread that resumes operations it did not start (the space waker, a
+  scheduler thread. `store.h` states this on the API. A thread that
+  resumes operations it did not start (the space waker, a
   memcache connection's epoll poller) polls its own queue too: their I/O is
   now its own. One thread per `SpdkIO` polls the controllers' admin queues
   (~10x/s), which keeps NVMe-oF keep-alives flowing.
