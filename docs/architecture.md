@@ -243,8 +243,13 @@ What remains lives in `io/`:
   it has used), the way a TRT scheduler polled between tasks — harvests the
   completions and resumes the coroutines, so a coroutine stays on the thread
   that submitted its I/O. io_uring queues SQEs and pushes them in batches of
-  up to 128, or at the thread's next poll, as uDepot's `UringState` does.
-  A thread that resumes operations it did not start (the space waker, a
+  up to 128, or at the thread's next poll, as uDepot's `UringState` does;
+  a ring smaller than that fills first, and the next I/O pushes it rather
+  than being refused. So an operation completes only when the thread that
+  started it polls (waiting in `run_sync()`, or driving
+  `poll_this_thread()`): waiting on it from another thread finishes only
+  once the starting thread polls, as a TRT task finishes on its own
+  scheduler thread. `store.h` states this on the API. A thread that resumes operations it did not start (the space waker, a
   memcache connection's epoll poller) polls its own queue too: their I/O is
   now its own. One thread per `SpdkIO` polls the controllers' admin queues
   (~10x/s), which keeps NVMe-oF keep-alives flowing.
@@ -673,9 +678,12 @@ persistent source of truth is the log"*.
   short), and halving it for a small device halves the table and refits,
   including where a fitted size leaves no tail for the device metadata. A
   segment size the caller sets is used as given. A table's memory is all
-  touched at open, so the default means up to 512 MiB per table; the
-  Python and JNI bindings use fitted segments for 2 MiB tables (2^18
-  buckets).
+  touched at open, so the default means up to 512 MiB per table. The
+  Python and JNI bindings take the table size from the caller
+  (`table_size`, `initWithTables`, YCSB's `udepot.table-size`; a power of
+  two of at least 4 KiB, or 0 for the store's default,
+  `segment_size_for_table`); they default to 2 MiB tables (2^18 buckets),
+  small, for tests, which map on 4 KiB pages, and the store says so.
 - **Memory** (`TableRegion`). An anonymous mapping of the whole segment,
   uDepot's mapping on its AIO and SPDK backends: read from the segment on
   restore, written back at close. As uDepot's fix for the shutdown overrun

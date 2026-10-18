@@ -24,7 +24,11 @@ namespace udepot {
 //
 // A context is sized for queue_depth() I/Os (the kernel rounds it up). An
 // I/O the kernel refuses because the context is full fails with -EAGAIN,
-// as in uDepot; nothing waits for room.
+// as in uDepot; nothing waits for room. A thread's first I/O creates its
+// context; if none can be had (the system's contexts already hold
+// fs.aio-max-nr requests) that I/O fails with -ENOMEM, not -EAGAIN: no
+// completion of the thread's own frees the room, so a retry would spin.
+// (uDepot exits.)
 class AioIO {
 public:
     static constexpr unsigned kDefaultQueueDepth = 1024;
@@ -65,6 +69,18 @@ public:
     // Reap this thread's completed I/Os and resume their coroutines.
     // Returns whether any of this thread's I/O is still outstanding.
     static bool poll_thread();
+
+    // Test seam, never set in production: called before each io_setup;
+    // returning -errno fails it with that, as the kernel would with every
+    // context taken (-EAGAIN). 0 lets it go on.
+    using SetupHook = int (*)();
+    inline static std::atomic<SetupHook> setup_test_hook{nullptr};
+
+    // Test seam, never set in production: release builds reap completions
+    // from the context's ring in user space, debug builds with io_getevents
+    // (as uDepot's aio_user_getevents). Set, a debug build reads the ring
+    // too, so a debug TSAN run covers what touches it. No effect in release.
+    inline static std::atomic<bool> user_ring_test_override{false};
 
 private:
     friend struct AioSubmitAwaitable;

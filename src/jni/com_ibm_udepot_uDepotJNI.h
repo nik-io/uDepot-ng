@@ -9,11 +9,11 @@ extern "C" {
 #endif
 /*
  * Class:     com_ibm_udepot_uDepotJNI
- * Method:    init
- * Signature: (Ljava/lang/String;JZ)I
+ * Method:    initWithTables
+ * Signature: (Ljava/lang/String;JZJ)I
  */
-JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_init
-  (JNIEnv *, jobject, jstring, jlong, jboolean);
+JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_initWithTables
+  (JNIEnv *, jobject, jstring, jlong, jboolean, jlong);
 
 /*
  * Class:     com_ibm_udepot_uDepotJNI

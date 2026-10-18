@@ -742,6 +742,23 @@ TEST_P(StoreIndexTest, SegmentSizeIsWholePages) {
 // of it, and all but the room it needs (header, footer, last neighborhood,
 // salsa metadata, rounded up to a page) when the table is large. A segment
 // of a power of two of bytes held half the table it was meant for.
+// The bindings size a store by its tables: 0 is the store's default
+// segment, a power of two of at least 4 KiB its fitted one, anything else
+// -EINVAL.
+TEST(FittedSegmentSize, SegmentSizeForTable) {
+    uint64_t seg = 1;
+    EXPECT_EQ(udepot::segment_size_for_table(0, 4096, &seg), 0);
+    EXPECT_EQ(seg, 0u);
+    EXPECT_EQ(udepot::segment_size_for_table(size_t{2} << 20, 4096, &seg), 0);
+    EXPECT_EQ(seg, udepot::fitted_segment_size(size_t{2} << 20, 4096));
+    EXPECT_EQ(udepot::segment_size_for_table(4096, 512, &seg), 0);
+    EXPECT_EQ(seg, udepot::fitted_segment_size(4096, 512));
+    seg = 7;
+    EXPECT_EQ(udepot::segment_size_for_table(2048, 512, &seg), -EINVAL);
+    EXPECT_EQ(udepot::segment_size_for_table(6 << 20, 512, &seg), -EINVAL);
+    EXPECT_EQ(seg, 7u);  // untouched on failure
+}
+
 TEST(FittedSegmentSize, TheTableFillsItsSegment) {
     for (uint32_t grain : {512u, 4096u}) {
         const size_t md = std::max<size_t>(512, grain);  // salsa md grain

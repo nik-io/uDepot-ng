@@ -149,6 +149,13 @@ TEST_F(AioIOTest, MultipleSequentialOps) {
 // the address often enough that one of the generations hits it.
 TEST_F(AioIOTest, ANewThreadsContextMayReuseAnExitedThreadsRing) {
     constexpr int kGenerations = 32;
+    // Reaped from the ring in user space, which is what TSAN must see; a
+    // debug build (CI's TSAN job) would otherwise use io_getevents and
+    // never touch it.
+    AioIO::user_ring_test_override = true;
+    struct ResetOverride {
+        ~ResetOverride() { AioIO::user_ring_test_override = false; }
+    } reset_override;
     AioIO io;
     ASSERT_EQ(io.open(path_.c_str(), 4096), 0);
     auto buf = io.alloc_buffer(4096);

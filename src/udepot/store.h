@@ -81,12 +81,13 @@ struct StoreConfig {
     uint32_t overprovision = 200;
     // Destroy any existing data on the device and start fresh.
     bool force_destroy = false;
-    // I/Os the caller expects to have in flight at once (per thread on
-    // SPDK). It sizes the backend's queue (AIO context, io_uring ring,
-    // SPDK request pool); uDepot allocates no data buffers for it, see
-    // alloc_put_buffer() and alloc_get_buffer(). An operation whose I/O
-    // the backend refuses because its queue is full fails with -EAGAIN.
-    // 0 = the backend's default.
+    // I/Os the caller expects to have in flight at once on a thread. It
+    // sizes each thread's queue (AIO context, io_uring ring, SPDK queue
+    // pair and request pool): the opening thread's at open(), and those
+    // other threads create from then on; uDepot allocates no data buffers
+    // for it, see alloc_put_buffer() and alloc_get_buffer(). An operation
+    // whose I/O the backend refuses because its queue is full fails with
+    // -EAGAIN. 0 = the backend's default.
     unsigned queue_depth = 0;
 };
 
@@ -95,9 +96,16 @@ struct StoreConfig {
 // the table's header, footer and last neighborhood, and the segment's
 // salsa metadata, rounded up to whole pages. A segment of a power of two
 // of bytes falls ~2 KiB short of its next table size, so half of it would
-// go unused. Its table maps on huge pages once it is 2 MiB or more
-// (TableRegion).
+// go unused. Its table maps on huge pages when rounding it up to 2 MiB
+// wastes little (TableRegion::wants_huge_pages).
 uint64_t fitted_segment_size(uint64_t table_bytes, uint32_t grain_size);
+
+// The StoreConfig::segment_size for tables of table_bytes, for callers that
+// size a store by its tables (the Python and JNI bindings): 0 for the
+// store's default, else the fitted segment of a table of table_bytes,
+// which must be a power of two of at least 4 KiB. 0 or -EINVAL.
+int segment_size_for_table(uint64_t table_bytes, uint32_t grain_size,
+                           uint64_t* segment_size);
 
 // Condition a put() must satisfy, checked atomically with the write.
 enum class PutMode {
@@ -178,7 +186,17 @@ public:
     //
     // Any operation fails with -EAGAIN if the backend cannot take another
     // I/O (its queue is full of the caller's operations); it may be retried
-    // once some of those complete. See StoreConfig::queue_depth.
+    // once some of those complete. See StoreConfig::queue_depth. On AIO, an
+    // operation that is a thread's first I/O fails with -ENOMEM if the
+    // thread can get no context (the system's hold fs.aio-max-nr requests).
+    //
+    // An operation's I/O goes to the queue of the thread that starts it,
+    // and completes only when that thread polls: while it waits in
+    // run_sync() on any of its operations, or drives poll_this_thread()
+    // itself, as uDepot's TRT tasks complete on their own scheduler thread.
+    // Waiting from another thread (run_sync() on a task started elsewhere)
+    // finishes only once the starting thread polls; a thread that starts
+    // operations and stops polling stalls them.
     int open(const StoreConfig& config);
     void close();
 

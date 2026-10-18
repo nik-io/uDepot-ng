@@ -5,6 +5,8 @@
 #include "udepot/io/aio.h"
 
 #include <algorithm>
+#include <chrono>
+#include <future>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -12,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -258,4 +261,52 @@ TEST_F(AioStoreTest, IndexSurvivesACleanReopen) {
         store.close();
         std::filesystem::remove(path);
     }
+}
+
+// A thread's first I/O creates its AIO context. When none can be had (the
+// system's contexts hold fs.aio-max-nr requests; io_setup fails with
+// EAGAIN, injected here), that I/O fails with -ENOMEM: -EAGAIN would mean a
+// full queue that the thread's own completions clear, so a caller retrying
+// it, and uDepot's own I/O (which does), would spin forever. Before, close()
+// from such a thread spun in its index flush until a context was freed.
+TEST(AioContext, NoContextFailsTheIoInsteadOfSpinning) {
+    const auto path = std::filesystem::temp_directory_path() /
+                      "udepot_aio_no_context_test";
+    StoreConfig config;
+    config.path = path.c_str();
+    config.size = kStoreSize;
+    config.grain_size = 512;
+    config.force_destroy = true;
+    struct ResetHook {
+        ~ResetHook() { AioIO::setup_test_hook = nullptr; }
+    } reset_hook;
+
+    auto store = std::make_unique<uDepot<AioIO>>();
+    ASSERT_EQ(store->open(config), 0);  // this thread's context: made here
+    ASSERT_EQ(store->put("kept", "value").run_sync(), 0);
+
+    AioIO::setup_test_hook = [] { return -EAGAIN; };
+    int put_rc = 0;
+    std::thread([&] { put_rc = store->put("k", "v").run_sync(); }).join();
+    EXPECT_EQ(put_rc, -ENOMEM);
+
+    // close() from a thread that cannot get a context: its index flush
+    // fails (the next open scans the log) rather than retrying forever.
+    auto closed = std::async(std::launch::async, [&] { store->close(); });
+    ASSERT_EQ(closed.wait_for(std::chrono::seconds(20)),
+              std::future_status::ready)
+        << "close() spun on the missing context";
+    AioIO::setup_test_hook = nullptr;
+
+    uDepot<AioIO> again;
+    config.force_destroy = false;
+    ASSERT_EQ(again.open(config), 0);
+    EXPECT_FALSE(again.index_restored());
+    uint8_t val[64];
+    size_t val_size = 0;
+    ASSERT_EQ(again.get("kept", val, sizeof(val), &val_size).run_sync(), 0);
+    EXPECT_EQ(std::string_view(reinterpret_cast<char*>(val), val_size),
+              "value");
+    again.close();
+    std::filesystem::remove(path);
 }

@@ -373,6 +373,11 @@ protected:
             // about a full one.
             EXPECT_GT(todo.size(), 0u)
                 << "no operation found the queue full; raise the depth";
+        } else {
+            // The kernel takes them all; a refusal is the backend's own
+            // (io_uring's ring full of SQEs it had not yet pushed).
+            EXPECT_EQ(todo.size(), 0u) << "refused, though the kernel takes "
+                                          "submissions past the queue";
         }
         std::vector<std::string> keys;
         std::vector<udepot::CoroTask<int>> tasks;

@@ -51,8 +51,12 @@ INSTANTIATE_TYPED_TEST_SUITE_P(Uring, QueueDepthTest, UringTraits);
 // nothing reaping meanwhile, a hang.
 TEST(UringSubmit, RefusedSubmissionsAreRetriedByThePoll) {
     static std::atomic<bool> refuse{false};
+    static std::atomic<int> refusals{0};
+    refusals = 0;
     udepot::UringIO::submit_test_hook = [] {
-        return refuse.load() ? -EBUSY : 0;
+        if (!refuse.load()) return 0;
+        ++refusals;
+        return -EBUSY;
     };
     struct ResetHook {
         ~ResetHook() { udepot::UringIO::submit_test_hook = nullptr; }
@@ -81,6 +85,9 @@ TEST(UringSubmit, RefusedSubmissionsAreRetriedByThePoll) {
     }
     // Every get was issued without blocking: none spun on the refusal.
     refuse = false;
+    // The refusal was met: the 4 queued SQEs filled the ring, so the next
+    // get pushed them and the kernel (the hook) refused.
+    EXPECT_GT(refusals.load(), 0);
 
     std::vector<int> refused;
     for (int i = 0; i < kKeys; ++i) {
@@ -104,6 +111,42 @@ TEST(UringSubmit, RefusedSubmissionsAreRetriedByThePoll) {
                             &ctx.val_size).run_sync(), 0);
         EXPECT_EQ(std::string_view(reinterpret_cast<char*>(ctx.val),
                                    ctx.val_size),
+                  qd::make_val(i));
+    }
+    store.close();
+    UringTraits::cleanup(config);
+}
+
+// A ring smaller than a submission batch (kSubmitBatch, 128) fills with
+// SQEs waiting for the batch before it is ever pushed. The next I/O pushes
+// them rather than being refused: nothing refused it but a full ring of
+// SQEs the kernel never saw. (uDepot's ring, 1024 entries, is never smaller
+// than its batch.) Before, at depth 4 the fifth of these gets failed with
+// -EAGAIN.
+TEST(UringSubmit, AFullRingIsPushedNotRefused) {
+    udepot::StoreConfig config;
+    config.grain_size = 512;
+    config.force_destroy = true;
+    config.queue_depth = 4;
+    UringTraits::configure(config);
+    udepot::uDepot<udepot::UringIO> store;
+    ASSERT_EQ(store.open(config), 0);
+
+    constexpr int kKeys = 64;
+    for (int i = 0; i < kKeys; ++i)
+        ASSERT_EQ(store.put(qd::make_key(i), qd::make_val(i)).run_sync(), 0);
+    std::vector<qd::ReadCtx> ctxs(kKeys);
+    std::vector<std::string> keys(kKeys);
+    std::vector<udepot::CoroTask<int>> tasks;
+    for (int i = 0; i < kKeys; ++i) {
+        keys[i] = qd::make_key(i);
+        tasks.push_back(store.get(keys[i], ctxs[i].val, sizeof(ctxs[i].val),
+                                  &ctxs[i].val_size));
+    }
+    for (int i = 0; i < kKeys; ++i) {
+        ASSERT_EQ(tasks[i].run_sync(), 0) << "i=" << i;
+        EXPECT_EQ(std::string_view(reinterpret_cast<char*>(ctxs[i].val),
+                                   ctxs[i].val_size),
                   qd::make_val(i));
     }
     store.close();

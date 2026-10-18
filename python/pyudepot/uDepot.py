@@ -15,14 +15,14 @@ _lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 libudepot = ctypes.cdll.LoadLibrary(
     _lib_path if os.path.exists(_lib_path) else 'libpyudepot.so')
 
-pyopen = libudepot.uDepotOpen
+pyopen = libudepot.uDepotOpenTables
 pyclose = libudepot.uDepotClose
 pyget = libudepot.uDepotGet
 pyput = libudepot.uDepotPut
 pydel = libudepot.uDepotDel
 pyexists = libudepot.uDepotExists
 
-pyopen.argtypes = [c_char_p, c_ulonglong, c_int]
+pyopen.argtypes = [c_char_p, c_ulonglong, c_int, c_ulonglong]
 pyopen.restype = c_void_p
 pyclose.argtypes = [c_void_p]
 pyget.argtypes = [c_void_p,
@@ -39,13 +39,22 @@ pyexists.argtypes = [c_void_p,
 pyexists.restype = c_int
 
 
+# Index tables of 2 MiB: small, for tests. A store sized for real use
+# passes its own table_size (a power of two of at least 4096 bytes, or 0
+# for the store's default, 512 MiB tables); tables this small map on
+# 4 KiB pages and directory grows are slower, which the store prints.
+DEFAULT_TABLE_SIZE = 2 * 1024 * 1024
+
+
 class uDepot:
     def __init__(self, **kwargs):
         self._fname = kwargs.get('file_name', '/tmp/pyudepot-test')
         self._size = kwargs.get('size', 1024 * 1024 + 4096)
         self._force_destroy = 1 if kwargs.get('force_destroy', False) else 0
+        self._table_size = kwargs.get('table_size', DEFAULT_TABLE_SIZE)
         self._kv = pyopen(
-            self._fname.encode('utf-8'), self._size, self._force_destroy)
+            self._fname.encode('utf-8'), self._size, self._force_destroy,
+            self._table_size)
         if not self._kv:
             raise IOError('failed to open uDepot for {}'.format(self._fname))
         atexit.register(self._cleanup)

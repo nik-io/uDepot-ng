@@ -435,6 +435,18 @@ uint64_t fitted_segment_size(uint64_t table_bytes, uint32_t grain_size) {
     return align_up(table_bytes + room, page) / grain_size;
 }
 
+int segment_size_for_table(uint64_t table_bytes, uint32_t grain_size,
+                           uint64_t* segment_size) {
+    if (table_bytes == 0) {
+        *segment_size = 0;
+        return 0;
+    }
+    if (!std::has_single_bit(table_bytes) || table_bytes < 4096)
+        return -EINVAL;
+    *segment_size = fitted_segment_size(table_bytes, grain_size);
+    return 0;
+}
+
 namespace {
 
 constexpr size_t kIndexMdBytes = TableRegion::kMdBytes;

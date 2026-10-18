@@ -57,12 +57,13 @@ struct AioRing {
 static constexpr unsigned kAioRingMagic = 0xa10a10a1;
 
 static inline bool aio_ring_valid(aio_context_t ctx) {
-#ifdef NDEBUG
-    return reinterpret_cast<AioRing*>(ctx)->magic == kAioRingMagic;
-#else
-    (void)ctx;
-    return false;
+#ifndef NDEBUG
+    // Debug builds reap with io_getevents, as uDepot's, unless a test asks
+    // for the ring (AioIO::user_ring_test_override).
+    if (!AioIO::user_ring_test_override.load(std::memory_order_relaxed))
+        return false;
 #endif
+    return reinterpret_cast<AioRing*>(ctx)->magic == kAioRingMagic;
 }
 
 static inline int aio_ring_getevents(aio_context_t ctx, unsigned max,
@@ -106,6 +107,8 @@ struct AioThread {
     // at once can reach it).
     int setup(unsigned n) {
         aio_context_t c = 0;
+        if (auto hook = AioIO::setup_test_hook.load(std::memory_order_relaxed))
+            if (int rc = hook(); rc != 0) return rc;
         if (sys_io_setup(n, &c) < 0) return -errno;
         tsan_acquire_from_kernel(reinterpret_cast<void*>(c));
         if (ctx != 0) sys_io_destroy(ctx);
@@ -140,7 +143,9 @@ struct AioSubmitAwaitable {
             int rc = t.setup(AioIO::new_ctx_depth_.load(
                 std::memory_order_relaxed));
             if (rc != 0) {
-                req->result = rc;
+                // No context to be had: not a full queue (-EAGAIN), which
+                // the thread's own completions would clear.
+                req->result = rc == -EAGAIN ? -ENOMEM : rc;
                 return false;
             }
             set_thread_poll(&AioIO::poll_thread);

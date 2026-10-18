@@ -122,6 +122,13 @@ struct UringSubmitAwaitable {
         }
         req->handle = h;
         struct io_uring_sqe* sqe = io_uring_get_sqe(&t.ring);
+        if (!sqe && io_uring_sq_ready(&t.ring) > 0) {
+            // Full of SQEs still waiting for a batch: a ring smaller than
+            // kSubmitBatch (uDepot's is never smaller) fills before one.
+            // Push them, and refuse only what the kernel refuses.
+            t.submit();
+            sqe = io_uring_get_sqe(&t.ring);
+        }
         if (!sqe) {  // full of SQEs the kernel refused for now
             req->result = -EAGAIN;
             return false;

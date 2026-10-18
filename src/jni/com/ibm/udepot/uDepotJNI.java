@@ -10,13 +10,34 @@ package com.ibm.udepot;
  */
 public class uDepotJNI {
   /**
-   * Initialize the Key Value provider.
+   * Index table size init() uses: 2 MiB, small, for tests. A store sized
+   * for real use passes its own to initWithTables; tables this small map
+   * on 4 KiB pages and directory grows are slower, which the store prints.
+   */
+  public static final long DEFAULT_TABLE_SIZE = 2L * 1024 * 1024;
+
+  /**
+   * Initialize the Key Value provider, with DEFAULT_TABLE_SIZE tables.
    * @param fname    Path to file/device for backend storage.
    * @param size     Desired capacity in bytes. 0 for full capacity.
    * @param force_destroy If true, assume empty device (no restore).
    * @return 0 on success, errno on failure.
    */
-  public native int init(String fname, long size, boolean force_destroy);
+  public int init(String fname, long size, boolean force_destroy) {
+    return initWithTables(fname, size, force_destroy, DEFAULT_TABLE_SIZE);
+  }
+
+  /**
+   * Initialize the Key Value provider.
+   * @param fname    Path to file/device for backend storage.
+   * @param size     Desired capacity in bytes. 0 for full capacity.
+   * @param force_destroy If true, assume empty device (no restore).
+   * @param table_size Bytes of each index table: a power of two of at least
+   *                 4096, or 0 for the store's default (512 MiB tables).
+   * @return 0 on success, errno on failure (EINVAL for a bad table_size).
+   */
+  public native int initWithTables(String fname, long size,
+                                   boolean force_destroy, long table_size);
 
   /**
    * Gracefully shutdown the Key Value provider.
