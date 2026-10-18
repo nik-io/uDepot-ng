@@ -772,6 +772,44 @@ TEST(FittedSegmentSize, TheTableFillsItsSegment) {
 // fitted size, which leave no tail for the device metadata at that size:
 // the search for a size that does must stay among fitted ones (it once
 // settled on a power of two of bytes, half of whose table went unused).
+// A segment whose tables would waste more than 1/8 of a huge-page
+// mapping maps them on 4 KiB pages, and open() says so, naming what that
+// costs: slower grows first. The bindings' (a 2 MiB table, 4 KiB grains)
+// is one; a 16 MiB table's segment keeps huge pages and says nothing.
+TEST_P(StoreIndexTest, OpenSaysWhenTablesMissHugePages) {
+    config_.grain_size = 4096;
+    auto open_log = [&](size_t table_bytes) {
+        const uint64_t seg =
+            udepot::fitted_segment_size(table_bytes, config_.grain_size);
+        config_.segment_size = seg;
+        config_.size = 32 * seg * config_.grain_size + 4096;
+        uDepot<PosixIO> store;
+        ::testing::internal::CaptureStderr();
+        const int rc = store.open(config());
+        std::string log = ::testing::internal::GetCapturedStderr();
+        EXPECT_EQ(rc, 0);
+        if (rc == 0) {
+            const auto& region =
+                store.directory().snapshot().tables[0]->region();
+            if (!udepot::TableRegion::wants_huge_pages(seg *
+                                                       config_.grain_size)) {
+                EXPECT_FALSE(region.huge());
+                EXPECT_EQ(region.map_bytes(), seg * config_.grain_size);
+            }
+            store.close();
+        }
+        std::filesystem::remove(path_);
+        return log;
+    };
+    const std::string small = open_log(size_t{2} << 20);
+    EXPECT_NE(small.find("index tables map on 4 KiB pages"), std::string::npos)
+        << small;
+    EXPECT_NE(small.find("directory grows to be slower"), std::string::npos)
+        << small;
+    const std::string large = open_log(size_t{16} << 20);
+    EXPECT_EQ(large.find("4 KiB pages"), std::string::npos) << large;
+}
+
 TEST_P(StoreIndexTest, TheDefaultSegmentsTableFillsIt) {
     std::vector<size_t> sizes = {256 * 1024 * 1024 + 4096};
     for (int k : {21, 22, 23})

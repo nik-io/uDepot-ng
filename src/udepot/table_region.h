@@ -20,15 +20,16 @@ namespace udepot {
 // from it.
 //
 // As uDepot (0e0b0a0, "map the full segment on huge pages"), the mapping
-// always spans the whole segment. It is on huge pages whenever the segment
-// is 2 MiB or more, rounded up to a 2 MiB multiple: the mapping is
-// anonymous, as uDepot's on its AIO and SPDK backends (the table is read
-// from its segment on restore and written back at close, never mapped
-// from the device), so it need not match the segment's size or where it
-// sits on the device. uDepot took huge pages only for a segment that is a
-// 2 MiB multiple, and every such segment's table filled half of it (see
-// fitted_segment_size). Falls back to 4 KiB pages, mapping the segment
-// exactly, when no huge page is available or the segment is smaller.
+// always spans the whole segment. It is on huge pages, rounded up to a
+// 2 MiB multiple, when wants_huge_pages(): the mapping is anonymous, as
+// uDepot's on its AIO and SPDK backends (the table is read from its
+// segment on restore and written back at close, never mapped from the
+// device), so it need not match the segment's size or where it sits on the
+// device. uDepot took huge pages only for a segment that is a 2 MiB
+// multiple, and every such segment's table filled half of it (see
+// fitted_segment_size). Otherwise, or when no huge page is available, 4 KiB
+// pages map the segment exactly; a grow then faults each new table in 4 KiB
+// at a time, and lookups miss the TLB more.
 class TableRegion {
 public:
     static constexpr size_t kMdBytes = 512;  // uDepot's dirmap_hdr/_ftr
@@ -43,6 +44,20 @@ public:
     TableRegion& operator=(TableRegion&& other) noexcept;
     TableRegion(const TableRegion&) = delete;
     TableRegion& operator=(const TableRegion&) = delete;
+
+    // Whether a segment of seg_bytes maps on huge pages: it is 2 MiB or
+    // more, and rounding it up to a 2 MiB multiple leaves at most
+    // 1/kMaxHugeWaste of the mapping unused. A fitted segment is a power of
+    // two plus a page or two, so its rounding wastes nearly 2 MiB: under
+    // 1/8 from a 16 MiB table up (the default's is 512 MiB), half of the
+    // bindings' 2 MiB one, which would take 4 MiB of huge pages each, from
+    // the pool SPDK's DMA buffers come from.
+    static constexpr size_t kMaxHugeWaste = 8;
+    static bool wants_huge_pages(size_t seg_bytes) noexcept;
+    // Bytes a huge-page mapping of seg_bytes takes: rounded up to 2 MiB.
+    static size_t huge_map_bytes(size_t seg_bytes) noexcept {
+        return (seg_bytes + kHugePage - 1) / kHugePage * kHugePage;
+    }
 
     // Map seg_bytes (rounded up to 2 MiB on huge pages) for a table using
     // the first net_bytes, backed by the segment starting at `grain`

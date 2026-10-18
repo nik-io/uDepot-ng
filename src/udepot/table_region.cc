@@ -23,6 +23,12 @@ TableRegion& TableRegion::operator=(TableRegion&& other) noexcept {
     return *this;
 }
 
+bool TableRegion::wants_huge_pages(size_t seg_bytes) noexcept {
+    if (seg_bytes < kHugePage) return false;
+    const size_t map_bytes = huge_map_bytes(seg_bytes);
+    return (map_bytes - seg_bytes) * kMaxHugeWaste <= map_bytes;
+}
+
 TableRegion TableRegion::map(size_t seg_bytes, size_t net_bytes,
                              uint64_t grain) {
     assert(net_bytes <= seg_bytes && net_bytes >= 2 * kMdBytes);
@@ -31,9 +37,8 @@ TableRegion TableRegion::map(size_t seg_bytes, size_t net_bytes,
     void* p = MAP_FAILED;
     size_t map_bytes = seg_bytes;
     bool huge = false;
-    if (seg_bytes >= kHugePage) {
-        const size_t huge_bytes = (seg_bytes + kHugePage - 1) / kHugePage *
-                                  kHugePage;
+    if (wants_huge_pages(seg_bytes)) {
+        const size_t huge_bytes = huge_map_bytes(seg_bytes);
         p = ::mmap(nullptr, huge_bytes, kProt, kFlags | MAP_HUGETLB, -1, 0);
         huge = p != MAP_FAILED;
         if (huge) map_bytes = huge_bytes;

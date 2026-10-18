@@ -1099,6 +1099,24 @@ int uDepot<IO>::open(const StoreConfig& config) {
         }
     }
 
+    // A segment too large for 4 KiB pages to be free, whose tables still
+    // map on them: say so, once per open, with what it costs.
+    if (const size_t seg_bytes = scm_->get_seg_size() * grain_size_;
+        seg_bytes >= TableRegion::kHugePage &&
+        !TableRegion::wants_huge_pages(seg_bytes)) {
+        const size_t map_bytes = TableRegion::huge_map_bytes(seg_bytes);
+        std::fprintf(
+            stderr,
+            "udepot: index tables map on 4 KiB pages, not 2 MiB huge pages: "
+            "a %zu KiB segment would leave %zu KiB of each %zu KiB huge-page "
+            "mapping unused (more than 1/%zu). Expect directory grows to be "
+            "slower: each new table is faulted in 4 KiB at a time, and the "
+            "copy into it misses the TLB more. Lookups take more TLB misses "
+            "too. A larger segment keeps huge pages.\n",
+            seg_bytes >> 10, (map_bytes - seg_bytes) >> 10, map_bytes >> 10,
+            TableRegion::kMaxHugeWaste);
+    }
+
     // Initialize our SalsaCtlr with 1 stream, 1 relocation stream.
     rc = salsa::SalsaCtlr::init(scm_, seg_md_grains_, 1, 1);
     if (rc != 0) {
