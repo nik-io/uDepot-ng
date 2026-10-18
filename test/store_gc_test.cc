@@ -750,16 +750,30 @@ TEST_F(StoreGcTest, TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk) {
     // so the chances come in windows, and about one run in thirty of the
     // workload above meets none. (It passed anyway while close() flushed
     // the index with GC still running, which gave GC more time.) Keep
-    // writing, other keys only, until GC has had one. Overwriting a small
-    // set (1000 records of ~3 KiB) keeps the live data well inside the
-    // store however long that takes: cycling through kKeys new keys, a late
-    // drop let them reach ~18 MiB on top of the ~13 MiB of "k" keys, past
-    // the ~25 MiB the store holds, and the put failed with -ENOSPC, rightly.
-    constexpr int kFillerKeys = 1000;
-    for (int i = 0; i < 200000 && drops.load() == 0; ++i)
-        ASSERT_EQ(store_.put("f" + std::to_string(i % kFillerKeys), val)
-                      .run_sync(),
-                  0);
+    // writing, other keys only, until GC has had one.
+    //
+    // The writes must keep GC relocating, and keep the live data bounded:
+    // each puts a new key and deletes the one kWindow puts back. Two
+    // fillers that did not:
+    //   - kKeys fresh keys cycled: a late drop let them reach ~18 MiB on
+    //     top of the ~13 MiB of "k" keys, past the ~25 MiB the store
+    //     holds, and a put failed, rightly, with -ENOSPC;
+    //   - 1000 keys overwritten: every segment ends up all garbage, and
+    //     salsa frees those without calling the relocation callback, so GC
+    //     never chose a victim again and no tombstone could go (no drop in
+    //     6 of 8 runs over 200000 puts).
+    // Here a segment always holds valid grains (the latest puts, and the
+    // deletes' tombstones), so freeing it means relocating it: every run
+    // measured had a drop within 12444 of the 200000.
+    constexpr int kWindow = 1000;
+    for (int i = 0; i < 200000 && drops.load() == 0; ++i) {
+        ASSERT_EQ(store_.put("f" + std::to_string(i), val).run_sync(), 0);
+        if (i >= kWindow) {
+            ASSERT_EQ(store_.del("f" + std::to_string(i - kWindow))
+                          .run_sync(),
+                      0);
+        }
+    }
     store_.close();
     uDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
 
