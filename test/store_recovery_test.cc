@@ -830,6 +830,39 @@ TEST_P(StoreIndexTest, OpenSaysWhenTablesMissHugePages) {
         << large;
 }
 
+// A device too small for the segment asked for, or the default, makes it
+// smaller, and every table with it; open() says so, naming both. A device
+// with room for it says nothing.
+TEST_P(StoreIndexTest, OpenSaysWhenTheDeviceShrinksTheSegment) {
+    config_.grain_size = 4096;
+    auto open_log = [&](uint64_t segment_size, size_t device) {
+        config_.segment_size = segment_size;
+        config_.size = device;
+        uDepot<PosixIO> store;
+        ::testing::internal::CaptureStderr();
+        const int rc = store.open(config());
+        std::string log = ::testing::internal::GetCapturedStderr();
+        EXPECT_EQ(rc, 0);
+        if (rc == 0) {
+            EXPECT_EQ(store.put("k", "v").run_sync(), 0);
+            store.close();
+        }
+        std::filesystem::remove(path_);
+        return log;
+    };
+    const uint64_t seg =
+        udepot::fitted_segment_size(size_t{2} << 20, config_.grain_size);
+    const std::string small = open_log(seg, 4 << 20);
+    EXPECT_NE(small.find("too small for the requested segments of 2056 KiB"),
+              std::string::npos) << small;
+    const std::string fits =
+        open_log(seg, 32 * seg * config_.grain_size + 4096);
+    EXPECT_EQ(fits.find("too small"), std::string::npos) << fits;
+    const std::string dflt = open_log(0, 4 << 20);
+    EXPECT_NE(dflt.find("too small for the default segments"),
+              std::string::npos) << dflt;
+}
+
 // No silent fallback: a table that wants huge pages and cannot have them
 // (none free) maps on 4 KiB pages, and the open says so, once, whether it
 // creates the table or restores it; the next open says it again. With

@@ -1051,6 +1051,10 @@ int uDepot<IO>::open(const StoreConfig& config) {
     // own segment size (a restored store keeps the one it was made with).
     // Fitted sizes are whole pages already.
     if (!restored) segment_size = sanitize(segment_size);
+    // What was asked for (or the default), to say so if the device makes
+    // it smaller.
+    const uint64_t wanted_segment = segment_size;
+    const bool wanted_default = fitted_table != 0;
 
     // Halving retry loop (matches uDepot): if the segment size is too
     // large for the device, halve and try again.
@@ -1133,6 +1137,38 @@ int uDepot<IO>::open(const StoreConfig& config) {
             io_.close();
             return -EINVAL;
         }
+    }
+
+    // A device too small for the segment asked for (or the default) made it
+    // smaller, as uDepot does, and with it every index table: say so. A
+    // segment the caller set is halved as a size, not refitted as the
+    // default is, so its table may fill only part of it.
+    if (!restored && segment_size != wanted_segment) {
+        auto table_bytes = [&](uint64_t seg) -> uint64_t {
+            const uint32_t bits = HashTable::index_bits_for(
+                static_cast<size_t>(seg - seg_md_grains_) * grain_size_);
+            return bits == 0 ? 0 : uint64_t{8} << bits;
+        };
+        const uint64_t got_table = table_bytes(segment_size);
+        const uint64_t net_bytes =
+            (segment_size - seg_md_grains_) * uint64_t{grain_size_};
+        std::fprintf(
+            stderr,
+            "udepot: a %llu KiB device is too small for %s segments of "
+            "%llu KiB (index tables of %llu KiB); using segments of %llu KiB, "
+            "whose tables hold %llu KiB (%llu%% of the segment). Smaller "
+            "tables fill sooner, so the directory grows sooner and more "
+            "often. Give the store a larger device, or ask for smaller "
+            "tables (StoreConfig::segment_size, fitted_segment_size; the "
+            "Python and JNI bindings' table size).\n",
+            static_cast<unsigned long long>(dev_size >> 10),
+            wanted_default ? "the default" : "the requested",
+            static_cast<unsigned long long>(wanted_segment * grain_size_ >> 10),
+            static_cast<unsigned long long>(table_bytes(wanted_segment) >> 10),
+            static_cast<unsigned long long>(segment_size * grain_size_ >> 10),
+            static_cast<unsigned long long>(got_table >> 10),
+            static_cast<unsigned long long>(
+                net_bytes == 0 ? 0 : got_table * 100 / net_bytes));
     }
 
     // A segment too large for 4 KiB pages to be free, whose tables still

@@ -148,6 +148,16 @@ class TestTableSize:
         err = capfd.readouterr().err
         assert "index tables map on 4 KiB pages" in err
         assert "directory grows to be slower" in err
+        assert "too small" not in err  # the device has room for them
+
+    def test_a_device_too_small_for_the_tables_says_so(self, tmp_path, capfd):
+        # 4 MiB holds too few 2 MiB-table segments: the store makes them
+        # smaller, and with them the tables, and says so.
+        kv = self._open(tmp_path)
+        assert kv.put(_key("k"), _val("v"))
+        kv._cleanup()
+        err = capfd.readouterr().err
+        assert "too small for the requested segments" in err
 
     @pytest.mark.parametrize("table_size", [4096, 1024 * 1024, 0])
     def test_configured_table_size_round_trips(self, tmp_path, table_size):

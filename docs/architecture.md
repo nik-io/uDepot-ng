@@ -683,7 +683,11 @@ persistent source of truth is the log"*.
   (`table_size`, `initWithTables`, YCSB's `udepot.table-size`; a power of
   two of at least 4 KiB, or 0 for the store's default,
   `segment_size_for_table`); they default to 2 MiB tables (2^18 buckets),
-  small, for tests, which map on 4 KiB pages, and the store says so.
+  small, for tests, which map on 4 KiB pages, and the store says so. A
+  device too small for the segment asked for (or the default) makes it
+  smaller, as uDepot does, and `open()` says so too, with both sizes and
+  how much of the smaller segment its table fills: a caller's size is
+  reduced as a size, not refitted as the default is.
 - **Memory** (`TableRegion`). An anonymous mapping of the whole segment,
   uDepot's mapping on its AIO and SPDK backends: read from the segment on
   restore, written back at close. As uDepot's fix for the shutdown overrun
