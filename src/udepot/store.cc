@@ -1838,9 +1838,10 @@ CoroTask<int> uDepot<IO>::put(std::span<const uint8_t> key,
     int rc = check_sizes(key.size(), val.size());
     if (rc == 0) {
         rec = alloc_put_buffer(key.size(), val.size());
-        if (rec.valid())
+        if (rec.valid()) {
             std::memcpy(rec.value().data(), val.data(), val.size());
-        else
+            ++tl_value_copies_;
+        } else
             rc = -ENOMEM;
     }
     return put_record(key, nullptr, std::move(rec), rc, mode, if_version);
@@ -2069,6 +2070,7 @@ CoroTask<int> uDepot<IO>::get_record(std::span<const uint8_t> key,
             size_t to_copy = std::min(val_buf_size,
                                       static_cast<size_t>(hdr.val_size));
             std::memcpy(val_out, p + sizeof(hdr) + hdr.key_size, to_copy);
+            ++tl_value_copies_;
         }
 
         co_return 0;

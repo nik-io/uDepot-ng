@@ -161,10 +161,12 @@ struct UringSubmitAwaitable {
 UringIO::~UringIO() { close(); }
 
 int UringIO::open(const char* path, size_t size) {
-    fd_ = ::open(path, O_RDWR | O_CREAT | O_DIRECT | O_NOATIME, 0666);
-    if (fd_ < 0 && (errno == EINVAL || errno == ENOTSUP))
-        fd_ = ::open(path, O_RDWR | O_CREAT, 0666);
-    if (fd_ < 0) return -errno;
+    fd_ = open_direct(path, &direct_);
+    if (fd_ < 0) {
+        const int err = fd_;
+        fd_ = -1;
+        return err;
+    }
 
     struct stat st;
     if (::fstat(fd_, &st) < 0) {

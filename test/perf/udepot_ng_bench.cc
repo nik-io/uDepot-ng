@@ -364,13 +364,18 @@ static int run_compare(uDepot<IO>& store, const BenchConfig& cfg) {
         std::vector<double> copy, zc, ratio;
     };
     // The get phase reads back the put phase's keys in the same order.
+    // Values copied between the caller's memory and uDepot's record
+    // buffers, per mode: zero copy must make none (exact, unlike timing).
+    uint64_t copies[2] = {0, 0};  // [copy, zero copy]
     auto phase = [&](auto run_batch, Phase* ph) {
         uint64_t next = 0;
         for (int r = 0; r < cfg.compare_rounds; ++r) {
             double mops[2] = {0, 0};  // [copy, zero copy]
             for (int m = 0; m < 2; ++m) {
                 const bool zero = (m == 0) == (r % 2 == 1);  // alternate
+                const uint64_t copies0 = uDepot<IO>::thread_value_copies();
                 const double secs = run_batch(next, zero);
+                copies[zero] += uDepot<IO>::thread_value_copies() - copies0;
                 if (secs < 0) return false;
                 next += batch;
                 mops[zero] = batch / (secs * 1e6);
@@ -387,6 +392,12 @@ static int run_compare(uDepot<IO>& store, const BenchConfig& cfg) {
         printf("CMP %s copy=%lf zero_copy=%lf delta=%+.2lf\n", name,
                median(ph->copy), median(ph->zc),
                (median(ph->ratio) - 1) * 100);
+    printf("COPIES copy=%lu zero_copy=%lu\n",
+           static_cast<unsigned long>(copies[0]),
+           static_cast<unsigned long>(copies[1]));
+    // Whether the device is open O_DIRECT, for the backends that open it so.
+    if constexpr (requires { store.io().direct(); })
+        printf("DIRECT %d\n", store.io().direct() ? 1 : 0);
 #ifdef UDEPOT_BUILD_SPDK
     if constexpr (std::is_same_v<IO, udepot::SpdkIO>)
         printf("BOUNCED %lu\n", static_cast<unsigned long>(

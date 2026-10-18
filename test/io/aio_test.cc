@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -218,4 +219,49 @@ TEST_F(AioIOTest, CloseCompletesInFlightIo) {
     if (stranded == 0) {
         for (auto& t : tasks) EXPECT_EQ(t.run_sync(), ssize_t{kBlock});
     }
+}
+
+// As uDepot, the store is opened O_DIRECT, so the device transfers straight
+// to and from the caller's buffers. On a filesystem that takes it (CI's
+// /tmp is ext4, and the workflow checks it does) the backend must have it,
+// not quietly fall back to buffered I/O.
+TEST_F(AioIOTest, OpensODirectWhereTheFilesystemTakesIt) {
+    const std::string probe = path_.string() + ".probe";
+    const int fd = ::open(probe.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0666);
+    const bool takes_it = fd >= 0;
+    if (fd >= 0) ::close(fd);
+    std::filesystem::remove(probe);
+
+    AioIO io;
+    ASSERT_EQ(io.open(path_.c_str(), 4096), 0);
+    EXPECT_EQ(io.direct(), takes_it);
+    EXPECT_EQ(::fcntl(io.fd_for_test(), F_GETFL) & O_DIRECT,
+              takes_it ? O_DIRECT : 0);
+    io.close();
+}
+
+// A filesystem that refuses O_DIRECT (injected) gets buffered I/O, which
+// copies every value through the page cache, and the open says so.
+TEST_F(AioIOTest, RefusedODirectFallsBackAndSaysSo) {
+    udepot::refuse_direct_test = true;
+    struct Reset {
+        ~Reset() { udepot::refuse_direct_test = false; }
+    } reset;
+    AioIO io;
+    ::testing::internal::CaptureStderr();
+    const int rc = io.open(path_.c_str(), 4096);
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    ASSERT_EQ(rc, 0);
+    EXPECT_FALSE(io.direct());
+    EXPECT_EQ(::fcntl(io.fd_for_test(), F_GETFL) & O_DIRECT, 0);
+    EXPECT_NE(log.find("does not take O_DIRECT"), std::string::npos) << log;
+    EXPECT_NE(log.find("no zero copy"), std::string::npos) << log;
+
+    auto buf = io.alloc_buffer(4096);
+    std::memset(buf.data, 0x5a, 4096);
+    ASSERT_EQ(io.pwrite(buf.data, 4096, 0).run_sync(), ssize_t{4096});
+    std::memset(buf.data, 0, 4096);
+    ASSERT_EQ(io.pread(buf.data, 4096, 0).run_sync(), ssize_t{4096});
+    EXPECT_EQ(static_cast<uint8_t*>(buf.data)[4095], 0x5a);
+    io.close();
 }

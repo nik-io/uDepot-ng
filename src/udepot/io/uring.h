@@ -71,6 +71,10 @@ public:
     }
 
     size_t get_size() const noexcept { return size_; }
+    // Whether the file is open O_DIRECT (see open_direct): a filesystem
+    // that refuses it gets buffered I/O, and no zero copy.
+    bool direct() const noexcept { return direct_; }
+    int fd_for_test() const noexcept { return fd_; }
     IoBuffer alloc_buffer(size_t size);
 
     // Test seam, never set in production: called before each
@@ -91,6 +95,7 @@ private:
 
     int fd_ = -1;
     size_t size_ = 0;
+    bool direct_ = false;
     unsigned queue_depth_ = kDefaultQueueDepth;
     bool poll_yields_set_ = false;
 

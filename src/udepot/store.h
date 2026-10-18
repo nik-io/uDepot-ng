@@ -287,6 +287,13 @@ public:
         return exists(as_bytes(key), val_size_out);
     }
 
+    // How many values the calling thread's operations copied between the
+    // caller's memory and uDepot's record buffers: one per copying put or
+    // get, none for a zero-copy one (PutBuffer, GetBuffer). Per thread, so
+    // counting adds no shared write; an operation's copy is counted on the
+    // thread that runs that part of it.
+    static uint64_t thread_value_copies() noexcept { return tl_value_copies_; }
+
     uint64_t hash_key(std::span<const uint8_t> key) const {
         return CityHash64(reinterpret_cast<const char*>(key.data()),
                           key.size());
@@ -372,6 +379,7 @@ private:
     Rcu rcu_;
     IO io_;
     Directory* directory_ = nullptr;
+    inline static thread_local uint64_t tl_value_copies_ = 0;
     bool index_restored_ = false;
     // Whether this open has reported a table that wanted huge pages and
     // could not have them (report_huge_fallback).

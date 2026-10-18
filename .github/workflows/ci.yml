@@ -55,6 +55,17 @@ jobs:
       - name: Every test is built
         run: scripts/ci-check-tests-built.sh build pyudepot_test jni_test
 
+      # The AIO and io_uring tests make their stores in /tmp and open them
+      # O_DIRECT, as uDepot does. A /tmp that refused it would run them all
+      # on buffered I/O (the backends fall back, and say so), so it must
+      # take it; OpensODirectWhereTheFilesystemTakesIt then checks the
+      # backends did.
+      - name: The tests' /tmp takes O_DIRECT
+        run: |
+          findmnt -T /tmp
+          dd if=/dev/zero of=/tmp/udepot-odirect-probe bs=4096 count=1 oflag=direct
+          rm -f /tmp/udepot-odirect-probe
+
       - name: Unit tests
         run: ctest --test-dir build -j"$(nproc)" --output-on-failure
 
@@ -104,6 +115,17 @@ jobs:
 
       - name: Every test is built
         run: scripts/ci-check-tests-built.sh build
+
+      # The AIO and io_uring tests make their stores in /tmp and open them
+      # O_DIRECT, as uDepot does. A /tmp that refused it would run them all
+      # on buffered I/O (the backends fall back, and say so), so it must
+      # take it; OpensODirectWhereTheFilesystemTakesIt then checks the
+      # backends did.
+      - name: The tests' /tmp takes O_DIRECT
+        run: |
+          findmnt -T /tmp
+          dd if=/dev/zero of=/tmp/udepot-odirect-probe bs=4096 count=1 oflag=direct
+          rm -f /tmp/udepot-odirect-probe
 
       # Any report fails the test that produced it.
       - name: Unit tests
@@ -240,3 +262,17 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: scripts/perf-zerocopy.sh uring build
+      # O_DIRECT on a real device: the runner's disk (ext4), not tmpfs,
+      # which takes O_DIRECT with no device behind it. There the I/O is
+      # device-bound, and zero copy's timing deltas flip sign run to run, so
+      # timing is reported, not gated; what fails the step is exact: O_DIRECT
+      # in effect, and no value copied by a zero-copy put or get. The store
+      # file is preallocated, as a device would be.
+      - name: Zero-copy over O_DIRECT on disk (aio)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: ZC_DIR="$RUNNER_TEMP" scripts/perf-zerocopy.sh aio build 200 3
+      - name: Zero-copy over O_DIRECT on disk (io_uring)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: ZC_DIR="$RUNNER_TEMP" scripts/perf-zerocopy.sh uring build 200 3

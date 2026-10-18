@@ -310,3 +310,35 @@ TEST(AioContext, NoContextFailsTheIoInsteadOfSpinning) {
     again.close();
     std::filesystem::remove(path);
 }
+
+// Zero copy is counted, not only timed: a copying put or get copies its
+// value between the caller's memory and uDepot's record buffer once, a
+// zero-copy one (PutBuffer, GetBuffer) never. The zero-copy gate checks
+// the same count over O_DIRECT (scripts/perf-zerocopy.sh).
+TEST_F(AioStoreTest, ValueCopiesAreCountedPerThread) {
+    const std::string v(4000, 'v');
+    auto copies = [] { return uDepot<AioIO>::thread_value_copies(); };
+    uint64_t c = copies();
+    ASSERT_EQ(store_.put("copy", v).run_sync(), 0);
+    EXPECT_EQ(copies() - c, 1u);
+
+    c = copies();
+    std::vector<uint8_t> out(v.size());
+    size_t n = 0;
+    ASSERT_EQ(store_.get("copy", out.data(), out.size(), &n).run_sync(), 0);
+    EXPECT_EQ(copies() - c, 1u);
+
+    const std::string key = "zero";
+    auto pb = store_.alloc_put_buffer(key.size(), v.size());
+    ASSERT_TRUE(pb.valid());
+    std::memcpy(pb.value().data(), v.data(), v.size());
+    auto gb = store_.alloc_get_buffer(key.size(), v.size());
+    ASSERT_TRUE(gb.valid());
+    c = copies();
+    ASSERT_EQ(store_.put(uDepot<AioIO>::as_bytes(key), pb).run_sync(), 0);
+    ASSERT_EQ(store_.get(uDepot<AioIO>::as_bytes(key), &gb).run_sync(), 0);
+    EXPECT_EQ(copies() - c, 0u);
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(gb.value().data()),
+                               gb.value().size()),
+              v);
+}

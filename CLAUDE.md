@@ -163,8 +163,15 @@ ctest --test-dir build
   SPDK is built with `--target-arch=x86-64-v2` and its tree cached per
   submodule revision.
 - **zero-copy perf invariant**, below: one check for AIO and io_uring,
-  and **zero-copy perf invariant (SPDK)**, a second entry of the
+  on `/dev/shm` and, over O_DIRECT, on the runner's disk; and
+  **zero-copy perf invariant (SPDK)**, a second entry of the
   SPDK job (`spdk-nvmef-test.sh build perf`) on a Release build.
+- **O_DIRECT.** Every AIO and io_uring test makes its store in `/tmp` and
+  opens it O_DIRECT, as uDepot does; the unit-test jobs first check that
+  `/tmp` takes O_DIRECT (ext4 on the runners), and
+  `OpensODirectWhereTheFilesystemTakesIt` that the backends got it. A
+  filesystem that refuses it gets buffered I/O, never silently: the open
+  says so (`open_direct`).
 
 ### Zero-copy perf invariant
 
@@ -212,6 +219,17 @@ to ~1.7x between processes, and that read as AIO's zero-copy GET 13.7%
 slower in CI, and on SPDK as anything from 37% slower to 52% faster, on
 code where every paired comparison has zero copy ahead. Never set
 throughputs from different runs against each other.
+
+**O_DIRECT on a real device.** tmpfs takes O_DIRECT with no device behind
+it: a toy case. So CI also runs the check on the runner's disk
+(`ZC_DIR=$RUNNER_TEMP`, ext4), store file preallocated as a device would be,
+for AIO and io_uring. There the I/O is device-bound and zero copy's timing
+deltas flip sign run to run (ext4 here: PUT -16% to +12% sparse, a GET at
+-4% preallocated), so timing is reported, not gated. What is gated, there
+and on `/dev/shm` alike, is exact: the backend opened the store O_DIRECT,
+and the zero-copy batches copied no value between the caller's memory and
+uDepot's record buffers (`uDepot::thread_value_copies()`; the copying ones
+copy every value). A zero-copy put made to count a copy fails it.
 
 **SPDK** is gated the same way, as its own CI check, "zero-copy perf
 invariant (SPDK)": `scripts/spdk-nvmef-test.sh <build> perf` starts the

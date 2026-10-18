@@ -169,12 +169,12 @@ struct AioSubmitAwaitable {
 AioIO::~AioIO() { close(); }
 
 int AioIO::open(const char* path, size_t size) {
-    // Match uDepot: O_DIRECT | O_NOATIME.  Fall back to buffered I/O if the
-    // filesystem does not support O_DIRECT (e.g. tmpfs in tests).
-    fd_ = ::open(path, O_RDWR | O_CREAT | O_DIRECT | O_NOATIME, 0666);
-    if (fd_ < 0 && (errno == EINVAL || errno == ENOTSUP))
-        fd_ = ::open(path, O_RDWR | O_CREAT, 0666);
-    if (fd_ < 0) return -errno;
+    fd_ = open_direct(path, &direct_);
+    if (fd_ < 0) {
+        const int err = fd_;
+        fd_ = -1;
+        return err;
+    }
 
     struct stat st;
     if (::fstat(fd_, &st) < 0) {
