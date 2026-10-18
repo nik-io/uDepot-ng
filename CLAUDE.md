@@ -56,7 +56,10 @@
     there at close and restored from it on a clean start, with the log scan
     only after a crash; the directory grows
     by freeze-and-copy, not the paper's incremental resize (tried in PR #8,
-    dropped: see `docs/udepot-paper.md`, §4.3); PUT writes before it checks, and
+    dropped: see `docs/udepot-paper.md`, §4.3); an entry's tag is the 8 hash
+    bits above its bucket's, as uDepot's `hash_to_keytag_` (the top 8 bits
+    until PR #9; persisted indexes carry a format number, and an older one is
+    rebuilt from the log); PUT writes before it checks, and
     Memcache paths may carry weaker durability than the store.
 
 ## Project Overview

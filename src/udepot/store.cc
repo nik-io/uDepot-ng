@@ -438,6 +438,11 @@ uint64_t fitted_segment_size(uint64_t table_bytes, uint32_t grain_size) {
 namespace {
 
 constexpr size_t kIndexMdBytes = TableRegion::kMdBytes;
+// How a persisted table's entries are to be read. 1: each entry's tag is
+// the 8 hash bits above its bucket's, as uDepot's. An index of any other
+// format (0: the top 8 bits, before PR #9) is not restored; the log scan
+// rebuilds it.
+constexpr uint32_t kIndexFormat = 1;
 constexpr size_t kIndexIoChunk = size_t{4} << 20;
 
 // uDepot's dirmap_hdr fields first; the rest are uDepot-ng's, checked
@@ -448,7 +453,7 @@ struct __attribute__((packed)) IndexHdr {
     uint32_t csum;
     uint64_t ts;
     uint32_t index_bits;
-    uint32_t reserved;
+    uint32_t format;   // kIndexFormat
     uint64_t slot_nr;  // slots in the table
 };
 
@@ -462,7 +467,7 @@ struct __attribute__((packed)) IndexFtr {
     uint64_t used_bytes_kv;
     uint64_t tot_bytes_kv;
     uint32_t index_bits;
-    uint32_t reserved;
+    uint32_t format;
     uint64_t slot_nr;
 };
 
@@ -472,7 +477,8 @@ static_assert(sizeof(IndexFtr) <= kIndexMdBytes);
 template <typename T>
 bool same_identity(const IndexHdr& h, const T& f) {
     return h.dir_size == f.dir_size && h.idx == f.idx && h.ts == f.ts &&
-           h.index_bits == f.index_bits && h.slot_nr == f.slot_nr;
+           h.index_bits == f.index_bits && h.format == f.format &&
+           h.slot_nr == f.slot_nr;
 }
 
 }  // namespace
@@ -637,6 +643,9 @@ int uDepot<IO>::flush_index() {
 
     // Header and slots, as uDepot's shutdown() writes each table back; the
     // footer stays clear.
+    uint32_t format = kIndexFormat;
+    if (auto hook = index_format_test_hook.load(std::memory_order_relaxed))
+        format = hook(format);
     for (uint32_t idx = 0; idx < snap.size(); ++idx) {
         const HashTable& table = *snap.tables[idx];
         const TableRegion& r = table.region();
@@ -645,6 +654,7 @@ int uDepot<IO>::flush_index() {
         hdr.idx = static_cast<uint16_t>(idx);
         hdr.ts = ts;
         hdr.index_bits = table.index_bits();
+        hdr.format = format;
         hdr.slot_nr = table.total_slots();
         hdr.csum = index_md_csum(hdr);
         std::memset(r.base(), 0, kIndexMdBytes);
@@ -667,6 +677,7 @@ int uDepot<IO>::flush_index() {
         ftr.idx = static_cast<uint16_t>(idx);
         ftr.ts = ts;
         ftr.index_bits = table.index_bits();
+        ftr.format = format;
         ftr.slot_nr = table.total_slots();
         ftr.csum = index_md_csum(ftr);
         uint8_t* f = r.base() + r.footer_offset();
@@ -788,7 +799,8 @@ int uDepot<IO>::restore_index(bool* restored) {
         for (const Found* f : set) {
             const IndexHdr& h = f->hdr;
             if (h.dir_size != dir_size || h.idx >= dir_size ||
-                h.index_bits != index_bits || h.slot_nr != total_slots ||
+                h.index_bits != index_bits || h.format != kIndexFormat ||
+                h.slot_nr != total_slots ||
                 seen[h.idx]) {
                 ok = false;
                 break;

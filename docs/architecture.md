@@ -153,8 +153,18 @@ replaces an entry (live or deleted) that is older in recovery order — segment
 timestamp, then grain — otherwise it is rewritten, so recovery always
 reproduces the order writes were acknowledged in.
 
+**Tag.** As in uDepot (`uDepotMap::hash_to_keytag_`), an entry's 8-bit tag
+is the 8 hash bits just above its bucket's, so the bucket and the tag
+together are the hash's low `index_bits + 8` bits: the paper's key
+fingerprint. Until PR #9 the tag was the hash's top 8 bits, statistically
+no different, but not uDepot's layout. A persisted table records its format
+in the index header and footer (`format`, 1 for uDepot's tag); an index of
+any other format is not restored, and the log scan rebuilds it.
+
 **Directory.** As in uDepot's `hash_to_map`, a key's table is chosen by the
-top bits of its tag and its bucket by the low bits of its hash. `grow()`
+top bits of its tag and its bucket by the low bits of its hash. (The paper
+says the tag's LSBs index the directory; uDepot's code, `hash_to_dir_idx_`,
+takes its MSBs, and uDepot-ng follows the code.) `grow()`
 doubles the number of tables. Legacy excluded every operation for the grow
 (`rwpflock.write_enter()` + `write_wait_readers()`); uDepot-ng keeps that for
 writers only, using RCU:

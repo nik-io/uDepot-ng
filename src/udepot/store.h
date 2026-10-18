@@ -309,6 +309,13 @@ public:
     using FooterHook = bool (*)();
     inline static std::atomic<FooterHook> index_footer_test_hook{nullptr};
 
+    // Test seam, never set in production: close() writes the format it
+    // returns, given the current one, into each index header and footer,
+    // as an older release would have written its own.
+    using IndexFormatHook = uint32_t (*)(uint32_t format);
+    inline static std::atomic<IndexFormatHook> index_format_test_hook{
+        nullptr};
+
     // Test seam, never set in production: called before allocating an
     // index segment for a new table; returning -errno fails the allocation
     // with it, as on a device with no segment to give (-ENOSPC) or none

@@ -367,11 +367,12 @@ TEST_F(StoreGcTest, RecoveryDoesNotDuplicateKeysSharingATag) {
     ASSERT_EQ(store_.open(config_), 0);
 
     // Two keys with the same tag and bucket.
-    const uint64_t bucket_mask =
-        (uint64_t{1} << store_.directory().snapshot().tables[0]->index_bits()) - 1;
+    // The bucket and the 8 bits above it: uDepot's key fingerprint.
+    const uint64_t fp_mask =
+        (uint64_t{1}
+         << (store_.directory().snapshot().tables[0]->index_bits() + 8)) - 1;
     auto tag_bucket = [&](const std::string& k) {
-        uint64_t h = store_.hash_key(uDepot<PosixIO>::as_bytes(k));
-        return (h >> 56) << 40 | (h & bucket_mask);
+        return store_.hash_key(uDepot<PosixIO>::as_bytes(k)) & fp_mask;
     };
     std::map<uint64_t, std::string> seen;
     std::string a, b;

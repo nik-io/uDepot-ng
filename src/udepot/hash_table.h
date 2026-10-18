@@ -154,6 +154,9 @@ private:
     uint64_t hash_to_bucket(uint64_t hash) const noexcept {
         return hash & bucket_mask_;
     }
+    uint8_t tag_of(uint64_t hash) const noexcept {
+        return hash_to_tag(hash, index_bits_);
+    }
 
     // First free slot in the search window of `bucket`, or total_slots().
     uint64_t find_free_slot(uint64_t bucket) const noexcept;

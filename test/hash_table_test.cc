@@ -22,7 +22,7 @@ using udepot::test::make_table;
 // Construct a hash value that maps to a specific bucket and tag.
 static uint64_t make_hash(uint64_t bucket, uint8_t tag, uint32_t index_bits) {
     uint64_t mask = (1ULL << index_bits) - 1;
-    return (static_cast<uint64_t>(tag) << 56) | (bucket & mask);
+    return (static_cast<uint64_t>(tag) << index_bits) | (bucket & mask);
 }
 
 TEST(HashEntry, PackUnpack) {
@@ -50,6 +50,24 @@ TEST(HashEntry, DeletedEntryIsNeverEmpty) {
     EXPECT_FALSE(e.empty());
     EXPECT_TRUE(e.deleted());
     EXPECT_FALSE(HashEntry::make(0, 0, 1, 0).deleted());
+}
+
+// As uDepot's hash_to_keytag_: the tag is the 8 hash bits just above the
+// bucket's, so a key is matched on the hash's low index_bits + 8 bits (its
+// fingerprint) and the bits above them play no part.
+TEST(HashTable, TagIsTheEightBitsAboveTheBucket) {
+    constexpr uint32_t kBits = 10;
+    auto table = make_table(kBits);
+    const uint64_t hash = make_hash(42, 0xAB, kBits) | (0xFULL << 60);
+    ASSERT_EQ(table->insert(hash, 1, 7), 0);
+    HashEntry e = table->lookup(hash);
+    ASSERT_FALSE(e.empty());
+    EXPECT_EQ(e.key_tag(), 0xAB);
+    EXPECT_EQ(e.bucket_offset(), 0u);
+    // Above the fingerprint: the same key as far as the table can tell.
+    EXPECT_EQ(table->lookup(make_hash(42, 0xAB, kBits)).pba(), 7u);
+    // The tag's lowest bit, just above the bucket's: a different key.
+    EXPECT_TRUE(table->lookup(make_hash(42, 0xAA, kBits)).empty());
 }
 
 TEST(HashEntry, AtomicLoadStore) {

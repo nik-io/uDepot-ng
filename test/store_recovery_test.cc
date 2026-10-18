@@ -44,6 +44,7 @@ protected:
 
     void TearDown() override {
         uDepot<PosixIO>::index_footer_test_hook = nullptr;
+        uDepot<PosixIO>::index_format_test_hook = nullptr;
         uDepot<PosixIO>::index_segment_test_hook = nullptr;
         uDepot<PosixIO>::internal_io_test_hook = nullptr;
         uDepot<PosixIO>::gc_tombstone_drop_test_hook = nullptr;
@@ -605,6 +606,40 @@ TEST_P(StoreIndexTest, IncompleteIndexFallsBackToTheLog) {
     // Only the log holds the rejected record: seeing it proves the log
     // was scanned rather than the half-written index restored.
     EXPECT_EQ(get_value(store, make_key(0)), "rejected");
+    store.close();
+}
+
+// An index persisted in another format is not restored: before PR #9 a
+// tag was the hash's top 8 bits, and read as uDepot's (the 8 above the
+// bucket) such an index would miss keys it holds. The log scan rebuilds
+// it, and the next close writes the current format.
+TEST_P(StoreIndexTest, AnIndexOfAnotherFormatIsRebuiltFromTheLog) {
+    config_.size = 16 * 1024 * 1024 + 4096;
+    config_.segment_size = 16;  // 8 KiB: tables of 512 buckets
+    uDepot<PosixIO>::index_format_test_hook = [](uint32_t) {
+        return uint32_t{0};
+    };
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(config()), 0);
+        for (int i = 0; i < 1000; ++i)
+            ASSERT_EQ(store.put(make_key(i), make_val(i)).run_sync(), 0);
+        store.close();
+    }
+    uDepot<PosixIO>::index_format_test_hook = nullptr;
+    {
+        uDepot<PosixIO> store;
+        ASSERT_EQ(store.open(reopen_config()), 0);
+        EXPECT_FALSE(store.index_restored());
+        for (int i = 0; i < 1000; ++i)
+            ASSERT_EQ(get_value(store, make_key(i)), make_val(i)) << make_key(i);
+        store.close();
+    }
+    uDepot<PosixIO> store;
+    ASSERT_EQ(store.open(reopen_config()), 0);
+    EXPECT_TRUE(store.index_restored());
+    for (int i = 0; i < 1000; ++i)
+        ASSERT_EQ(get_value(store, make_key(i)), make_val(i)) << make_key(i);
     store.close();
 }
 
