@@ -698,9 +698,12 @@ persistent source of truth is the log"*.
   when no huge page is free. The main cost is in grows: a grow faults each
   new table in 4 KiB at a time (512 times the faults), and the puts
   waiting on a full table wait for the whole grow; the copy and lookups
-  also miss the TLB more, a second-order cost. `open()` prints a message
-  saying so whenever a segment of 2 MiB or more maps on 4 KiB pages by
-  this rule. As uDepot's `KV_conf::sanitize_segment_size`, a store's
+  also miss the TLB more, a second-order cost. Neither fallback is silent:
+  `open()` prints a message whenever a segment of 2 MiB or more maps on
+  4 KiB pages by this rule, and the store prints one, once per open, the
+  first time a table that wants huge pages cannot have them (at open, or at
+  the grow that finds none free), with the mmap error and how many huge
+  pages a table takes. As uDepot's `KV_conf::sanitize_segment_size`, a store's
   segment size is whole pages. Verified: with huge pages reserved, a
   fitted 16 MiB + 8 KiB segment's table maps on huge pages as 18 MiB
   (`TableRegion.HugePagesRoundedUpTo2MiB`), and the store suites pass.

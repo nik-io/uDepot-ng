@@ -52,7 +52,8 @@
     segment and its halvings are fitted to a power-of-two table,
     `fitted_segment_size`, and a table maps on huge pages rounded up to
     2 MiB when that leaves at most 1/8 of the mapping unused, else on 4 KiB
-    pages with a message at open, since grows are slower then: agreed in
+    pages, never silently: a message at open, or when no huge page is free,
+    since grows are slower then: agreed in
     PR #9, diverging from uDepot, whose power-of-two segments left every
     table half full), is written back
     there at close and restored from it on a clean start, with the log scan

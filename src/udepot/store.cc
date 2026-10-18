@@ -566,9 +566,32 @@ int uDepot<IO>::new_index_table(std::unique_ptr<HashTable>* table) {
         index_ctlr_->release_grains(grain, net_grains);
     }
     if (!region.valid()) return -ENOMEM;
+    report_huge_fallback(region);
     *table = std::make_unique<HashTable>(std::move(region));
     (*table)->clear();
     return 0;
+}
+
+// No silent fallback: a table that wants huge pages and gets 4 KiB ones
+// says so, the first time in an open (at open, for the first table, or at
+// the grow that runs out of huge pages), with what it costs.
+template <typename IO>
+void uDepot<IO>::report_huge_fallback(const TableRegion& region) {
+    if (region.huge_error() == 0 ||
+        huge_fallback_reported_.exchange(true, std::memory_order_relaxed))
+        return;
+    const size_t seg_bytes = static_cast<size_t>(scm_->get_seg_size()) *
+                             grain_size_;
+    std::fprintf(
+        stderr,
+        "udepot: no 2 MiB huge pages for an index table (mmap MAP_HUGETLB: "
+        "%s); it maps on 4 KiB pages, and so will others while none are "
+        "free. Expect directory grows to be slower: each new table is "
+        "faulted in 4 KiB at a time, and the copy into it misses the TLB "
+        "more. Lookups take more TLB misses too. Each table of this store "
+        "takes %zu huge pages (vm.nr_hugepages).\n",
+        std::strerror(region.huge_error()),
+        TableRegion::huge_map_bytes(seg_bytes) / TableRegion::kHugePage);
 }
 
 template <typename IO>
@@ -823,6 +846,7 @@ int uDepot<IO>::restore_index(bool* restored) {
                 ok = false;
                 break;
             }
+            report_huge_fallback(region);
             for (size_t off = 0; off < used && ok; off += kIndexIoChunk) {
                 const size_t n = std::min(kIndexIoChunk, used - off);
                 ssize_t r = pread_internal(
@@ -1158,6 +1182,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
 
     index_ts_ = 0;
     index_restored_ = false;
+    huge_fallback_reported_.store(false, std::memory_order_relaxed);
     index_unbacked_ = false;
     if (restored) {
         // As uDepot's init: the persisted index after a clean shutdown,

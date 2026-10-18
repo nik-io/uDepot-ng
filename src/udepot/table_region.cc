@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 
 #include <cassert>
+#include <cerrno>
 
 namespace udepot {
 
@@ -19,6 +20,7 @@ TableRegion& TableRegion::operator=(TableRegion&& other) noexcept {
         net_bytes_ = std::exchange(other.net_bytes_, 0);
         grain_ = std::exchange(other.grain_, 0);
         huge_ = std::exchange(other.huge_, false);
+        huge_error_ = std::exchange(other.huge_error_, 0);
     }
     return *this;
 }
@@ -37,16 +39,20 @@ TableRegion TableRegion::map(size_t seg_bytes, size_t net_bytes,
     void* p = MAP_FAILED;
     size_t map_bytes = seg_bytes;
     bool huge = false;
+    int huge_error = 0;
     if (wants_huge_pages(seg_bytes)) {
         const size_t huge_bytes = huge_map_bytes(seg_bytes);
         p = ::mmap(nullptr, huge_bytes, kProt, kFlags | MAP_HUGETLB, -1, 0);
         huge = p != MAP_FAILED;
-        if (huge) map_bytes = huge_bytes;
+        if (huge)
+            map_bytes = huge_bytes;
+        else
+            huge_error = errno;
     }
     if (!huge) p = ::mmap(nullptr, seg_bytes, kProt, kFlags, -1, 0);
     if (p == MAP_FAILED) return {};
     return TableRegion(static_cast<uint8_t*>(p), map_bytes, net_bytes, grain,
-                       huge);
+                       huge, huge_error);
 }
 
 void TableRegion::unmap() noexcept {

@@ -510,6 +510,8 @@ TEST(TableRegion, HugePagesRoundedUpTo2MiB) {
     TableRegion r = TableRegion::map(seg, seg - 512, TableRegion::kNoSegment);
     ASSERT_TRUE(r.valid());
     EXPECT_EQ(r.huge(), available);
+    // Why it is not on huge pages, so the store can say.
+    EXPECT_EQ(r.huge_error(), available ? 0 : ENOMEM);
     EXPECT_EQ(r.map_bytes(), available ? huge_bytes : seg);
     EXPECT_EQ(r.net_bytes(), seg - 512);
     r.base()[seg - 1] = 1;  // the whole segment is inside the mapping
@@ -519,5 +521,6 @@ TEST(TableRegion, HugePagesRoundedUpTo2MiB) {
                                      TableRegion::kNoSegment);
     ASSERT_TRUE(b.valid());
     EXPECT_FALSE(b.huge());
+    EXPECT_EQ(b.huge_error(), 0);  // never asked for them
     EXPECT_EQ(b.map_bytes(), small);
 }

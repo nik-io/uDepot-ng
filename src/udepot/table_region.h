@@ -72,6 +72,9 @@ public:
     size_t map_bytes() const noexcept { return map_bytes_; }
     uint64_t grain() const noexcept { return grain_; }
     bool huge() const noexcept { return huge_; }
+    // The errno of a huge-page mapping that wants_huge_pages() asked for
+    // and the system refused (no huge page free: ENOMEM), else 0.
+    int huge_error() const noexcept { return huge_error_; }
 
     // Give a region mapped with kNoSegment its segment.
     void set_grain(uint64_t grain) noexcept { grain_ = grain; }
@@ -81,9 +84,9 @@ public:
 
 private:
     TableRegion(uint8_t* base, size_t map_bytes, size_t net_bytes,
-                uint64_t grain, bool huge) noexcept
+                uint64_t grain, bool huge, int huge_error) noexcept
         : base_(base), map_bytes_(map_bytes), net_bytes_(net_bytes),
-          grain_(grain), huge_(huge) {}
+          grain_(grain), huge_(huge), huge_error_(huge_error) {}
 
     void unmap() noexcept;
 
@@ -92,6 +95,7 @@ private:
     size_t net_bytes_ = 0;
     uint64_t grain_ = 0;
     bool huge_ = false;
+    int huge_error_ = 0;
 };
 
 }  // namespace udepot

@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <gtest/gtest.h>
@@ -807,7 +808,50 @@ TEST_P(StoreIndexTest, OpenSaysWhenTablesMissHugePages) {
     EXPECT_NE(small.find("directory grows to be slower"), std::string::npos)
         << small;
     const std::string large = open_log(size_t{16} << 20);
-    EXPECT_EQ(large.find("4 KiB pages"), std::string::npos) << large;
+    EXPECT_EQ(large.find("index tables map on 4 KiB pages"),
+              std::string::npos)
+        << large;
+}
+
+// No silent fallback: a table that wants huge pages and cannot have them
+// (none free) maps on 4 KiB pages, and the open says so, once, whether it
+// creates the table or restores it; the next open says it again. With
+// huge pages free, nothing is said.
+TEST_P(StoreIndexTest, OpenSaysWhenNoHugePagesAreFree) {
+    config_.grain_size = 4096;
+    const uint64_t seg =
+        udepot::fitted_segment_size(size_t{16} << 20, config_.grain_size);
+    const size_t seg_bytes = seg * config_.grain_size;
+    ASSERT_TRUE(udepot::TableRegion::wants_huge_pages(seg_bytes));
+    config_.segment_size = seg;
+    config_.size = 32 * seg_bytes + 4096;
+
+    auto count = [](const std::string& log) {
+        int n = 0;
+        for (size_t at = 0;
+             (at = log.find("no 2 MiB huge pages", at)) != std::string::npos;
+             ++at)
+            ++n;
+        return n;
+    };
+    for (int round = 0; round < 2; ++round) {
+        uDepot<PosixIO> store;
+        ::testing::internal::CaptureStderr();
+        const int rc = store.open(round == 0 ? config() : reopen_config());
+        const std::string log = ::testing::internal::GetCapturedStderr();
+        ASSERT_EQ(rc, 0);
+        // Whether it got huge pages, rather than a probe beforehand that a
+        // test running alongside could invalidate.
+        const auto& region = store.directory().snapshot().tables[0]->region();
+        EXPECT_EQ(count(log), region.huge() ? 0 : 1) << log;
+        if (!region.huge()) {
+            EXPECT_NE(region.huge_error(), 0);
+            EXPECT_NE(log.find("directory grows to be slower"),
+                      std::string::npos) << log;
+        }
+        ASSERT_EQ(store.put("k", "v").run_sync(), 0);
+        store.close();
+    }
 }
 
 TEST_P(StoreIndexTest, TheDefaultSegmentsTableFillsIt) {

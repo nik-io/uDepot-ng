@@ -347,6 +347,10 @@ private:
     IO io_;
     Directory* directory_ = nullptr;
     bool index_restored_ = false;
+    // Whether this open has reported a table that wanted huge pages and
+    // could not have them (report_huge_fallback).
+    std::atomic<bool> huge_fallback_reported_{false};
+    void report_huge_fallback(const TableRegion& region);
     uint32_t grain_size_ = 512;
     uint64_t total_grains_ = 0;
 
