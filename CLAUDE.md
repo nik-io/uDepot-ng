@@ -62,7 +62,10 @@
     dropped: see `docs/udepot-paper.md`, §4.3); an entry's tag is the 8 hash
     bits above its bucket's, as uDepot's `hash_to_keytag_` (the top 8 bits
     until PR #9; persisted indexes carry a format number, and an older one is
-    rebuilt from the log); PUT writes before it checks, and
+    rebuilt from the log); an io_uring poll that finds nothing completed
+    spins, as uDepot's, unless `StoreConfig::poll_yields` asks it to yield
+    the CPU (agreed in PR #9: configurable, legacy's spin the default); PUT
+    writes before it checks, and
     Memcache paths may carry weaker durability than the store.
 
 ## Project Overview

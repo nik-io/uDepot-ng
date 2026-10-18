@@ -46,6 +46,16 @@ public:
     }
     unsigned queue_depth() const noexcept { return queue_depth_; }
 
+    // Before open(): whether a poll that finds nothing completed yields
+    // the CPU (sched_yield) rather than returning to spin, as uDepot's TRT
+    // poller does (the default). An I/O the kernel cannot do inline (every
+    // one on tmpfs, buffered writes, a device without nowait) runs on an
+    // io-wq worker, which the scheduler wakes on the submitting thread's
+    // CPU; a spinning thread holds it off until preemption. Rings are per
+    // thread and shared by every store a thread uses, so this is
+    // process-wide, as the depth of new rings: the last open() sets it.
+    void set_poll_yields(bool yields) noexcept { poll_yields_set_ = yields; }
+
     int open(const char* path, size_t size);
     // Completes the I/O the calling thread has in flight (resuming its
     // coroutines); I/O other threads have in flight they reap themselves.
@@ -73,15 +83,21 @@ public:
     // thread's I/O is still outstanding.
     static bool poll_thread();
 
+    // How many of the calling thread's polls found nothing and yielded.
+    static uint64_t thread_idle_yields() noexcept;
+
 private:
     friend struct UringSubmitAwaitable;
 
     int fd_ = -1;
     size_t size_ = 0;
     unsigned queue_depth_ = kDefaultQueueDepth;
+    bool poll_yields_set_ = false;
 
     // Size of the rings threads create from now on.
     static std::atomic<unsigned> new_ring_depth_;
+    // Whether an empty poll yields (set_poll_yields).
+    static std::atomic<bool> poll_yields_;
 };
 
 }  // namespace udepot

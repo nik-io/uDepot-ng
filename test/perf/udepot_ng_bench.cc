@@ -67,6 +67,9 @@ struct BenchConfig {
     uint32_t qd = 1;
     // Only the put phase (--put-only): the latency runs need nothing else.
     bool put_only = false;
+    // io_uring: an empty poll yields the CPU (--poll-yields) instead of
+    // spinning, the default (StoreConfig::poll_yields).
+    bool poll_yields = false;
 };
 
 static double now_secs() {
@@ -399,6 +402,7 @@ static int run_bench(const BenchConfig& cfg) {
     sc.size = cfg.store_size;
     sc.grain_size = cfg.grain_size;
     sc.segment_size = cfg.segment_size;
+    sc.poll_yields = cfg.poll_yields;
     // Every run starts empty: a file is removed between runs, but an SPDK
     // namespace keeps the previous run's store.
     sc.force_destroy = true;
@@ -506,7 +510,9 @@ static void usage() {
         "                 from each put's due time (with --latency)\n"
         "  --qd <n>       Operations each thread keeps in flight, in every\n"
         "                 phase (default: 1)\n"
-        "  --put-only     Run only the put phase\n");
+        "  --put-only     Run only the put phase\n"
+        "  --poll-yields  io_uring: yield the CPU on an empty poll instead\n"
+        "                 of spinning (StoreConfig::poll_yields)\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -536,6 +542,8 @@ int main(int argc, char* argv[]) {
             cfg.latency = true;
         } else if (arg == "--put-only") {
             cfg.put_only = true;
+        } else if (arg == "--poll-yields") {
+            cfg.poll_yields = true;
         } else if (arg == "--qd" && i + 1 < argc) {
             cfg.qd = std::stoul(argv[++i]);
         } else if (arg == "--rate" && i + 1 < argc) {

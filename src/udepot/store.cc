@@ -981,6 +981,8 @@ int uDepot<IO>::open(const StoreConfig& config) {
 
     if constexpr (requires { io_.set_queue_depth(config.queue_depth); })
         io_.set_queue_depth(config.queue_depth);
+    if constexpr (requires { io_.set_poll_yields(config.poll_yields); })
+        io_.set_poll_yields(config.poll_yields);
     int rc = io_.open(config.path, config.size);
     if (rc != 0) return rc;
 

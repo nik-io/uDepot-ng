@@ -152,3 +152,46 @@ TEST(UringSubmit, AFullRingIsPushedNotRefused) {
     store.close();
     UringTraits::cleanup(config);
 }
+
+// A poll that finds none of the thread's I/O completed spins, as uDepot's
+// poller does, unless StoreConfig::poll_yields asks it to yield the CPU.
+// With submissions refused (injected), nothing can complete, so every poll
+// is an empty one.
+TEST(UringPoll, AnEmptyPollSpinsUnlessAskedToYield) {
+    static std::atomic<bool> refuse{false};
+    udepot::UringIO::submit_test_hook = [] {
+        return refuse.load() ? -EBUSY : 0;
+    };
+    struct ResetHook {
+        ~ResetHook() { udepot::UringIO::submit_test_hook = nullptr; }
+    } reset_hook;
+
+    for (bool yields : {false, true}) {
+        SCOPED_TRACE(yields ? "poll_yields" : "default");
+        udepot::StoreConfig config;
+        config.grain_size = 512;
+        config.force_destroy = true;
+        config.poll_yields = yields;
+        UringTraits::configure(config);
+        udepot::uDepot<udepot::UringIO> store;
+        ASSERT_EQ(store.open(config), 0);
+        ASSERT_EQ(store.put(qd::make_key(0), qd::make_val(0)).run_sync(), 0);
+
+        refuse = true;
+        qd::ReadCtx ctx;
+        const std::string key = qd::make_key(0);
+        auto task = store.get(key, ctx.val, sizeof(ctx.val), &ctx.val_size);
+        const uint64_t before = udepot::UringIO::thread_idle_yields();
+        for (int i = 0; i < 10; ++i)
+            ASSERT_TRUE(udepot::UringIO::poll_thread());  // still pending
+        EXPECT_EQ(udepot::UringIO::thread_idle_yields() - before,
+                  yields ? 10u : 0u);
+        refuse = false;
+        ASSERT_EQ(task.run_sync(), 0);
+        EXPECT_EQ(std::string_view(reinterpret_cast<char*>(ctx.val),
+                                   ctx.val_size),
+                  qd::make_val(0));
+        store.close();
+        UringTraits::cleanup(config);
+    }
+}

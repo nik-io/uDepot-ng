@@ -89,6 +89,14 @@ struct StoreConfig {
     // whose I/O the backend refuses because its queue is full fails with
     // -EAGAIN. 0 = the backend's default.
     unsigned queue_depth = 0;
+    // io_uring only: whether a thread's poll that finds none of its I/O
+    // completed yields the CPU instead of spinning. Off by default: it
+    // spins, as uDepot's poller does, for the lowest latency. Worth turning
+    // on where the kernel cannot do the I/O inline (tmpfs, buffered writes,
+    // a device without nowait support): it hands each request to an io-wq
+    // worker, woken on the submitting thread's CPU, which a spinning thread
+    // holds off until it is preempted. Process-wide: the last open() sets it.
+    bool poll_yields = false;
 };
 
 // The segment size, in grains, whose directory table holds table_bytes of

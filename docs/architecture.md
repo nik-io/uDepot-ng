@@ -259,19 +259,19 @@ What remains lives in `io/`:
   made them 15–87% slower than uDepot; reaped on the submitting thread they
   are faster on every operation.
 
-  An io_uring poll that finds nothing completed yields the CPU
-  (`sched_yield`) where uDepot's poller only yielded to the TRT scheduler.
-  A request the kernel cannot do inline (every one on tmpfs, buffered
-  writes, a device without nowait) runs on an io-wq kernel worker, and the
-  scheduler wakes that worker on the submitting thread's own CPU (traced:
-  every wakeup). A thread spinning on its CQ then held off the very worker
-  it waited for until preemption, so an operation took a scheduler slice
-  rather than the I/O's time, and which of copy and zero copy won depended
-  on the CPU. Yielding roughly doubled io_uring throughput on tmpfs on a
-  4-CPU Intel VM; on a CI EPYC 7763 it changed neither throughput nor the
-  zero-copy result much, since there the hand-off itself (~20 us) is what an
-  operation costs. AIO needs none: `io_submit` does that work before
-  returning.
+  An io_uring poll that finds nothing completed spins by default, as
+  uDepot's poller does (it only yields to the TRT scheduler), for the
+  lowest latency. `StoreConfig::poll_yields` (process-wide, as rings are
+  per thread) makes it yield the CPU (`sched_yield`) instead. That is for
+  I/O the kernel cannot do inline (every request on tmpfs, buffered
+  writes, a device without nowait): it runs on an io-wq worker, which the
+  scheduler wakes on the submitting thread's own CPU (traced: every
+  wakeup), and a spinning thread holds it off until preemption. Measured
+  on tmpfs, yielding once roughly doubled io_uring throughput on a 4-CPU
+  Intel VM at queue depth 1, then made no consistent difference there
+  (24-32 kops/s spinning, 24-28 yielding, 4 KiB values), and changed little
+  on a CI EPYC 7763: measure before turning it on. AIO needs neither:
+  `io_submit` does that work before returning.
 - **Awaitable** that bridges I/O completion to coroutine resume.
 - **Buffer allocation** utilities (tagged by backend).
 

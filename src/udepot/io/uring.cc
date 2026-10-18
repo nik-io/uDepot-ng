@@ -80,6 +80,10 @@ constexpr unsigned kSubmitBatch = 128;
 }  // namespace
 
 std::atomic<unsigned> UringIO::new_ring_depth_{UringIO::kDefaultQueueDepth};
+std::atomic<bool> UringIO::poll_yields_{false};
+static thread_local uint64_t tl_idle_yields = 0;
+
+uint64_t UringIO::thread_idle_yields() noexcept { return tl_idle_yields; }
 
 // liburing has published the SQEs to the ring before io_uring_submit can
 // fail, so they cannot be withdrawn. EBUSY/EAGAIN clear as the thread
@@ -193,6 +197,7 @@ int UringIO::open(const char* path, size_t size) {
         set_thread_poll(&UringIO::poll_thread);
     }
     new_ring_depth_.store(queue_depth_, std::memory_order_relaxed);
+    poll_yields_.store(poll_yields_set_, std::memory_order_relaxed);
     return 0;
 }
 
@@ -237,11 +242,15 @@ bool UringIO::poll_thread() {
     static constexpr unsigned kMaxCqes = 64;
     struct io_uring_cqe* cqes[kMaxCqes];
     const unsigned n = io_uring_peek_batch_cqe(&t.ring, cqes, kMaxCqes);
-    // Nothing done: give up the CPU. The io-wq worker running a request the
-    // kernel could not do inline is woken on this thread's CPU, and spinning
-    // here holds it off until preemption (docs/architecture.md).
+    // Nothing done: spin, as uDepot's poller, or, if asked, give up the
+    // CPU. The io-wq worker running a request the kernel could not do
+    // inline is woken on this thread's CPU, and spinning here holds it off
+    // until preemption (set_poll_yields, docs/architecture.md).
     if (n == 0) {
-        std::this_thread::yield();
+        if (poll_yields_.load(std::memory_order_relaxed)) {
+            ++tl_idle_yields;
+            std::this_thread::yield();
+        }
         return true;
     }
     UringRequest* done[kMaxCqes];
