@@ -315,3 +315,33 @@ TEST_F(AioIOTest, CannotPreallocateFallsBackToSparseAndSaysSo) {
     EXPECT_LT(static_cast<size_t>(st.st_blocks) * 512, kSize);  // sparse
     io.close();
 }
+
+// live_contexts() counts the AIO contexts that exist: one per thread that has done
+// I/O through the backend, gone when the thread exits. The memcache server's
+// bound on them is asserted through it. On the bare backend, so no thread of
+// a store adds one in the middle of the count.
+TEST_F(AioIOTest, LiveContextsCountsThreadsDoingIo) {
+    AioIO io;
+    ASSERT_EQ(io.open(path_.c_str(), 4096), 0);
+    const unsigned base = AioIO::live_contexts();
+
+    constexpr int kThreads = 3;
+    std::atomic<int> started{0};
+    std::atomic<bool> release{false};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&] {
+            auto buf = io.alloc_buffer(4096);
+            EXPECT_EQ(io.pread(buf.data, 4096, 0).run_sync(),
+                      static_cast<ssize_t>(4096));
+            ++started;
+            while (!release) std::this_thread::yield();
+        });
+    }
+    while (started < kThreads) std::this_thread::yield();
+    EXPECT_EQ(AioIO::live_contexts(), base + kThreads);
+    release = true;
+    for (auto& t : threads) t.join();
+    EXPECT_EQ(AioIO::live_contexts(), base);
+    io.close();
+}

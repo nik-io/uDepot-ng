@@ -13,10 +13,12 @@
 #include <ctime>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <optional>
 #include <string_view>
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 #include "udepot/coro.h"
@@ -144,9 +146,9 @@ static void decode_metadata(const uint8_t* src, size_t total_size,
 // ─────────────────────────────────────────────────────────────────────────────
 // MemcacheServer — connection handler coroutine
 //
-// Each connection runs in its own thread with its own EpollState. The handler
-// reads commands from the socket, dispatches to the store, and writes
-// responses back.
+// Each connection is a coroutine on one of the server's workers. It reads
+// commands from the socket, dispatches to the store, and writes responses
+// back.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // RecvBuffer: growable receive buffer for reading line-oriented protocol.
@@ -643,11 +645,175 @@ static CoroTask<int> serve_connection(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MemcacheServer implementation
-// ─────────────────────────────────────────────────────────────────────────────
+
+
+// A worker: one thread running one EpollState's poller, which polls the
+// sockets and this thread's store I/O completions side by side, as one of
+// uDepot's TRT scheduler threads ran its epoll and I/O pollers (and the
+// connection tasks) -- trt-memcache.cc:122-127 spawns the epoll poller on
+// every scheduler thread, task_mc_accept (:238-270) spawns each accepted
+// connection as a task on one of them (SpawnPolicy::Distribute).
+//
+// Everything a worker owns (conns, acceptor) is touched only by its poller
+// thread, which starts, resumes and reclaims the connection coroutines, so
+// it needs no lock. Two exceptions in time: start() creates the worker and
+// starts its acceptor before the poller has anything to act on (the poller
+// never reads `acceptor`), and stop_workers() destroys it after the poller
+// is joined. The other exceptions are the atomics: a connection coroutine
+// may finish on another thread (the store's space waker resumes a waiting
+// operation, and the coroutine runs on from there until its next socket
+// wait), so finishing touches nothing but the socket (under the epoll's own
+// lock), conn_fds_ (its existing mutex) and the `finished` counter.
+//
+// Hand-off of an accepted fd: the accept thread sends the fd number down
+// this worker's socketpair, whose read end the worker's epoll watches, and
+// the worker's acceptor coroutine starts the connection on the worker's own
+// thread. No userspace lock is involved (the kernel queues the message), and
+// the accept thread chooses the worker round robin. The alternative, every
+// worker accepting on the shared listen fd, would spread connections by
+// whichever worker wins the race rather than evenly; legacy distributes
+// round robin.
+template <typename Store>
+struct MemcacheServer<Store>::Worker {
+    struct Conn {
+        Connection conn;
+        std::optional<CoroTask<int>> task;
+        Conn(EpollState& es, int fd) : conn(es, fd) {}
+    };
+
+    unsigned index = 0;  // for messages and the test hooks
+    EpollState es;
+    int rx = -1;  // read end of the hand-off socketpair: worker thread
+    int tx = -1;  // write end: accept thread; stop() closes it to end the worker
+    std::optional<CoroTask<int>> acceptor;
+    std::atomic<bool> acceptor_done{false};
+    std::unordered_map<Conn*, std::unique_ptr<Conn>> conns;  // poller thread
+    std::atomic<size_t> finished{0};  // finished, not yet reclaimed: any thread
+    std::atomic<size_t> nconns{0};    // conns.size(), readable anywhere
+
+    ~Worker() {
+        if (rx >= 0) ::close(rx);
+        if (tx >= 0) ::close(tx);
+    }
+
+    // A connection: serves it, then closes its fd. The fd leaves conn_fds_
+    // before it is closed, so stop() can never shutdown() a number that has
+    // been reused.
+    CoroTask<int> run_connection(MemcacheServer& srv, Conn& c) {
+        const int fd = c.conn.fd();
+        int rc = co_await serve_connection<Store>(
+            srv.store_, es, c.conn, srv.running_, srv.bytes_stored_);
+        {
+            std::lock_guard<std::mutex> lk(srv.conn_fds_mu_);
+            auto it = std::find(srv.conn_fds_.begin(), srv.conn_fds_.end(), fd);
+            if (it != srv.conn_fds_.end()) srv.conn_fds_.erase(it);
+        }
+        es.close_fd(fd);
+        if (auto hook = MemcacheTestHooks::connection_finished_test_hook.load(
+                std::memory_order_relaxed))
+            hook();
+        // The last thing this body does: after it the poller may reclaim
+        // the frame once the task reports completion.
+        finished.fetch_add(1, std::memory_order_release);
+        co_return rc;
+    }
+
+    // Starts a connection on this thread (the poller's).
+    void spawn(MemcacheServer& srv, int fd) {
+        auto c = std::make_unique<Conn>(es, fd);
+        Conn* p = c.get();
+        conns.emplace(p, std::move(c));
+        nconns.store(conns.size(), std::memory_order_relaxed);
+        es.register_fd(fd, EPOLLIN | EPOLLOUT);
+        // Eager start: runs to the connection's first suspension here.
+        p->task.emplace(run_connection(srv, *p));
+    }
+
+    // Receives the fds the accept thread hands over until it closes its end
+    // (after the last one: a socketpair delivers what is queued before EOF).
+    CoroTask<int> accept_handoffs(MemcacheServer& srv) {
+        for (;;) {
+            int fd = -1;
+            ssize_t n = co_await es.recv(rx, &fd, sizeof(fd), 0);
+            const bool have_fd = n == static_cast<ssize_t>(sizeof(fd));
+            if (auto hook = MemcacheTestHooks::handoff_recv_test_hook.load(
+                    std::memory_order_relaxed)) {
+                if (int e = hook(index); e != 0) {
+                    n = -1;
+                    errno = e;
+                }
+            }
+            if (n == static_cast<ssize_t>(sizeof(fd))) {
+                spawn(srv, fd);
+                continue;
+            }
+            if (n < 0) {
+                std::fprintf(stderr,
+                             "udepot: memcache worker %u: hand-off socket "
+                             "failed (%s); this worker takes no more "
+                             "connections and closes those still queued for "
+                             "it\n", index, std::strerror(errno));
+                if (have_fd) {  // received, but failed: close it as the rest
+                    std::lock_guard<std::mutex> lk(srv.conn_fds_mu_);
+                    auto it = std::find(srv.conn_fds_.begin(),
+                                        srv.conn_fds_.end(), fd);
+                    if (it != srv.conn_fds_.end()) srv.conn_fds_.erase(it);
+                    ::close(fd);
+                }
+                while (::recv(rx, &fd, sizeof(fd), MSG_DONTWAIT) ==
+                       static_cast<ssize_t>(sizeof(fd))) {
+                    std::lock_guard<std::mutex> lk(srv.conn_fds_mu_);
+                    auto it = std::find(srv.conn_fds_.begin(),
+                                        srv.conn_fds_.end(), fd);
+                    if (it != srv.conn_fds_.end()) srv.conn_fds_.erase(it);
+                    ::close(fd);
+                }
+            }
+            break;  // 0: the accept side is closed and everything queued done.
+        }
+        es.close_fd(rx);
+        rx = -1;
+        acceptor_done.store(true, std::memory_order_release);
+        co_return 0;
+    }
+
+    // The poller's hook, at the top of every iteration: reclaims finished
+    // connections and ends the poller once there will be no more.
+    bool poll() {
+        if (finished.load(std::memory_order_acquire) != 0) {
+            size_t reclaimed = 0;
+            for (auto it = conns.begin(); it != conns.end();) {
+                // await_ready() is the task's completion test: it holds
+                // once the coroutine's final suspend ran, the last thing
+                // it does on whichever thread finished it.
+                if (it->second->task && it->second->task->await_ready()) {
+                    it = conns.erase(it);
+                    ++reclaimed;
+                } else {
+                    ++it;
+                }
+            }
+            finished.fetch_sub(reclaimed, std::memory_order_relaxed);
+            nconns.store(conns.size(), std::memory_order_relaxed);
+        }
+        return !(acceptor_done.load(std::memory_order_acquire) &&
+                 conns.empty());
+    }
+};
+
+template <typename Store>
+MemcacheServer<Store>::MemcacheServer(Store& store) : store_(store) {}
 
 template <typename Store>
 MemcacheServer<Store>::~MemcacheServer() {
     stop();
+}
+
+template <typename Store>
+size_t MemcacheServer<Store>::connections() const noexcept {
+    size_t n = 0;
+    for (const auto& w : workers_) n += w->nconns.load(std::memory_order_relaxed);
+    return n;
 }
 
 template <typename Store>
@@ -686,12 +852,82 @@ int MemcacheServer<Store>::start(const Config& config) {
         int e = errno;
         ::close(listen_fd_);
         listen_fd_ = -1;
+        port_ = 0;
         return -e;
     }
 
+    unsigned nworkers = config.workers;
+    if (nworkers == 0) nworkers = std::thread::hardware_concurrency();
+    if (nworkers == 0) nworkers = 1;  // hardware_concurrency() may not know.
+
+    int err = 0;
+    for (unsigned i = 0; i < nworkers && err == 0; ++i) {
+        auto w = std::make_unique<Worker>();
+        w->index = i;
+        int sv[2];
+        int sp_errno = 0;
+        if (auto hook = MemcacheTestHooks::socketpair_test_hook.load(
+                std::memory_order_relaxed))
+            sp_errno = hook(i);
+        if (sp_errno == 0 &&
+            socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) < 0)
+            sp_errno = errno;
+        if (sp_errno != 0) {
+            err = -sp_errno;
+            std::fprintf(stderr,
+                         "udepot: memcache worker %u: socketpair: %s; the "
+                         "server does not start\n",
+                         i, std::strerror(sp_errno));
+            break;
+        }
+        w->rx = sv[0];
+        w->tx = sv[1];
+        Worker* wp = w.get();
+        w->es.set_poll_hook([wp] { return wp->poll(); });
+        workers_.push_back(std::move(w));
+        if ((err = wp->es.init()) != 0) {
+            std::fprintf(stderr,
+                         "udepot: memcache worker %u: epoll: %s; the server "
+                         "does not start\n", i, std::strerror(-err));
+            break;
+        }
+        wp->es.register_fd(wp->rx, EPOLLIN);
+        wp->acceptor.emplace(wp->accept_handoffs(*this));
+    }
+    if (err != 0) {
+        stop_workers();
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+        port_ = 0;
+        return err;
+    }
+
+    next_worker_ = 0;
+    handoff_failures_ = 0;
+    refused_.store(0, std::memory_order_relaxed);
     running_.store(true, std::memory_order_release);
     accept_thread_ = std::thread(&MemcacheServer::accept_loop, this);
     return 0;
+}
+
+// Ends the workers: closing the hand-off socket's write end tells each
+// acceptor, after the last queued fd, to stop; its poller then exits when
+// its connections are done. The accept thread must be gone (it sends on
+// that socket).
+template <typename Store>
+void MemcacheServer<Store>::stop_workers() {
+    for (auto& w : workers_) {
+        if (w->tx >= 0) {
+            ::close(w->tx);
+            w->tx = -1;
+        }
+    }
+    // Every connection ends: the caller shut their sockets down.
+    for (auto& w : workers_) {
+        w->es.join_poller();
+        w->es.stop();
+    }
+    workers_.clear();
 }
 
 template <typename Store>
@@ -716,16 +952,15 @@ void MemcacheServer<Store>::stop() {
     }
 
     // Force-close all tracked connection fds so handler coroutines unblock.
+    // A connection removes its fd from conn_fds_ before it closes it, so
+    // this never touches a number that has been reused.
     {
         std::lock_guard<std::mutex> lk(conn_fds_mu_);
         for (int fd : conn_fds_)
             shutdown(fd, SHUT_RDWR);
     }
 
-    for (auto& t : conn_threads_) {
-        if (t.joinable()) t.join();
-    }
-    conn_threads_.clear();
+    stop_workers();
 }
 
 template <typename Store>
@@ -748,35 +983,47 @@ void MemcacheServer<Store>::accept_loop() {
             conn_fds_.push_back(fd);
         }
 
-        conn_threads_.emplace_back(
-            &MemcacheServer::handle_connection, this, fd);
-    }
-}
-
-template <typename Store>
-void MemcacheServer<Store>::handle_connection(int fd) {
-    EpollState es;
-    if (es.init() != 0) {
-        ::close(fd);
-        return;
-    }
-
-    es.register_fd(fd, EPOLLIN | EPOLLOUT);
-    Connection conn(es, fd);
-
-    auto task = serve_connection<Store>(
-        store_, es, conn, running_, bytes_stored_);
-    task.run_sync();
-
-    // Stop the poller before touching fds_ to avoid a data race between
-    // the poller's notify_maybe and deregister_fd/close_fd.
-    es.stop();
-    ::close(fd);
-
-    {
-        std::lock_guard<std::mutex> lk(conn_fds_mu_);
-        auto it = std::find(conn_fds_.begin(), conn_fds_.end(), fd);
-        if (it != conn_fds_.end()) conn_fds_.erase(it);
+        // Round robin over the workers. The hand-off never blocks: a worker
+        // that stopped draining its socket (its poller stalled or died)
+        // must not hold up the accept thread, and with it every other
+        // worker's connections and stop(). A full queue passes the
+        // connection to the next worker; if none can take it, it is closed.
+        bool handed = false;
+        for (size_t tries = 0; tries < workers_.size(); ++tries) {
+            Worker& w = *workers_[next_worker_];
+            next_worker_ = (next_worker_ + 1) % workers_.size();
+            if (::send(w.tx, &fd, sizeof(fd), MSG_NOSIGNAL | MSG_DONTWAIT) ==
+                static_cast<ssize_t>(sizeof(fd))) {
+                handed = true;
+                break;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            // Broken, not just full. Said on the 1st, 2nd, 4th, ... so a
+            // dead worker cannot flood the log.
+            const int e = errno;
+            if (const uint64_t n = ++handoff_failures_; (n & (n - 1)) == 0)
+                std::fprintf(stderr,
+                             "udepot: memcache: could not hand a connection "
+                             "to worker %u (%s); %llu such failures so far\n",
+                             w.index, std::strerror(e),
+                             static_cast<unsigned long long>(n));
+        }
+        if (!handed) {
+            {
+                std::lock_guard<std::mutex> lk(conn_fds_mu_);
+                auto it = std::find(conn_fds_.begin(), conn_fds_.end(), fd);
+                if (it != conn_fds_.end()) conn_fds_.erase(it);
+            }
+            ::close(fd);
+            const uint64_t n =
+                refused_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0)
+                std::fprintf(stderr,
+                             "udepot: memcache: no worker could take a "
+                             "connection (every hand-off queue is full or "
+                             "broken); closed it, %llu so far\n",
+                             static_cast<unsigned long long>(n));
+        }
     }
 }
 

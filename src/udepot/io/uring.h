@@ -87,6 +87,10 @@ public:
     // thread's I/O is still outstanding.
     static bool poll_thread();
 
+    // io_uring rings that exist now, across all threads: one per thread
+    // that has used the backend, released when the thread exits.
+    static unsigned live_rings() noexcept;
+
     // How many of the calling thread's polls found nothing and yielded.
     static uint64_t thread_idle_yields() noexcept;
 
