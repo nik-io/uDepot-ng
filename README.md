@@ -123,9 +123,29 @@ correctness, and async queue-depth scaling.
 
 ### Using a block device
 
-uDepot-ng sizes the store from `StoreConfig::size`. On a **regular file** the
-store creates or truncates the file to that size. A **block device cannot be
-truncated**, so set `size` to the device capacity.
+uDepot-ng sizes the store from `StoreConfig::size`, and 0 means the whole
+thing, as uDepot (it takes the size from `lseek(SEEK_END)`). A **block
+device** is never resized or preallocated: `size` 0 uses the whole device, a
+smaller `size` is used as is, and a larger one fails the open with `-ENOSPC`
+and a message naming the device size. A **regular file** is sized to `size`:
+AIO and io_uring preallocate it (so no write allocates), posix grows it with
+`ftruncate`; a file is never shrunk, and one larger than `size` is used up to
+`size`.
+With `size` 0 a non-empty file is used whole (AIO and io_uring preallocate
+it over its current length); a new or empty file has no size to be the whole
+of, so the open fails with `-EINVAL` and the file is left as it is. This
+holds for the posix, AIO and io_uring backends.
+
+**uDepot will not format over what it may hold.** The store's metadata sits at
+the end of the size it was created with, so a reopen under another size (a
+file's whole length instead of the size asked for, say) finds none. Unless
+`StoreConfig::force_destroy` asks for a new store, that open fails with
+`-EEXIST` and a message, except on a regular file that was new or empty,
+which holds nothing. Reopen with the size the store was created with. The
+same refusal follows a first open that crashed before it finished (a clean
+failure puts a new file back to empty); `force_destroy` is the remedy.
+A file with data that is shorter than the `size` asked for is refused the same
+way, before it is grown.
 
 **The device metadata needs a tail past the last whole segment.** As uDepot,
 uDepot-ng puts it after `align_down(device_size, segment_size * grain_size)`.

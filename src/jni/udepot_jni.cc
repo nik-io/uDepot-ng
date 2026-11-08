@@ -30,9 +30,8 @@ static bool store_open() {
 JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_initWithTables(
     JNIEnv* env, jobject, jstring fname, jlong size, jboolean force_destroy,
     jlong table_size) {
-    (void)force_destroy;
-
     udepot::StoreConfig config;
+    config.force_destroy = force_destroy == JNI_TRUE;
     config.grain_size = 512;
     // The Java side defaults to small tables, for tests; see
     // uDepotJNI.DEFAULT_TABLE_SIZE.

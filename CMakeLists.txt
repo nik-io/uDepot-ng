@@ -185,6 +185,10 @@ if(UDEPOT_BUILD_TESTS)
     udepot_add_test(hash_table_test test/hash_table_test.cc)
     udepot_add_test(directory_test  test/directory_test.cc)
     udepot_add_test(aio_test        test/io/aio_test.cc)
+    # Needs root and losetup, else it skips; CI runs it under sudo and fails
+    # on a skip.
+    udepot_add_test(block_device_test test/io/block_device_test.cc)
+    udepot_add_test(file_size_test test/io/file_size_test.cc)
     udepot_add_test(store_test      test/store_test.cc)
     udepot_add_test(aio_store_test  test/aio_store_test.cc)
     udepot_add_test(concurrent_store_test test/concurrent_store_test.cc)
