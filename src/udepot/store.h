@@ -97,6 +97,71 @@ struct StoreConfig {
     // worker, woken on the submitting thread's CPU, which a spinning thread
     // holds off until it is preempted. Process-wide: the last open() sets it.
     bool poll_yields = false;
+    // uDepot's *MC runtimes (udepot-lsa.cc:338-380, 889-915; selected per
+    // runtime at compile time there, persisted nowhere, and so not on the
+    // device here either): a memcache store. Its GC evicts instead of
+    // relocating: the entries of every segment it cleans are dropped from
+    // the directory, oldest segment first (salsa's circular-buffer GC), and
+    // nothing is rewritten. GETs stay read-only. Salsa is set up as the *MC
+    // runtimes do: gc_type 1, GC from 20 free segments to 40. `overprovision`
+    // above is not used: legacy's 40 per mille there is replaced, by the
+    // maintainer's decision, by a live-data cap of the device less 10
+    // segments (half the low watermark), so that GC is always due before
+    // the cap can refuse a put; a refusal that still comes, because writers
+    // outran GC, makes the put wait for it (as for no free segment) rather
+    // than fail with ENOSPC.
+    //
+    // The cap is taken off the device including its tail (the part past the
+    // last whole segment that holds the device metadata). Sizing: salsa's
+    // spare-segment check passes at any size under that cap (it leaves 8
+    // spare segments of the 4 it needs), but the cap must leave room for the
+    // first table and 4 data segments (kMcMinTableSegments,
+    // kMcMinDataSegments), or a put refused for space could wait for a GC
+    // with nothing to evict: with a net segment of S grains, the cap must be
+    // at least 5 S: 15 whole segments always suffice (14 do with a tail of
+    // nearly a segment), so 15 is a sufficient bound, not the exact one. A
+    // new store below that has its segment halved until it fits, with a
+    // message; an
+    // existing store keeps its segment size and fails to open (-EINVAL,
+    // with a message naming the cause). GC runs from 20 free segments to 40
+    // and some segments are never free (the first table, and 2 more salsa
+    // keeps), so a device of fewer than 43 segments cannot let it rest, and
+    // the open says so (each table the directory grows raises that by one).
+    // With the default fitted segment (~512 MiB) that is a device over
+    // ~21 GiB.
+    //
+    // A put the cap refuses waits for GC (-EAGAIN) rather than failing, and
+    // so does a directory grow, which keeps the tables it has gathered; a
+    // directory that could never fit at its peak (old and new tables, and 4
+    // data segments) fails with ENOSPC and a message, when the cap refuses a
+    // segment to it. Consequence of that margin (3 tables per table, and 4
+    // data segments): a store near the minimum cannot grow past its first
+    // table; its 4 data segments hold several times fewer entries than a
+    // table does (measured: a table of a 128 KiB segment held ~5000 entries
+    // before growing, 4 such segments hold 1020 one-grain records), so it
+    // does not need to.
+    // capacity_waits() counts the waits.
+    //
+    // A clean close persists the index as for any store and the next open
+    // restores it (unless the index could not be persisted: close says
+    // so, and the entries are lost). After a crash the store opens EMPTY
+    // and says so: eviction removes entries without writing anything and
+    // segments are reused out of age order, so a log scan could bring back
+    // stale values or deleted keys.
+    //
+    // The mode is not on the device, so nothing stops the other mixes, and
+    // both are a consequence of that choice: a store that crashed as KV and
+    // is opened with memcache = true is WIPED at open (new seed, nothing
+    // replayed); one that crashed as memcache and is opened as KV replays
+    // the log this mode calls unsafe -- stale values, deleted keys back --
+    // with no message; and a memcache store that was closed cleanly and is
+    // opened as KV may hold more live data than a KV store's cap allows, in
+    // which case the open fails (-EIO, with a message) and, as any open
+    // does, has cleared the index, so a reopen as memcache starts empty.
+    // Open a store in the mode it was created in. After a clean reopen a
+    // memcache store's segments go back to GC oldest first, so eviction
+    // stays oldest first.
+    bool memcache = false;
 };
 
 // The segment size, in grains, whose directory table holds table_bytes of
@@ -365,6 +430,12 @@ public:
     using InternalIoHook = int (*)(bool write, off_t offset, size_t count);
     inline static std::atomic<InternalIoHook> internal_io_test_hook{nullptr};
 
+    // Test seam, never set in production: called when GC visits an index
+    // segment of a memcache store, with its segment index and whether it
+    // was let go (a retired table's) or kept (a live table's).
+    using IndexGcHook = void (*)(uint64_t seg, bool freed);
+    inline static std::atomic<IndexGcHook> index_gc_test_hook{nullptr};
+
     Directory& directory() { return *directory_; }
     const Directory& directory() const { return *directory_; }
     Rcu& rcu() { return rcu_; }
@@ -375,6 +446,35 @@ public:
     // Whether open() restored the index from its segments (the store was
     // shut down cleanly), rather than scanning the log.
     bool index_restored() const noexcept { return index_restored_; }
+    // How many times a memcache store's puts and directory grows were
+    // refused by its live-data cap and waited for GC instead (-EAGAIN). 0
+    // for a KV store.
+    uint64_t capacity_waits() const noexcept {
+        return capacity_waits_.load(std::memory_order_relaxed);
+    }
+    // Times a memcache store's circular GC went to sleep waiting for a kick:
+    // its queue was empty, or a lap of it (index segments it cannot free,
+    // or a segment it cannot read) freed nothing. Waits that returned at
+    // once are not counted, and the two kinds are not told apart. It is
+    // woken by a segment entering the queue and by a retired table's
+    // segment.
+    uint64_t gc_waits() const noexcept {
+        return scm_ ? scm_->gc_waits() : 0;
+    }
+    // Test seam, never used in production: kick the circular GC.
+    void kick_gc_for_test() { scm_->gc_kick(); }
+    // Test seam, never used in production: retire the directory's table
+    // `idx` as a grow would, without replacing it (the store is only to be
+    // closed afterwards).
+    void retire_table_for_test(size_t idx) {
+        retire_index_table(*directory_->snapshot().tables[idx]);
+    }
+    // Test seam, never used in production: the live-data cap (in grains)
+    // the directory-grow guard compares against, to drive the guard on a
+    // device where no real workload could.
+    void set_memcache_guard_cap_for_test(uint64_t grains) noexcept {
+        cap_grains_ = grains;
+    }
 
 private:
     Rcu rcu_;
@@ -405,6 +505,11 @@ private:
     // metadata and old records on disk until it is reused. GC uses it to
     // tell whether a tombstone can still matter.
     std::unique_ptr<std::atomic<bool>[]> seg_live_;
+    // Memcache only: set when a directory table's index segment is retired
+    // (its grains invalidated). The circular GC, unlike nbin, does not free
+    // a segment at zero valid grains, only after its relocation upcall
+    // returns 0, which IndexCtlr::gc_callback does for these.
+    std::unique_ptr<std::atomic<bool>[]> index_retired_;
 
     // Waiting for free space or for a directory grow. When salsa has no
     // segment staged, or the key's directory snapshot is being grown, an
@@ -511,8 +616,14 @@ private:
 
     private:
         // Never holds anything GC could move (uDepot: "this should not
-        // happen").
-        int gc_callback(u64, u64) override { return ENOSYS; }
+        // happen", udepot-directory-map.cc:938-941): ENOSYS. Except in a
+        // memcache store, whose circular GC frees a segment only when this
+        // returns 0: a retired table's segment is let go, a live one's is
+        // not. (nbin frees a segment at zero valid grains itself, so a KV
+        // store never needs it, and keeps ENOSYS.)
+        int gc_callback(u64 grain_start, u64) override {
+            return store_->index_gc(grain_start);
+        }
         void seg_md_callback(u64 grain_start, u64, u64) override {
             store_->index_seg_md_callback(grain_start);
         }
@@ -540,8 +651,25 @@ private:
     // walk has freed the dead ones (assign_index_segments).
     bool index_unbacked_ = false;
     uint32_t overprovision_ = 0;  // per mille, as the store was opened
+    bool memcache_ = false;       // StoreConfig::memcache, as opened
+    // What a memcache store's cap has to leave besides the segments it
+    // takes off: the first table's segment and room for 4 data segments
+    // (the one being filled, one sealed for GC to evict, one filling after
+    // it, one staged). With less, a put refused for space could wait for a
+    // GC that has nothing to evict.
+    static constexpr uint32_t kMcMinTableSegments = 1;
+    static constexpr uint32_t kMcMinDataSegments = 4;
+    // Segments besides the tables that GC's free count never reaches
+    // (measured, see open()).
+    static constexpr uint32_t kMcNeverFreeSegments = 2;
+    uint64_t cap_grains_ = 0;     // memcache: the live-data cap, in grains
+    std::atomic<uint64_t> capacity_waits_{0};
+    std::atomic<bool> grow_cap_reported_{false};
+
     int new_index_table(std::unique_ptr<HashTable>* table);
     void retire_index_table(HashTable& table);
+    void mark_index_segment_retired(uint64_t grain);
+    int index_gc(u64 grain_start);
     int assign_index_segments();
     // The directory with its first table (uDepot's init: grow() from none).
     int create_directory();
@@ -565,7 +693,19 @@ private:
     // -errno if a segment's metadata, header or footer could not be read
     // (it may hold a footer that must be invalidated) or the invalidation
     // failed.
-    int restore_index(bool* restored);
+    // Why restore_index() did not restore an index (memcache says so at
+    // open).
+    enum class IndexDecline {
+        kNone,          // restored
+        kNoIndex,       // no valid index footer on the device
+        kIncomplete,    // footers found, but not a complete newest index
+        kFormat,        // written in another index format
+        kGeometry,      // another segment size or table geometry
+        kUnreadable,    // a table could not be mapped or read
+        kInconsistent,  // entries that do not match the log's segments
+    };
+    static const char* decline_text(IndexDecline why);
+    int restore_index(bool* restored, IndexDecline* why = nullptr);
     CoroTask<int> tombstone_grains(uint64_t pba, uint64_t seg_ts,
                                    uint64_t* grains);
     template <typename T>

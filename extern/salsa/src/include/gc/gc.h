@@ -60,6 +60,15 @@ void gc_seg_destaged(
 	struct gc      *const gc,
 	struct segment *const seg);
 
+/* Tell the circular GC that something it could not free may be freeable
+ * now (or that a segment entered its queue): wakes it if it waits after a
+ * fruitless lap. Cheap; call it once per such event, never per I/O. */
+void gc_kick(struct gc *const gc);
+
+/* How many times the circular GC went to sleep waiting for a kick: its queue
+ * was empty, or a lap of it freed nothing. Not waits that returned at once. */
+u64 gc_get_kick_waits(const struct gc *const gc);
+
 void gc_seg_relocated(
 	struct gc      *const gc,
 	struct segment *const seg);

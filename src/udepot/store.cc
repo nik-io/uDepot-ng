@@ -528,12 +528,45 @@ void uDepot<IO>::index_seg_md_callback(uint64_t md_grain) {
 // grow() loops on EAGAIN).
 template <typename IO>
 int uDepot<IO>::allocate_index_segment(uint64_t net_grains, u64* grain) {
+    int rc = 0;
     auto hook = index_segment_test_hook.load(std::memory_order_relaxed);
     if (hook) {
-        if (int rc = hook(); rc != 0) return rc;
+        // A refusal for want of a segment (-EAGAIN) or of capacity
+        // (-ENOSPC) goes where salsa's would; any other error is returned.
+        if (int hrc = hook(); hrc != 0) {
+            if (hrc != -EAGAIN && hrc != -ENOSPC) return hrc;
+            rc = -hrc;
+        }
     }
-    int rc = index_ctlr_->allocate_grains_no_wait(net_grains, grain);
-    if (rc != 0) return rc == EAGAIN ? -EAGAIN : -ENOSPC;
+    if (rc == 0) rc = index_ctlr_->allocate_grains_no_wait(net_grains, grain);
+    if (rc == EAGAIN) return -EAGAIN;
+    if (rc == ENOSPC && memcache_ && directory_) {
+        // The live-data cap, not a full device (see try_allocate_grains):
+        // the grow waits for GC and keeps the tables it has gathered, unless
+        // the directory it asks for, at its peak (the old tables and the
+        // new, twice as many), could never fit besides the data GC needs.
+        const uint64_t peak = 3 * uint64_t{directory_->num_tables()};
+        if ((peak + kMcMinDataSegments) * net_grains > cap_grains_) {
+            if (!grow_cap_reported_.exchange(true, std::memory_order_relaxed))
+                std::fprintf(
+                    stderr,
+                    "udepot: memcache store: the directory may not be able to "
+                    "grow past %u %s: growing needs %llu tables' "
+                    "segments at once and %u data segments, more than the "
+                    "live-data cap of %llu grains, and the cap just refused "
+                    "a segment. Puts that need the table to grow fail with "
+                    "ENOSPC. Give the store a larger device.\n",
+                    directory_->num_tables(),
+                    directory_->num_tables() == 1 ? "table" : "tables",
+                    static_cast<unsigned long long>(peak),
+                    kMcMinDataSegments,
+                    static_cast<unsigned long long>(cap_grains_));
+            return -ENOSPC;
+        }
+        capacity_waits_.fetch_add(1, std::memory_order_relaxed);
+        return -EAGAIN;
+    }
+    if (rc != 0) return -ENOSPC;
     // As for user writes (try_allocate_grains): a segment whose metadata
     // could not be written is not used. (Salsa runs the metadata callback
     // inside the allocation: an index allocation fills a segment, so each
@@ -541,6 +574,7 @@ int uDepot<IO>::allocate_index_segment(uint64_t net_grains, u64* grain) {
     if (!seg_md_ok_[scm_->grain_to_seg_idx(*grain)].load(
             std::memory_order_acquire)) {
         index_ctlr_->invalidate_grains(*grain, net_grains, false);
+        mark_index_segment_retired(*grain);
         index_ctlr_->release_grains(*grain, net_grains);
         return -EIO;
     }
@@ -574,8 +608,10 @@ int uDepot<IO>::new_index_table(std::unique_ptr<HashTable>* table) {
         TableRegion::map(get_seg_size() * grain_size_,
                          static_cast<size_t>(net_grains) * grain_size_, grain);
     if (!index_unbacked_) {
-        if (!region.valid())
+        if (!region.valid()) {
             index_ctlr_->invalidate_grains(grain, net_grains, false);
+            mark_index_segment_retired(grain);
+        }
         index_ctlr_->release_grains(grain, net_grains);
     }
     if (!region.valid()) return -ENOMEM;
@@ -613,6 +649,41 @@ void uDepot<IO>::retire_index_table(HashTable& table) {
     if (table.region().grain() == TableRegion::kNoSegment) return;
     index_ctlr_->invalidate_grains(table.region().grain(),
                                    get_seg_size() - seg_md_grains_, false);
+    mark_index_segment_retired(table.region().grain());
+}
+
+// A memcache store's circular GC frees an index segment only once
+// index_gc says so: flag a segment whose grains are invalidated (before it
+// is released to GC's queue, where it may come round at once), and kick GC,
+// which waits when all it has left in its queue are segments it could not
+// free: this one may be freeable now. Once per retired segment.
+template <typename IO>
+void uDepot<IO>::mark_index_segment_retired(uint64_t grain) {
+    if (!memcache_) return;
+    index_retired_[scm_->grain_to_seg_idx(grain)].store(
+        true, std::memory_order_release);
+    scm_->gc_kick();
+}
+
+// The relocation upcall for an index segment, from salsa's GC thread. Only
+// a memcache store's circular GC needs it to succeed (see IndexCtlr).
+// A table's segment is retired once its grains are invalidated; a live
+// table's, and one being installed by a grow, are not, so they stay.
+// No lock: the flag is a plain atomic per segment, as seg_live_.
+template <typename IO>
+int uDepot<IO>::index_gc(u64 grain_start) {
+    if (!memcache_) return ENOSYS;
+    const uint64_t seg = scm_->grain_to_seg_idx(grain_start);
+    const bool freed =
+        seg < num_segments_ &&
+        index_retired_[seg].exchange(false, std::memory_order_acq_rel);
+    const int rc = freed ? 0 : ENOSYS;
+    // (A segment it cannot free here goes back on GC's queue; when all that
+    // is left is such segments GC waits for a kick: see
+    // mark_index_segment_retired and salsa's gc_circular_run.)
+    if (auto hook = index_gc_test_hook.load(std::memory_order_relaxed))
+        hook(seg, rc == 0);
+    return rc;
 }
 
 template <typename IO>
@@ -744,15 +815,40 @@ CoroTask<int> uDepot<IO>::tombstone_grains(uint64_t pba, uint64_t seg_ts,
 }
 
 template <typename IO>
-int uDepot<IO>::restore_index(bool* restored) {
+const char* uDepot<IO>::decline_text(IndexDecline why) {
+    switch (why) {
+    case IndexDecline::kNone: return "restored";
+    case IndexDecline::kNoIndex: return "no persisted index on the device";
+    case IndexDecline::kIncomplete:
+        return "the newest persisted index is incomplete";
+    case IndexDecline::kFormat:
+        return "the persisted index is in another format";
+    case IndexDecline::kGeometry:
+        return "the persisted index is of another table geometry";
+    case IndexDecline::kUnreadable:
+        return "a persisted table could not be read";
+    case IndexDecline::kInconsistent:
+        return "the persisted index does not match the log's segments";
+    }
+    return "?";
+}
+
+template <typename IO>
+int uDepot<IO>::restore_index(bool* restored, IndexDecline* why_out) {
     *restored = false;
+    IndexDecline why_local = IndexDecline::kNoIndex;
+    IndexDecline& why = why_out ? *why_out : why_local;
+    why = IndexDecline::kNoIndex;
     const uint64_t seg_size = get_seg_size();
     const uint64_t net_grains = seg_size - seg_md_grains_;
     const size_t net_bytes = static_cast<size_t>(net_grains) * grain_size_;
     const size_t md_chunk = align_up(kIndexMdBytes, grain_size_);
     // The tables' geometry follows from the segment size, as in uDepot.
     const uint32_t index_bits = HashTable::index_bits_for(net_bytes);
-    if (index_bits == 0 || net_bytes < 2 * md_chunk) return 0;
+    if (index_bits == 0 || net_bytes < 2 * md_chunk) {
+        why = IndexDecline::kGeometry;
+        return 0;
+    }
     const uint64_t total_slots =
         (uint64_t{1} << index_bits) + HashEntry::kHopRange;
 
@@ -823,21 +919,32 @@ int uDepot<IO>::restore_index(bool* restored) {
 
     // Is the newest index complete, and of this segment size's tables?
     bool ok = !set.empty();
+    if (!ok && !found.empty()) why = IndexDecline::kIncomplete;
     uint32_t dir_size = 0;
     if (ok) {
         dir_size = set[0]->hdr.dir_size;
         ok = dir_size != 0 && std::has_single_bit(dir_size) &&
              dir_size <= (1u << DirSnapshot::kMaxTableBits) &&
              set.size() == dir_size;
+        if (!ok) why = IndexDecline::kIncomplete;
     }
     if (ok) {
         std::vector<bool> seen(dir_size, false);
         for (const Found* f : set) {
             const IndexHdr& h = f->hdr;
+            if (h.format != kIndexFormat) {
+                why = IndexDecline::kFormat;
+                ok = false;
+                break;
+            }
+            if (h.index_bits != index_bits || h.slot_nr != total_slots) {
+                why = IndexDecline::kGeometry;
+                ok = false;
+                break;
+            }
             if (h.dir_size != dir_size || h.idx >= dir_size ||
-                h.index_bits != index_bits || h.format != kIndexFormat ||
-                h.slot_nr != total_slots ||
                 seen[h.idx]) {
+                why = IndexDecline::kIncomplete;
                 ok = false;
                 break;
             }
@@ -856,6 +963,7 @@ int uDepot<IO>::restore_index(bool* restored) {
                 static_cast<size_t>(seg_size) * grain_size_, net_bytes,
                 f->grain);
             if (!region.valid()) {
+                why = IndexDecline::kUnreadable;
                 ok = false;
                 break;
             }
@@ -867,7 +975,10 @@ int uDepot<IO>::restore_index(bool* restored) {
                     grain_to_offset(f->grain) + static_cast<off_t>(off));
                 if (r != static_cast<ssize_t>(n)) ok = false;
             }
-            if (!ok) break;
+            if (!ok) {
+                why = IndexDecline::kUnreadable;
+                break;
+            }
             // Cleared on the device below; the next flush writes a new one.
             std::memset(region.base() + region.footer_offset(), 0,
                         kIndexMdBytes);
@@ -879,6 +990,7 @@ int uDepot<IO>::restore_index(bool* restored) {
     // restore does: a live entry holds kv_size grains, a deleted one its
     // tombstone's, read from the tombstone's header.
     std::vector<uint64_t> valid(num_segments_, 0);
+    const bool loaded = ok;
     if (ok) {
         std::vector<std::pair<uint64_t, uint64_t>> tombs;  // (pba, seg)
         auto account = [&](uint64_t pba, uint64_t grains) {
@@ -931,6 +1043,8 @@ int uDepot<IO>::restore_index(bool* restored) {
         }
     }
 
+    if (loaded && !ok) why = IndexDecline::kInconsistent;
+
     // Clear every valid footer before anything is written: neither the
     // index restored here nor one passed over may be restored again once
     // the log moves on. Only the footer: with grains over 512 B its grain
@@ -957,28 +1071,80 @@ int uDepot<IO>::restore_index(bool* restored) {
     directory_ = new Directory(rcu_, index_tables_, std::move(tables));
     // The live data and the tables it was persisted with fitted the store
     // when it shut down, so they fit now; a failure means a corrupt index.
-    for (const Found* f : set)
-        if (scm_->restore_grain_range(f->grain, net_grains,
-                                      index_ctlr_->get_ctlr_id()) != 0)
+    for (const Found* f : set) {
+        const int rrc = scm_->restore_grain_range(
+            f->grain, net_grains, index_ctlr_->get_ctlr_id());
+        if (rrc != 0) {
+            std::fprintf(stderr,
+                         "udepot: the persisted index's table segments "
+                         "cannot be restored to the allocator (%s): the "
+                         "device has more live data than this store's "
+                         "capacity allows, or the segments are not free. "
+                         "Open it as it was created.\n",
+                         std::strerror(rrc));
             return -EIO;
-    for (uint64_t seg = 0; seg < num_segments_; ++seg) {
-        if (data_ts[seg] == 0) continue;
+        }
+    }
+    // Salsa's circular GC cleans segments in the order they are restored,
+    // so a memcache store restores them oldest first, as its eviction runs
+    // oldest first (a KV store's order is left as it was).
+    std::vector<uint64_t> order;
+    for (uint64_t seg = 0; seg < num_segments_; ++seg)
+        if (data_ts[seg] != 0) order.push_back(seg);
+    if (memcache_)
+        std::stable_sort(order.begin(), order.end(),
+                         [&](uint64_t a, uint64_t b) {
+                             return data_ts[a] < data_ts[b];
+                         });
+    for (const uint64_t seg : order) {
         seg_timestamps_[seg].store(data_ts[seg], std::memory_order_relaxed);
         seg_md_ok_[seg].store(true, std::memory_order_relaxed);
         seg_live_[seg].store(true, std::memory_order_relaxed);
-        if (valid[seg] != 0 &&
-            scm_->restore_grain_range(seg * seg_size, valid[seg],
-                                      get_ctlr_id()) != 0)
+        if (valid[seg] == 0) continue;
+        const int rrc = scm_->restore_grain_range(seg * seg_size, valid[seg],
+                                                  get_ctlr_id());
+        if (rrc != 0) {
+            // ENOSPC: salsa refuses live data past the store's capacity.
+            // The index is fine: it was written by a store with a higher
+            // cap (a memcache store's is the device less a few segments, a
+            // KV store's the device less its overprovision). Anything else
+            // (EINVAL: the segment is not free) is reported as it is.
+            if (rrc == ENOSPC)
+                std::fprintf(
+                    stderr,
+                    "udepot: the persisted index holds more live data than "
+                    "this %s store may (live-data cap %llu grains): it was "
+                    "written by a store with a higher cap, probably the "
+                    "other mode (StoreConfig::memcache). The store cannot "
+                    "be opened like this. As any open does, it has cleared "
+                    "the index's footers, so the store's index is gone: "
+                    "opened as it was created it now %s.\n",
+                    memcache_ ? "memcache" : "KV",
+                    static_cast<unsigned long long>(
+                        scm_->get_max_capacity()),
+                    memcache_ ? "recovers from the log (a KV store's)"
+                              : "starts empty (a memcache store's)");
+            else
+                std::fprintf(
+                    stderr,
+                    "udepot: the persisted index's live data in segment "
+                    "%llu cannot be restored to the allocator (%s). The "
+                    "store cannot be opened; open it as it was created.\n",
+                    static_cast<unsigned long long>(seg),
+                    std::strerror(rrc));
             return -EIO;
+        }
     }
     if (max_data_ts > 0) restore_seg_alloc_nr(max_data_ts);
     *restored = true;
+    why = IndexDecline::kNone;
     return 0;
 }
 
 template <typename IO>
 int uDepot<IO>::open(const StoreConfig& config) {
     grain_size_ = config.grain_size;
+    memcache_ = config.memcache;
 
     if constexpr (requires { io_.set_queue_depth(config.queue_depth); })
         io_.set_queue_depth(config.queue_depth);
@@ -1001,21 +1167,25 @@ int uDepot<IO>::open(const StoreConfig& config) {
     salsa::salsa_dev_md dev_md{};
     uint64_t segment_size = config.segment_size;
 
+    // Every store on a device needs its own seed: records and segment
+    // metadata are only told apart from an earlier store's by it.
+    // uDepot used the monotonic clock's seconds, which repeats for two
+    // stores created within a second (or across reboots).
+    auto new_seed = [] {
+        std::random_device rd;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        return (static_cast<uint64_t>(rd()) << 32 | rd()) ^
+               static_cast<uint64_t>(ts.tv_nsec) ^
+               (static_cast<uint64_t>(ts.tv_sec) << 20);
+    };
+
     if (!config.force_destroy && validate_dev_md(&dev_md)) {
         restored = true;
         seed_ = dev_md.seed;
         segment_size = dev_md.segment_size;
     } else {
-        // Every store on a device needs its own seed: records and segment
-        // metadata are only told apart from an earlier store's by it.
-        // uDepot used the monotonic clock's seconds, which repeats for two
-        // stores created within a second (or across reboots).
-        std::random_device rd;
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        seed_ = (static_cast<uint64_t>(rd()) << 32 | rd()) ^
-                static_cast<uint64_t>(ts.tv_nsec) ^
-                (static_cast<uint64_t>(ts.tv_sec) << 20);
+        seed_ = new_seed();
     }
 
     // The default as uDepot's, a segment for a 2^29-byte table (it adds 2
@@ -1029,10 +1199,24 @@ int uDepot<IO>::open(const StoreConfig& config) {
     }
 
     // Relocating GC with uDepot's non-memcache parameters
-    // (uDepotSalsa::init: init_local(14, 2, 4)).
-    static constexpr uint32_t kGcType = 14;
-    static constexpr uint32_t kGcLowWm = 2;
-    static constexpr uint32_t kGcHighWm = 4;
+    // (uDepotSalsa::init: init_local(14, 2, 4)); a memcache store takes the
+    // *MC runtimes': init_local(1, 20, 40), the circular-buffer GC
+    // (udepot-lsa.cc:338-380). The watermarks count free segments. Legacy's
+    // overprovision 40 per mille there is replaced, by the maintainer's
+    // decision, by a live-data cap of the device less kMcGcLowWm / 2
+    // segments: with the cap a percentage, a device of over ~500 segments
+    // reached it with more than the low watermark still free, so no GC was
+    // due and puts failed with ENOSPC. Under this cap, live data cannot
+    // reach it before GC has been due for kMcGcLowWm / 2 segments (see
+    // docs/architecture.md, §9).
+    static constexpr uint32_t kMcGcType = 1;
+    static constexpr uint32_t kMcGcLowWm = 20;
+    static constexpr uint32_t kMcGcHighWm = 40;
+    static constexpr uint32_t kMcCapSegments = kMcGcLowWm / 2;
+    const uint32_t gc_type = memcache_ ? kMcGcType : 14;
+    const uint32_t gc_low_wm = memcache_ ? kMcGcLowWm : 2;
+    const uint32_t gc_high_wm = memcache_ ? kMcGcHighWm : 4;
+    const uint32_t overprovision = config.overprovision;
 
     // As uDepot's check_dev_size: the device metadata sits in the tail past
     // the last whole segment, so there has to be one, or the last segment's
@@ -1058,6 +1242,12 @@ int uDepot<IO>::open(const StoreConfig& config) {
     // it smaller.
     const uint64_t wanted_segment = segment_size;
     const bool wanted_default = fitted_table != 0;
+
+    // Why the last Scm::init attempt failed, for a store that cannot be
+    // halved.
+    uint64_t mc_cap_grains = 0, mc_min_grains = 0;
+    bool mc_cap_too_small = false;
+    int init_err = 0;
 
     // Halving retry loop (matches uDepot): if the segment size is too
     // large for the device, halve and try again.
@@ -1111,7 +1301,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
                  static_cast<unsigned long>(dev_size),
                  grain_size_,
                  static_cast<unsigned long>(segment_size),
-                 kGcType, kGcLowWm, kGcHighWm);
+                 gc_type, gc_low_wm, gc_high_wm);
 
         char* argv[16];
         int argc = 0;
@@ -1122,12 +1312,79 @@ int uDepot<IO>::open(const StoreConfig& config) {
         }
 
         scm_ = new salsa::Scm();
-        overprovision_ = config.overprovision;
-        rc = scm_->init(argc, argv, config.overprovision);
-        if (rc == 0) break;
+        overprovision_ = overprovision;
+        // A memcache store's live data is capped at the device less
+        // kMcCapSegments segments, exactly, in grains (0: Scm derives it
+        // from the overprovision, as for a KV store). Not a device that
+        // size at all: as if salsa refused it.
+        uint64_t cap_grains = 0;
+        if (memcache_ && total_grains_ > kMcCapSegments * segment_size)
+            cap_grains = total_grains_ - kMcCapSegments * segment_size;
+        mc_min_grains = (kMcMinTableSegments + kMcMinDataSegments) *
+                        (segment_size - seg_md_grains_);
+        mc_cap_grains = cap_grains;
+        mc_cap_too_small = memcache_ && cap_grains < mc_min_grains;
+        rc = mc_cap_too_small
+                 ? EINVAL
+                 : scm_->init(argc, argv, overprovision, cap_grains);
+        init_err = rc;
+        if (rc == 0) {
+            cap_grains_ = cap_grains;
+            break;
+        }
 
         delete scm_;
         scm_ = nullptr;
+        if (restored) {
+            // An existing store's geometry is fixed by its device metadata
+            // (the tail check above refuses to halve it too): halving would
+            // make every segment's metadata invalid, and the open would go
+            // on to wipe the store or scan the log over the wrong
+            // geometry. The device is not touched.
+            char why[256];
+            if (mc_cap_too_small)
+                std::snprintf(
+                    why, sizeof(why),
+                    "its live-data cap (the device less %u segments, plus "
+                    "its tail) is %llu grains, under the %llu a memcache "
+                    "store needs for a table and %u data segments; that is "
+                    "at least %llu segments of this size",
+                    kMcCapSegments,
+                    static_cast<unsigned long long>(mc_cap_grains),
+                    static_cast<unsigned long long>(mc_min_grains),
+                    kMcMinDataSegments,
+                    static_cast<unsigned long long>(
+                        kMcCapSegments + kMcMinTableSegments +
+                        kMcMinDataSegments));
+            else if (init_err == EINVAL && memcache_)
+                std::snprintf(
+                    why, sizeof(why),
+                    "salsa refuses its geometry (EINVAL; its spare-segment "
+                    "check passes under a memcache store's cap, so this is "
+                    "another of salsa's checks)");
+            else if (init_err == EINVAL)
+                std::snprintf(
+                    why, sizeof(why),
+                    "salsa refuses it at this overprovision: it needs 4 "
+                    "spare segments besides the 2 it reserves for GC");
+            else
+                std::snprintf(why, sizeof(why), "salsa failed to start (%s)",
+                              std::strerror(init_err));
+            std::fprintf(
+                stderr,
+                "udepot: the existing store, %llu segments of %llu KiB, "
+                "cannot be opened as a %s store (overprovision %u per "
+                "mille): %s. A store keeps the geometry it was created "
+                "with. Open it as it was created (StoreConfig::memcache, "
+                "StoreConfig::overprovision); the device has not been "
+                "touched.\n",
+                static_cast<unsigned long long>(total_grains_ / segment_size),
+                static_cast<unsigned long long>(segment_size * grain_size_ >>
+                                                10),
+                memcache_ ? "memcache" : "KV", overprovision, why);
+            io_.close();
+            return init_err == ENOMEM ? -ENOMEM : -EINVAL;
+        }
         if (fitted_table != 0) {
             fitted_table /= 2;
             segment_size = fitted_table >= 4096
@@ -1137,6 +1394,14 @@ int uDepot<IO>::open(const StoreConfig& config) {
             segment_size /= 2;
         }
         if (segment_size <= 1) {
+            if (mc_cap_too_small)
+                std::fprintf(
+                    stderr,
+                    "udepot: memcache store: the device is too small: its "
+                    "live-data cap (the device less %u segments) cannot hold "
+                    "a table and %u data segments at any segment size. Give "
+                    "it a larger device.\n",
+                    kMcCapSegments, kMcMinDataSegments);
             io_.close();
             return -EINVAL;
         }
@@ -1160,7 +1425,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
             stderr,
             "udepot: %s segments of %llu KiB (index tables of %llu KiB) do "
             "not fit a %llu KiB device: too few of them fit, or none of it is "
-            "left past the last for the device metadata. Using segments of "
+            "left past the last for the device metadata%s. Using segments of "
             "%llu KiB, whose tables hold %llu KiB (%llu%% of the segment). "
             "Smaller tables fill sooner, so the directory grows sooner and "
             "more often. Give the store a larger device, or ask for smaller "
@@ -1170,6 +1435,10 @@ int uDepot<IO>::open(const StoreConfig& config) {
             static_cast<unsigned long long>(wanted_segment * grain_size_ >> 10),
             static_cast<unsigned long long>(table_bytes(wanted_segment) >> 10),
             static_cast<unsigned long long>(dev_size >> 10),
+            memcache_ ? ", or (memcache) the live-data cap, the device less "
+                        "10 segments, leaves less than a table and 4 data "
+                        "segments"
+                      : "",
             static_cast<unsigned long long>(segment_size * grain_size_ >> 10),
             static_cast<unsigned long long>(got_table >> 10),
             static_cast<unsigned long long>(
@@ -1227,7 +1496,9 @@ int uDepot<IO>::open(const StoreConfig& config) {
     seg_timestamps_ = std::make_unique<std::atomic<uint64_t>[]>(num_segments_);
     seg_md_ok_ = std::make_unique<std::atomic<bool>[]>(num_segments_);
     seg_live_ = std::make_unique<std::atomic<bool>[]>(num_segments_);
+    index_retired_ = std::make_unique<std::atomic<bool>[]>(num_segments_);
     for (uint64_t i = 0; i < num_segments_; ++i) {
+        index_retired_[i].store(false, std::memory_order_relaxed);
         seg_timestamps_[i].store(0, std::memory_order_relaxed);
         seg_md_ok_[i].store(false, std::memory_order_relaxed);
         seg_live_[i].store(false, std::memory_order_relaxed);
@@ -1240,8 +1511,44 @@ int uDepot<IO>::open(const StoreConfig& config) {
     if (restored) {
         // As uDepot's init: the persisted index after a clean shutdown,
         // the log otherwise.
-        rc = restore_index(&index_restored_);
-        if (rc == 0 && !index_restored_) rc = crash_recovery();
+        IndexDecline decline = IndexDecline::kNone;
+        rc = restore_index(&index_restored_, &decline);
+        if (rc == 0 && !index_restored_) {
+            if (memcache_) {
+                // Not shut down cleanly. The log cannot be replayed: GC
+                // evicts without writing anything, and freed segments are
+                // reused out of age order, so a scan could bring back an
+                // older value of a key whose newer copy's segment was
+                // reused, or a deleted key whose tombstone was evicted.
+                // Start as a new store does: a new seed, so no old record
+                // or segment metadata is ever taken for a new one, fresh
+                // device metadata and directory.
+                if (decline == IndexDecline::kNoIndex)
+                    std::fprintf(
+                        stderr,
+                        "udepot: memcache store was not shut down cleanly "
+                        "(no persisted index): starting empty. Its log "
+                        "cannot be replayed safely after evictions, which "
+                        "write nothing and reuse segments out of age order: "
+                        "a scan could bring back a stale value or a deleted "
+                        "key. Every entry it held is lost.\n");
+                else
+                    std::fprintf(
+                        stderr,
+                        "udepot: memcache store: its persisted index cannot "
+                        "be restored (%s): starting empty. Its log cannot be "
+                        "replayed safely after evictions, which write "
+                        "nothing and reuse segments out of age order: a scan "
+                        "could bring back a stale value or a deleted key. "
+                        "Every entry it held is lost.\n",
+                        decline_text(decline));
+                seed_ = new_seed();
+                rc = persist_dev_md();
+                if (rc == 0) rc = create_directory();
+            } else {
+                rc = crash_recovery();
+            }
+        }
         if (rc != 0) return fail(rc);
     } else {
         rc = persist_dev_md();
@@ -1274,6 +1581,49 @@ int uDepot<IO>::open(const StoreConfig& config) {
         space_stop_ = false;
     }
     space_waker_ = std::thread(&uDepot::space_waker_loop, this);
+    // Said once the open has succeeded, so a failed open does not claim a
+    // memcache store.
+    if (memcache_) {
+        std::fprintf(
+            stderr,
+            "udepot: memcache store: GC evicts the entries of the segments "
+            "it cleans, oldest segment first, instead of relocating them: "
+            "it reads each victim segment to find its keys and writes "
+            "nothing, and an evicted entry is gone. Circular-buffer GC "
+            "(gc_type %u), started at %u free segments and run until %u. "
+            "Live data is capped at the device (its tail included) less %u "
+            "segments, so GC is always due before a put can be refused for "
+            "space; a put the cap does refuse waits for GC "
+            "(StoreConfig::overprovision is not used; legacy's 40 per mille "
+            "is replaced by this cap). On %llu segments of %llu KiB. After a "
+            "crash the store opens empty; a clean close keeps its entries, "
+            "unless its index cannot be persisted (close says so).\n",
+            gc_type, gc_low_wm, gc_high_wm, kMcCapSegments,
+            static_cast<unsigned long long>(total_grains_ /
+                                            scm_->get_seg_size()),
+            static_cast<unsigned long long>(scm_->get_seg_size() *
+                                            grain_size_ >> 10));
+        // GC runs until gc_high_wm segments are free; some can never be:
+        // the tables' (one for a new store, the restored count after a
+        // clean reopen), and two more salsa keeps (measured: with 128 KiB
+        // segments GC rests at 43 segments and not at 42 with one table,
+        // and each table the directory grows raises it by one).
+        const uint64_t floor_segs =
+            gc_high_wm + kMcNeverFreeSegments + directory_->num_tables();
+        if (total_grains_ / scm_->get_seg_size() < floor_segs)
+            std::fprintf(
+                stderr,
+                "udepot: memcache store: the device has fewer segments than "
+                "%llu (GC's high watermark of %u, the directory's table "
+                "segments and %u more that are never free), so GC can never "
+                "rest: it "
+                "evicts every segment it can reach, continuously, and the "
+                "store holds little; every table the directory grows raises "
+                "the floor by one. Give it a larger device (or a smaller "
+                "StoreConfig::segment_size).\n",
+                static_cast<unsigned long long>(floor_segs), gc_high_wm,
+                kMcNeverFreeSegments);
+    }
     return 0;
 }
 
@@ -1289,7 +1639,9 @@ void uDepot<IO>::close() {
         // own controller. GC relocates records, updating the tables, so they
         // are written back only once it has stopped; they hold their
         // segments already, so nothing needs GC to free one. If they cannot
-        // be written, the next open scans the log, as after a crash.
+        // be written, the next open scans the log, as after a crash (a
+        // memcache store starts empty instead, and its GC evicts rather
+        // than relocates).
         scm_->exit_threads();
         // GC is stopped, so no more segments get deferred; return the
         // deferred ones to salsa before its controllers shut down.
@@ -1303,9 +1655,11 @@ void uDepot<IO>::close() {
 
         int frc = flush_index();
         if (frc != 0)
-            std::fprintf(stderr, "udepot: index not persisted (%s); the "
-                         "next open recovers from the log\n",
-                         std::strerror(-frc));
+            std::fprintf(stderr, "udepot: index not persisted (%s); %s\n",
+                         std::strerror(-frc),
+                         memcache_ ? "the next open starts empty: this "
+                                     "memcache store's entries are lost"
+                                   : "the next open recovers from the log");
 
         index_ctlr_->shutdown();
         index_ctlr_.reset();
@@ -1319,6 +1673,7 @@ void uDepot<IO>::close() {
     seg_timestamps_.reset();
     seg_md_ok_.reset();
     seg_live_.reset();
+    index_retired_.reset();
     num_segments_ = 0;
 
     delete directory_;
@@ -1332,6 +1687,15 @@ int uDepot<IO>::try_allocate_grains(uint64_t count, uint64_t* grain) {
     int rc = salsa::SalsaCtlr::allocate_grains_no_wait(
         static_cast<u64>(count), &grain_out);
     if (rc == EAGAIN) return -EAGAIN;
+    // A memcache store's live data is capped at the device less a few
+    // segments (open()), and GC is always due by then: salsa's refusal is
+    // GC not having caught up yet (several writers can fill the few
+    // segments between GC being due and the cap faster than it evicts),
+    // not a full device. The put waits for GC, as for no free segment.
+    if (rc == ENOSPC && memcache_) {
+        capacity_waits_.fetch_add(1, std::memory_order_relaxed);
+        return -EAGAIN;
+    }
     if (rc != 0) return -ENOSPC;
     // A segment whose metadata could not be written would not be found by
     // crash recovery, so nothing may be acknowledged from it.
@@ -1499,6 +1863,19 @@ int uDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
         const HashEntry entry = table.entry_at(hash, grain);
         if (entry.empty()) return 0;
 
+        if (memcache_) {
+            // As uDepot's local_gc_callback_mc (udepot-lsa.cc:889-915):
+            // whatever the directory points at, live or deleted, is
+            // dropped and its grains invalidated; nothing is relocated.
+            // A put or del of the key cannot commit meanwhile: its stripes
+            // are held. The store keeps no live-entry or byte counters
+            // (del() keeps none either), so the table entry and salsa's
+            // valid-grain count are all there is to keep consistent.
+            table.remove_locked(hash, grain);
+            invalidate_grains(grain, entry_grains, true);
+            return 0;
+        }
+
         if (entry.deleted() && drop_tombstones) {
             // As uDepot purged deleted entries at GC; only when no older
             // segment remains, since an older copy of the key would
@@ -1583,7 +1960,8 @@ int uDepot<IO>::gc_record(uint64_t grain, uint64_t entry_grains,
 }
 
 // GC callback — called from salsa's GC thread when it reclaims a segment.
-// Relocating GC, as uDepot's non-memcache runtimes used: every record the
+// Relocating GC (a memcache store evicts instead, in gc_record), as
+// uDepot's non-memcache runtimes used: every record the
 // directory still references moves out, then the segment is freed.
 template <typename IO>
 int uDepot<IO>::gc_callback(u64 grain_start, u64 grain_nr) {
@@ -1592,15 +1970,21 @@ int uDepot<IO>::gc_callback(u64 grain_start, u64 grain_nr) {
 
     // A tombstone only guards against older copies of its key, which can
     // live only in older segments.
+    // (A memcache store evicts instead, and never drops by it.)
     bool drop_tombstones = true;
-    for (uint64_t i = 0; i < num_segments_ && drop_tombstones; ++i) {
+    for (uint64_t i = 0; i < num_segments_ && drop_tombstones && !memcache_;
+         ++i) {
         if (i != victim && seg_live_[i].load(std::memory_order_acquire) &&
             seg_timestamps_[i].load(std::memory_order_acquire) < victim_ts)
             drop_tombstones = false;
     }
 
     // Net segment excludes the per-segment metadata grains at the tail.
-    // As uDepot (which maps the victim): one read, then walk it in memory.
+    // One read of the whole net segment, then walk it in memory. (uDepot
+    // maps the victim read-only instead and faults in only the pages its walk
+    // touches, so it skips the pages inside a value larger than a page; not
+    // possible on every backend, SPDK has no mmap. See
+    // docs/TODO-memcache-eviction.md.)
     uint64_t end_grain = grain_start + grain_nr - seg_md_grains_;
     IoBuffer seg_buf;
     int rc = read_segment(grain_start, end_grain - grain_start, seg_buf);

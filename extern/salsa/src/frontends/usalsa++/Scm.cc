@@ -26,7 +26,7 @@ namespace salsa {
 Scm::Scm() : scm_(nullptr), used_streams_(0U), used_capacity_(0UL), max_capacity_(0UL), max_capacity_reloc_(0UL) {}
 
 int
-Scm::init(int argc, char **argv, u32 overprovision)
+Scm::init(int argc, char **argv, u32 overprovision, u64 max_capacity_grains)
 {
 	scm_parameters scm_cfg;
 	int err = scm_usr_init_cfg(argv, argc, &scm_cfg);
@@ -37,7 +37,10 @@ Scm::init(int argc, char **argv, u32 overprovision)
 		goto fail0;
 	}
 
-	max_capacity_ = scm_cfg.dev_size_raw / scm_cfg.grain_size * (1000ULL - overprovision) / 1000ULL;
+	// A caller that knows its capacity in grains (a per-mille overprovision
+	// cannot express a few segments on a large device) gives it directly.
+	max_capacity_ = 0 != max_capacity_grains ? max_capacity_grains :
+		scm_cfg.dev_size_raw / scm_cfg.grain_size * (1000ULL - overprovision) / 1000ULL;
 	max_capacity_reloc_ = max_capacity_ + reloc_spare;
 
 	if (!has_enough_spare_segments(seg_aligned_dev_size, scm_cfg.grain_size,
@@ -214,6 +217,18 @@ Scm::set_defer_free_seg(void (*const fn)(void *arg, struct segment *seg),
 {
 	scm_->defer_free_arg = arg;
 	scm_->defer_free_seg = fn;
+}
+
+void
+Scm::gc_kick()
+{
+	::gc_kick(scm_->gc);
+}
+
+u64
+Scm::gc_waits() const
+{
+	return gc_get_kick_waits(scm_->gc);
 }
 
 void

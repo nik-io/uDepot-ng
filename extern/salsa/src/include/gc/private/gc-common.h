@@ -61,6 +61,13 @@ struct gc {
 	os_atomic32_t                   exit;
 	const enum gc_type              gc_type;
 	os_waitqueue_head_t             low_watermark_waitq;
+	/* Bumped (and low_watermark_waitq broadcast) by gc_kick(): a segment
+	 * entered the circular GC's queue, or the frontend says one in it may
+	 * be freeable now. The circular GC, after a lap of its queue in which
+	 * nothing could be freed, waits for it to change. */
+	os_atomic64_t                   kick_gen;
+	/* How many times the circular GC slept waiting for that. */
+	os_atomic64_t                   kick_waits;
 	const u64                       LOW_WATERMARK;
 	const u64                       HIGH_WATERMARK;
 
