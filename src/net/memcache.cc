@@ -13,6 +13,7 @@
 #include <ctime>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
 #include <optional>
 #include <string_view>
 #include <signal.h>
@@ -46,6 +47,10 @@ static constexpr std::string_view kError = "ERROR\r\n";
 static constexpr std::string_view kClientError = "CLIENT_ERROR ";
 static constexpr std::string_view kServerError = "SERVER_ERROR ";
 static constexpr std::string_view kExists = "EXISTS\r\n";
+// The server's threads are named with this prefix (at most 15 characters in
+// all: the accept thread "udepot-mc-acc", each worker "udepot-mc-w<N>"), so
+// `top -H` and the tests can tell them from the rest of the process.
+#define UDEPOT_MC_THREAD_PREFIX "udepot-mc-"
 static constexpr int kSendFlags = MSG_NOSIGNAL;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -884,6 +889,9 @@ int MemcacheServer<Store>::start(const Config& config) {
         w->tx = sv[1];
         Worker* wp = w.get();
         w->es.set_poll_hook([wp] { return wp->poll(); });
+        char name[32];  // set_thread_name cuts it to the 15 a thread name takes
+        std::snprintf(name, sizeof(name), UDEPOT_MC_THREAD_PREFIX "w%u", i);
+        w->es.set_thread_name(name);
         workers_.push_back(std::move(w));
         if ((err = wp->es.init()) != 0) {
             std::fprintf(stderr,
@@ -965,6 +973,7 @@ void MemcacheServer<Store>::stop() {
 
 template <typename Store>
 void MemcacheServer<Store>::accept_loop() {
+    pthread_setname_np(pthread_self(), UDEPOT_MC_THREAD_PREFIX "acc");
     while (running_.load(std::memory_order_relaxed)) {
         struct sockaddr_in cli_addr{};
         socklen_t cli_len = sizeof(cli_addr);

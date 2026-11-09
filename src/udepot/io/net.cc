@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -242,6 +243,8 @@ void EpollState::shutdown_all() {
 
 void EpollState::poller_loop() {
     struct epoll_event events[kMaxEvents];
+    if (thread_name_[0] != '\0')
+        pthread_setname_np(pthread_self(), thread_name_);
 
     while (running_.load(std::memory_order_acquire)) {
         if (poll_hook_ && !poll_hook_()) break;

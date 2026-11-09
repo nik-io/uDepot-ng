@@ -891,6 +891,16 @@ unsigned live_io_contexts() {
 #endif
 }
 
+// Whether the fds above `fds_before` are exactly the io_uring rings (each
+// an fd) that exist above `base`: the store's own threads' rings, which
+// outlive the server. AIO contexts are not fds.
+template <typename IO>
+bool fds_match_contexts(size_t fds_before, unsigned base) {
+    const unsigned extra = live_io_contexts<IO>() - base;
+    const size_t extra_fds = std::is_same_v<IO, udepot::AioIO> ? 0 : extra;
+    return open_fds() == fds_before + extra_fds;
+}
+
 // `n` sets then `n` gets of keys of its own; whether every one was right.
 bool sets_and_gets(McClient& client, int id, int n) {
     for (int i = 0; i < n; ++i) {
@@ -1136,13 +1146,33 @@ namespace {
 using udepot::EpollState;
 using udepot::MemcacheTestHooks;
 
-size_t thread_count() {
-    std::ifstream f("/proc/self/status");
-    std::string line;
-    while (std::getline(f, line))
-        if (line.rfind("Threads:", 0) == 0)
-            return std::stoul(line.substr(8));
-    return 0;
+// The server's own threads: those whose name the server set (the accept
+// thread "udepot-mc-acc", each worker "udepot-mc-w<N>"). Counting the
+// process's threads instead measured threads that are not the server's too
+// (the store's RCU reclaimer starts lazily) and ones the kernel still counts
+// after pthread_join returned, until it reaps them.
+size_t server_threads() {
+    size_t n = 0;
+    for (const auto& e : std::filesystem::directory_iterator("/proc/self/task")) {
+        std::ifstream f(e.path() / "comm");
+        std::string comm;
+        std::getline(f, comm);
+        if (comm.rfind("udepot-mc-", 0) == 0) ++n;
+    }
+    return n;
+}
+
+// Whether the server's thread count reaches `n` (within 2 s, which absorbs
+// the kernel's lag in reaping a joined thread; a leaked thread never goes
+// away, so it still fails). Zero is checked again after a moment: a thread
+// that was just started and is not yet named would otherwise hide.
+bool server_threads_reach(size_t n) {
+    if (!wait_until([&] { return server_threads() == n; },
+                    std::chrono::seconds(2)))
+        return false;
+    if (n != 0) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return server_threads() == 0;
 }
 
 // Clears every seam, whatever the test did.
@@ -1274,7 +1304,7 @@ TEST_F(MemcacheTest, FailedStartRollsBackAndSaysSo) {
     mc_config.port = 0;
     mc_config.workers = 3;
     const size_t fds_before = open_fds();
-    const size_t threads_before = thread_count();
+    ASSERT_TRUE(server_threads_reach(0)) << "server threads after stop()";
 
     struct Case {
         const char* what;
@@ -1307,20 +1337,23 @@ TEST_F(MemcacheTest, FailedStartRollsBackAndSaysSo) {
         EXPECT_EQ(server_.workers(), 0u);
         EXPECT_EQ(server_.port(), 0u) << "port_ not reset";
         EXPECT_EQ(open_fds(), fds_before);
-        EXPECT_EQ(thread_count(), threads_before);
+        EXPECT_TRUE(server_threads_reach(0)) << "threads left by a failed start";
         MemcacheTestHooks::socketpair_test_hook = nullptr;
         EpollState::init_test_hook = nullptr;
 
         // And the server can be started afterwards.
         ASSERT_EQ(server_.start(mc_config), 0);
         EXPECT_EQ(server_.workers(), 3u);
+        // The accept thread and the 3 workers, each named by the server.
+        EXPECT_TRUE(server_threads_reach(4))
+            << "server threads: " << server_threads();
         McClient client;
         ASSERT_TRUE(client.connect(server_.port()));
         EXPECT_TRUE(sets_and_gets(client, 5, 2));
         client.close();
         server_.stop();
         EXPECT_EQ(open_fds(), fds_before);
-        EXPECT_EQ(thread_count(), threads_before);
+        EXPECT_TRUE(server_threads_reach(0)) << "threads left by stop()";
     }
 }
 
@@ -1395,10 +1428,14 @@ TYPED_TEST(MemcacheWakerTest, ConnectionFinishingOnTheWakerThreadIsReclaimed) {
     // The workers' contexts are gone; what is left is the store's own
     // threads' (its waker, GC), which live as long as the store. An io_uring
     // ring is an fd, so those account for the extra fds exactly.
-    const unsigned extra = live_io_contexts<TypeParam>() - base;
-    EXPECT_LE(extra, 2u);
-    const size_t extra_fds = std::is_same_v<TypeParam, udepot::AioIO> ? 0 : extra;
-    EXPECT_EQ(open_fds(), fds_before + extra_fds) << "fds leaked";
+    EXPECT_LE(live_io_contexts<TypeParam>() - base, 2u);
+    // The store's own threads (GC) may still be starting a ring of their own
+    // (an fd) between two readings, so read both together until they agree;
+    // a leaked fd never does.
+    EXPECT_TRUE(wait_until([&] { return fds_match_contexts<TypeParam>(fds_before, base); },
+                           std::chrono::seconds(5)))
+        << "fds: " << open_fds() << " before: " << fds_before
+        << " contexts above base: " << live_io_contexts<TypeParam>() - base;
 }
 
 namespace {
@@ -1545,8 +1582,9 @@ TYPED_TEST(MemcacheWakerTest, StopWaitsForAConnectionParkedInSpaceWait) {
     }
     EXPECT_EQ(this->server_.connections(), 0u);
     EXPECT_EQ(this->server_.workers(), 0u);
-    const unsigned extra = live_io_contexts<TypeParam>() - base;
-    EXPECT_LE(extra, 2u);  // the store's own waker / GC threads
-    const size_t extra_fds = std::is_same_v<TypeParam, udepot::AioIO> ? 0 : extra;
-    EXPECT_EQ(open_fds(), fds_before + extra_fds);
+    EXPECT_LE(live_io_contexts<TypeParam>() - base, 2u);  // the store's own threads
+    EXPECT_TRUE(wait_until([&] { return fds_match_contexts<TypeParam>(fds_before, base); },
+                           std::chrono::seconds(5)))
+        << "fds: " << open_fds() << " before: " << fds_before
+        << " contexts above base: " << live_io_contexts<TypeParam>() - base;
 }

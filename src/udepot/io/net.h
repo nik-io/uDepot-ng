@@ -101,6 +101,7 @@ class EpollState {
     std::thread poller_;
     std::atomic<bool> running_{false};
     std::function<bool()> poll_hook_;  // set before init(); poller thread only
+    char thread_name_[16] = {};        // set before init(); poller thread only
 
     void notify_maybe(int fd, EpollOpType ty);
 
@@ -120,6 +121,17 @@ public:
     // runs on the one thread that owns that state.
     void set_poll_hook(std::function<bool()> hook) {
         poll_hook_ = std::move(hook);
+    }
+
+    // Before init(): names the poller thread (Linux limits a name to 15
+    // characters; a longer one is cut), set from inside the thread at the
+    // top of its loop, so tools and tests can tell a server's threads from
+    // the rest of the process's.
+    void set_thread_name(const char* name) {
+        size_t i = 0;
+        for (; i + 1 < sizeof(thread_name_) && name[i] != '\0'; ++i)
+            thread_name_[i] = name[i];
+        thread_name_[i] = '\0';
     }
 
     int init();
