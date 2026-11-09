@@ -88,6 +88,12 @@ public:
     // Returns whether any of this thread's I/O is still outstanding.
     static bool poll_thread();
 
+    // AIO contexts that exist now, across all threads: one per thread that
+    // has done AIO, released when the thread exits. Each reserves its
+    // depth against fs.aio-max-nr, so this is what a server that adds
+    // threads with its connections would run out of.
+    static unsigned live_contexts() noexcept;
+
     // Test seam, never set in production: called before each io_setup;
     // returning -errno fails it with that, as the kernel would with every
     // context taken (-EAGAIN). 0 lets it go on.

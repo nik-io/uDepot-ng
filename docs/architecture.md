@@ -251,7 +251,7 @@ What remains lives in `io/`:
   once the starting thread polls, as a TRT task finishes on its own
   scheduler thread. `store.h` states this on the API. A thread that
   resumes operations it did not start (the space waker, a
-  memcache connection's epoll poller) polls its own queue too: their I/O is
+  memcache worker's epoll poller) polls its own queue too: their I/O is
   now its own. One thread per `SpdkIO` polls the controllers' admin queues
   (~10x/s), which keeps NVMe-oF keep-alives flowing.
 
@@ -354,8 +354,9 @@ Per-thread queues cost kernel resources per thread, as in uDepot: an AIO
 context reserves its depth against the system-wide `fs.aio-max-nr` (65536
 by default, so 64 contexts of the default 1024 can exist at once across
 the system). A thread that cannot get a context fails its I/O with
-`-EAGAIN`. Many threads doing AIO at once (the memcache server runs two per
-connection) need a smaller `queue_depth` or a larger `aio-max-nr`. SPDK's own pool size
+`-EAGAIN`. Many threads doing AIO at once need a smaller `queue_depth` or a
+larger `aio-max-nr`; the memcache server takes one context per worker thread
+(`MemcacheServer::Config::workers`), however many connections it serves. SPDK's own pool size
 stays the minimum: a large I/O takes several requests (one per transfer-size
 piece), so a pool sized to a small depth could never take it. Nothing in
 uDepot caps the depth below what the backend takes. A depth the backend
@@ -432,6 +433,17 @@ protocol server. It sits alongside the storage backends as another
 `IoBackend` for accept/recv/send operations. The memcache protocol handler is
 a layer above that uses both the network backend (for the connection) and the
 storage backend (for the data).
+
+The server is one accept thread and a fixed pool of worker threads
+(`Config::workers`, default one per hardware thread). Each connection is a
+coroutine, started and resumed on one worker, which runs that worker's socket
+epoll and its store I/O completions side by side, as one of uDepot's TRT
+scheduler threads does for its connection tasks (`trt-memcache.cc`
+`task_mc_accept`). The accept thread hands each new fd to the next worker
+round robin down a per-worker socketpair that the worker's epoll watches, so
+the hand-off takes no userspace lock. Threads, and with them AIO contexts and
+io_uring rings, are bounded by the pool, and a worker has the I/Os of all its
+connections in flight at once on its one context.
 
 Remote access for flywheel is planned — the memcache protocol provides a
 ready-made wire format, and the zero-copy path through the protocol handler

@@ -5,6 +5,7 @@
 
 #include <arpa/inet.h>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -354,4 +355,77 @@ TEST_F(EpollNetTest, ConnectionRecvSurvivesSpuriousWakeups) {
 
     EXPECT_EQ(failures, 0)
         << "recv returned early: spurious wakeup surfaced as an error";
+}
+
+// The poll hook runs on the poller thread at the top of every iteration, and
+// a false return ends the poller on its own (join_poller() then returns
+// without stop() having ended anything). The memcache workers reclaim their
+// finished connections and decide they are done there. The test never joins
+// a poller that has not exited: a hook whose result is ignored fails the
+// call count rather than hanging.
+TEST(EpollPollHook, RunsOnThePollerAndFalseEndsIt) {
+    EpollState es;
+    std::atomic<int> calls{0};
+    std::atomic<bool> on_poller_thread{true};
+    const auto test_thread = std::this_thread::get_id();
+    es.set_poll_hook([&] {
+        if (std::this_thread::get_id() == test_thread)
+            on_poller_thread = false;
+        return calls.fetch_add(1) + 1 < 3;  // false on the third call
+    });
+    ASSERT_EQ(es.init(), 0);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (calls.load() < 3 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // Once it said false, the poller is gone: no further calls.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const int seen = calls.load();
+    EXPECT_EQ(seen, 3) << "the hook's false did not end the poller";
+    EXPECT_TRUE(on_poller_thread.load());
+    if (seen == 3) es.join_poller();  // returns: the poller has exited
+    es.stop();                        // and stop() is still safe after it
+    EXPECT_EQ(calls.load(), seen);
+}
+
+// A poller with a poll hook multiplexes coroutines and is ended only through
+// the hook: an epoll_wait that fails (here by a seam) says so and aborts,
+// rather than leaving, which would orphan the coroutines it serves. A poller
+// without a hook keeps its old behaviour: report and stop.
+TEST(EpollPollHookDeathTest, EpollWaitFailureAbortsAPollerWithAHook) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        {
+            EpollState es;
+            es.set_poll_hook([] { return true; });
+            EpollState::epoll_wait_test_hook = [] { return EBADF; };
+            es.init();
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+        },
+        "udepot: epoll_wait failed \\(Bad file descriptor\\) on a poller that "
+        "is serving coroutines");
+}
+
+TEST(EpollPollHook, EpollWaitFailureWithoutAHookJustStops) {
+    EpollState es;
+    EpollState::epoll_wait_test_hook = [] { return EBADF; };
+    ::testing::internal::CaptureStderr();
+    ASSERT_EQ(es.init(), 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EpollState::epoll_wait_test_hook = nullptr;
+    es.join_poller();  // it left on its own
+    es.stop();
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    EXPECT_NE(log.find("epoll_wait: Bad file descriptor"), std::string::npos)
+        << log;
+}
+
+TEST(EpollPollHook, InitFailureIsReturned) {
+    EpollState es;
+    EpollState::init_test_hook = [] { return EMFILE; };
+    EXPECT_EQ(es.init(), -EMFILE);
+    EpollState::init_test_hook = nullptr;
+    EXPECT_EQ(es.init(), 0);  // nothing was left half done
+    es.stop();
 }

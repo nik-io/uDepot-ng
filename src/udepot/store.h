@@ -443,6 +443,13 @@ public:
     using InternalIoHook = int (*)(bool write, off_t offset, size_t count);
     inline static std::atomic<InternalIoHook> internal_io_test_hook{nullptr};
 
+    // Test seam, never set in production: the space waker calls it just
+    // before it resumes the waiters it has taken (only when there are any).
+    // A test may block in it, which keeps those operations parked in
+    // SpaceWait until it returns.
+    using WakerHook = void (*)();
+    inline static std::atomic<WakerHook> space_waker_test_hook{nullptr};
+
     // Test seam, never set in production: called when GC visits an index
     // segment of a memcache store, with its segment index and whether it
     // was let go (a retired table's) or kept (a live table's).

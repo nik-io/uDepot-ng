@@ -6,8 +6,10 @@
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -107,6 +109,9 @@ EpollState::~EpollState() {
 int EpollState::init() {
     if (state_.load(std::memory_order_acquire) != State::kUninitialized)
         return -EINVAL;
+
+    if (auto hook = init_test_hook.load(std::memory_order_relaxed))
+        if (int e = hook(); e != 0) return -e;
 
     epfd_ = epoll_create1(EPOLL_CLOEXEC);
     if (epfd_ == -1) {
@@ -238,8 +243,11 @@ void EpollState::shutdown_all() {
 
 void EpollState::poller_loop() {
     struct epoll_event events[kMaxEvents];
+    if (thread_name_[0] != '\0')
+        pthread_setname_np(pthread_self(), thread_name_);
 
     while (running_.load(std::memory_order_acquire)) {
+        if (poll_hook_ && !poll_hook_()) break;
         // A coroutine resumed here (a connection handler) runs its store
         // operations on this thread, and their I/O completes only when this
         // thread polls: as uDepot's TRT scheduler ran its epoll and I/O
@@ -248,9 +256,30 @@ void EpollState::poller_loop() {
         int timeout = io_pending ? 0
                       : (pending_waits_.load(std::memory_order_relaxed) > 0) ? 10
                                                                             : 100;
-        int n = epoll_wait(epfd_, events, kMaxEvents, timeout);
+        int n;
+        auto wait_hook = epoll_wait_test_hook.load(std::memory_order_relaxed);
+        if (int e = wait_hook ? wait_hook() : 0; e != 0) {
+            n = -1;
+            errno = e;
+        } else {
+            n = epoll_wait(epfd_, events, kMaxEvents, timeout);
+        }
         if (n < 0) {
             if (errno == EINTR) continue;
+            if (poll_hook_) {
+                // A poller with a hook multiplexes coroutines (the memcache
+                // workers) and is ended only through the hook, once they
+                // are done. Leaving here would orphan them: connections
+                // in a store wait that only this thread's owner can see
+                // through, destroyed while alive. There is no safe way to
+                // carry on.
+                std::fprintf(stderr,
+                             "udepot: epoll_wait failed (%s) on a poller that "
+                             "is serving coroutines; its connections cannot "
+                             "be ended safely, aborting\n",
+                             std::strerror(errno));
+                std::abort();
+            }
             perror("epoll_wait");
             break;
         }

@@ -24,6 +24,9 @@ struct UringRequest {
 
 namespace {
 
+// Rings that exist now, across all threads (UringIO::live_rings()).
+std::atomic<unsigned> g_live_rings{0};
+
 // The calling thread's ring, as uDepot's thread_local UringState: only this
 // thread submits to it and reaps it, so it needs no synchronization.
 struct UringThread {
@@ -40,6 +43,7 @@ struct UringThread {
         if (int rc = io_uring_queue_init(n, &r, 0); rc < 0) return rc;
         handoff(r, tsan_acquire_from_kernel);
         if (initialized) exit_ring();
+        else g_live_rings.fetch_add(1, std::memory_order_relaxed);
         ring = r;
         initialized = true;
         depth = n;
@@ -53,7 +57,10 @@ struct UringThread {
     // down under them.
     ~UringThread() {
         while (pending > 0) UringIO::poll_thread();
-        if (initialized) exit_ring();
+        if (initialized) {
+            exit_ring();
+            g_live_rings.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
 
     // The kernel maps the ring and liburing unmaps it with raw syscalls, so
@@ -166,6 +173,10 @@ struct UringSubmitAwaitable {
 
     ssize_t await_resume() noexcept { return req->result; }
 };
+
+unsigned UringIO::live_rings() noexcept {
+    return g_live_rings.load(std::memory_order_relaxed);
+}
 
 UringIO::~UringIO() { close(); }
 

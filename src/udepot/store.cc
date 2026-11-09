@@ -1807,6 +1807,9 @@ void uDepot<IO>::resume_waiters(std::unique_lock<std::mutex>& lock,
     auto waiters = std::move(space_waiters_);
     space_waiters_.clear();
     lock.unlock();
+    if (!waiters.empty())
+        if (auto hook = space_waker_test_hook.load(std::memory_order_relaxed))
+            hook();
     for (SpaceWait* w : waiters) {
         if (rc != 0 && w->grow == gen) w->result = rc;
         w->handle.resume();  // `w` lives in the resumed frame: done with it

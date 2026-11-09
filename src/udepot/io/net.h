@@ -100,6 +100,8 @@ class EpollState {
 
     std::thread poller_;
     std::atomic<bool> running_{false};
+    std::function<bool()> poll_hook_;  // set before init(); poller thread only
+    char thread_name_[16] = {};        // set before init(); poller thread only
 
     void notify_maybe(int fd, EpollOpType ty);
 
@@ -110,8 +112,48 @@ public:
     EpollState(const EpollState&) = delete;
     EpollState& operator=(const EpollState&) = delete;
 
+    // Before init(): `hook` runs on the poller thread at the top of every
+    // loop iteration, before it polls and waits. Returning false ends the
+    // loop: the poller drains this thread's I/O and exits (stop() then
+    // only joins it). A thread that multiplexes many coroutines on this
+    // poller (the memcache server's workers) reclaims finished ones here
+    // and decides when it has nothing left to run, with no lock: the hook
+    // runs on the one thread that owns that state.
+    void set_poll_hook(std::function<bool()> hook) {
+        poll_hook_ = std::move(hook);
+    }
+
+    // Before init(): names the poller thread (Linux limits a name to 15
+    // characters; a longer one is cut), set from inside the thread at the
+    // top of its loop, so tools and tests can tell a server's threads from
+    // the rest of the process's.
+    void set_thread_name(const char* name) {
+        size_t i = 0;
+        for (; i + 1 < sizeof(thread_name_) && name[i] != '\0'; ++i)
+            thread_name_[i] = name[i];
+        thread_name_[i] = '\0';
+    }
+
     int init();
     void stop();
+
+    // Test seams, never set in production. init_test_hook is called before
+    // epoll_create1 and returns the errno it should fail with (0 lets it
+    // go on); epoll_wait_test_hook is called before every epoll_wait in the
+    // poller and returns the errno that call should fail with (0 lets it
+    // go on). Both are atomic: tests set and clear them while pollers read.
+    using ErrnoHook = int (*)();
+    inline static std::atomic<ErrnoHook> init_test_hook{nullptr};
+    inline static std::atomic<ErrnoHook> epoll_wait_test_hook{nullptr};
+
+    // Waits for the poller to exit on its own, which it does once the poll
+    // hook returns false, without ending the connections' waits as stop()
+    // does: stop() sets the state to draining, which fails every socket
+    // operation still to come. Call stop() afterwards (or let the
+    // destructor).
+    void join_poller() {
+        if (poller_.joinable()) poller_.join();
+    }
 
     void register_fd(int fd, uint32_t event_mask);
     int deregister_fd(int fd);

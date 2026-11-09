@@ -94,6 +94,9 @@ struct AioRequest {
 
 namespace {
 
+// Contexts that exist now, across all threads (AioIO::live_contexts()).
+std::atomic<unsigned> g_live_contexts{0};
+
 // The calling thread's context, as uDepot's thread_local AioState: only
 // this thread submits to it and reaps it, so it needs no synchronization.
 struct AioThread {
@@ -112,6 +115,7 @@ struct AioThread {
         if (sys_io_setup(n, &c) < 0) return -errno;
         tsan_acquire_from_kernel(reinterpret_cast<void*>(c));
         if (ctx != 0) sys_io_destroy(ctx);
+        else g_live_contexts.fetch_add(1, std::memory_order_relaxed);
         ctx = c;
         depth = n;
         return 0;
@@ -122,7 +126,10 @@ struct AioThread {
     // context under them.
     ~AioThread() {
         while (pending > 0) AioIO::poll_thread();
-        if (ctx != 0) sys_io_destroy(ctx);
+        if (ctx != 0) {
+            sys_io_destroy(ctx);
+            g_live_contexts.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
 };
 
@@ -187,6 +194,10 @@ struct AioSubmitAwaitable {
 
     ssize_t await_resume() noexcept { return req->result; }
 };
+
+unsigned AioIO::live_contexts() noexcept {
+    return g_live_contexts.load(std::memory_order_relaxed);
+}
 
 AioIO::~AioIO() { close(); }
 

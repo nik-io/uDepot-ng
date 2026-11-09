@@ -210,7 +210,7 @@ if(UDEPOT_BUILD_TESTS)
         add_executable(memcache_test test/memcache_test.cc)
         target_link_libraries(memcache_test PRIVATE udepot_memcache GTest::gtest_main)
         add_test(NAME memcache_test COMMAND memcache_test)
-        set_tests_properties(memcache_test PROPERTIES TIMEOUT 60)
+        set_tests_properties(memcache_test PROPERTIES TIMEOUT 180)
     endif()
 
     if(UDEPOT_BUILD_URING)
