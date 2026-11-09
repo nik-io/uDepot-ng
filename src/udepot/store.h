@@ -68,6 +68,19 @@ inline size_t record_val_bytes(const KvHeader& hdr) noexcept {
 
 struct StoreConfig {
     const char* path = nullptr;
+    // Bytes the store uses; 0 means the whole thing, as uDepot (it takes
+    // the size from lseek(SEEK_END)): a block device's capacity, or a
+    // non-empty file's length (a new or empty file has none: the open fails
+    // with -EINVAL). A regular file smaller than `size` is grown to it (AIO
+    // and io_uring preallocate it, posix ftruncates; never shrunk), and a
+    // larger one is used up to `size`. A block device is never resized: a
+    // size up to the device's is used as is, a larger one fails the open
+    // with -ENOSPC. The backend's get_size() is what the store ends up
+    // using. The store is looked for at the end of that size, so reopen
+    // under the size it was created with: where none is found the open
+    // fails with -EEXIST rather than format over what may be a store under
+    // another size, unless force_destroy asks for a new one or the backing
+    // is a regular file that was new or empty.
     size_t size = 0;
     uint32_t grain_size = 512;
     // Segment size in grains, sanitized to whole pages as uDepot's
@@ -566,7 +579,11 @@ private:
     // Device metadata: sits at the tail past the last whole segment.
     uint64_t dev_md_grain_offset() const;
     int persist_dev_md();
-    bool validate_dev_md(salsa::salsa_dev_md* md_out);
+    // 0 if a store of this geometry is on the device (*md_out), -ENODATA if
+    // none is (no metadata, or not at the end of this size), -EINVAL if the
+    // store there was created with another grain size, -errno if the
+    // metadata could not be read. A read error is never "no store".
+    int validate_dev_md(salsa::salsa_dev_md* md_out);
 
     // Segment metadata: written at the tail of each segment. ctlr_type is
     // the owning controller's id: KV segments are ours, index segments

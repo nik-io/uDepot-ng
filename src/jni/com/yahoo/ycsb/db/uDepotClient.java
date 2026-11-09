@@ -24,7 +24,10 @@ import com.ibm.udepot.uDepotJNI;
  *
  * Properties:
  *   udepot.dev  - path to backing file/device (default: /dev/shm/udepot_test)
- *   udepot.size - capacity in bytes (default: 0 = full device)
+ *   udepot.size - capacity in bytes (default: 0 = the whole device, or a
+ *                  non-empty file's length; a new or empty file, such as the
+ *                  default /dev/shm one, has none and cannot be opened with
+ *                  0: give a size)
  *   udepot.force-destroy - skip restore (default: true)
  *   udepot.table-size - bytes per index table, a power of two of at least
  *                  4096, or 0 for the store's default (default: 2 MiB,

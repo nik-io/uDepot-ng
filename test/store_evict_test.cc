@@ -761,7 +761,13 @@ TEST_F(StoreEvictTest, TinyDevicesAreRefusedOrShrunkAtTheMinimum) {
         } else {
             ASSERT_EQ(try_open(s, mc), 0) << segs << ": " << log_;
             EXPECT_TRUE(s.index_restored());
-            EXPECT_EQ(get_or_empty(s, "a"), "1");
+            // 15 segments is far below the 43 GC needs to rest, so it runs
+            // from the moment the store opens and evicts oldest first: the
+            // key the KV store wrote sits in the oldest data segment, which
+            // may already be gone. Either answer is right; another value
+            // would not be.
+            const std::string old = get_or_empty(s, "a");
+            EXPECT_TRUE(old.empty() || old == "1") << "a = " << old;
             ASSERT_EQ(s.put("b", "2").run_sync(), 0);
             EXPECT_EQ(get_or_empty(s, "b"), "2");
             s.close();

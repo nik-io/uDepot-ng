@@ -34,6 +34,8 @@ protected:
         config_.path = "SPDK";
         config_.size = 0;
         config_.grain_size = 4096;
+        // Each test starts a new store: the namespace holds the last one.
+        config_.force_destroy = true;
 
         ASSERT_EQ(store_.open(config_), 0);
     }
@@ -213,6 +215,7 @@ TEST_F(SpdkStoreTest, ConcurrentOverwritesBeyondDeviceSize) {
     check();
     auto t2 = std::chrono::steady_clock::now();
     store_.close();
+    config_.force_destroy = false;  // restore what was written
     ASSERT_EQ(store_.open(config_), 0);
     auto t3 = std::chrono::steady_clock::now();
     check();

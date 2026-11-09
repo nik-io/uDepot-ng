@@ -128,15 +128,24 @@ int uDepot<IO>::persist_dev_md() {
 }
 
 template <typename IO>
-bool uDepot<IO>::validate_dev_md(salsa::salsa_dev_md* md_out) {
+int uDepot<IO>::validate_dev_md(salsa::salsa_dev_md* md_out) {
     size_t aligned = align_up(sizeof(salsa::salsa_dev_md), grain_size_);
     IoBuffer buf = io_.alloc_buffer(aligned);
-    if (!buf.data) return false;
+    if (!buf.data) {
+        std::fprintf(stderr, "udepot: no memory to read the device "
+                             "metadata (%zu bytes).\n", aligned);
+        return -ENOMEM;
+    }
 
     ssize_t r = pread_internal(buf.data, aligned,
                                grain_to_offset(dev_md_grain_offset()));
+    if (r < 0) {
+        std::fprintf(stderr, "udepot: could not read the device metadata: "
+                             "%s.\n", std::strerror(static_cast<int>(-r)));
+        return static_cast<int>(r);
+    }
     if (r < static_cast<ssize_t>(sizeof(salsa::salsa_dev_md)))
-        return false;
+        return -ENODATA;
 
     salsa::salsa_dev_md md;
     std::memcpy(&md, buf.data, sizeof(md));
@@ -146,12 +155,21 @@ bool uDepot<IO>::validate_dev_md(salsa::salsa_dev_md* md_out) {
         reinterpret_cast<const uint8_t*>(&md),
         sizeof(md) - sizeof(md.csum));
 
-    if (md.csum != expected) return false;
-    if (md.grain_size != grain_size_) return false;
-    if (md.physical_size != total_grains_ * grain_size_) return false;
+    if (md.csum != expected) return -ENODATA;
+    if (md.grain_size != grain_size_) {
+        std::fprintf(stderr,
+                     "udepot: the store on this device was created with "
+                     "grains of %u bytes, not the %u asked for: reopen it "
+                     "with that grain size (StoreConfig::grain_size), or "
+                     "set StoreConfig::force_destroy to start a new store, "
+                     "which destroys it.\n",
+                     static_cast<unsigned>(md.grain_size), grain_size_);
+        return -EINVAL;
+    }
+    if (md.physical_size != total_grains_ * grain_size_) return -ENODATA;
 
     if (md_out) *md_out = md;
-    return true;
+    return 0;
 }
 
 template <typename IO>
@@ -1150,11 +1168,24 @@ int uDepot<IO>::open(const StoreConfig& config) {
         io_.set_queue_depth(config.queue_depth);
     if constexpr (requires { io_.set_poll_yields(config.poll_yields); })
         io_.set_poll_yields(config.poll_yields);
+    if constexpr (requires { io_.set_force_destroy(config.force_destroy); })
+        io_.set_force_destroy(config.force_destroy);
     int rc = io_.open(config.path, config.size);
     if (rc != 0) return rc;
 
+    // A failure before the device metadata is written leaves a new file as
+    // it found it: empty, so the next open is a first one again.
+    bool md_persisted = false;
+    auto abandon = [&](int err) {
+        if constexpr (requires { io_.discard_fresh(); })
+            if (!md_persisted) io_.discard_fresh();
+        io_.close();
+        return err;
+    };
+
     // As uDepot's register_local_region: the device size is whatever the
-    // backend reports once open (config.size 0 means "the whole device").
+    // backend reports once open (config.size 0 means "the whole device",
+    // or a non-empty file's whole length).
     const uint64_t dev_size = io_.get_size();
     total_grains_ = dev_size / grain_size_;
 
@@ -1180,11 +1211,34 @@ int uDepot<IO>::open(const StoreConfig& config) {
                (static_cast<uint64_t>(ts.tv_sec) << 20);
     };
 
-    if (!config.force_destroy && validate_dev_md(&dev_md)) {
+    const int vrc =
+        config.force_destroy ? -ENODATA : validate_dev_md(&dev_md);
+    if (vrc != 0 && vrc != -ENODATA) return abandon(vrc);
+    if (vrc == 0) {
         restored = true;
         seed_ = dev_md.seed;
         segment_size = dev_md.segment_size;
     } else {
+        // No store found. Formatting over a device or file that may hold
+        // one under another size (the metadata sits at the end of what the
+        // store was sized to) destroys it on the first write, so only a new
+        // or empty file, which holds nothing, is formatted without being
+        // told to. Backends without fresh() (SPDK) never are.
+        bool fresh = false;
+        if constexpr (requires { io_.fresh(); }) fresh = io_.fresh();
+        if (!config.force_destroy && !fresh) {
+            std::fprintf(
+                stderr,
+                "udepot: no store of %llu bytes found on %s, which is not a "
+                "new or empty file: uDepot will not format over what it may "
+                "hold. Reopen it with the size the store was created with, "
+                "or set StoreConfig::force_destroy to start a new store, "
+                "which destroys it. (It is also what a first open that "
+                "never completed leaves behind: force_destroy is the "
+                "remedy.)\n",
+                static_cast<unsigned long long>(dev_size), config.path);
+            return abandon(-EEXIST);
+        }
         seed_ = new_seed();
     }
 
@@ -1254,8 +1308,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
     while (true) {
         if (!has_tail(segment_size)) {
             if (restored) {
-                io_.close();
-                return -EINVAL;
+                return abandon(-EINVAL);
             }
             if (fitted_table != 0) {
                 // A smaller fitted segment, not the least-waste size below
@@ -1267,8 +1320,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
                                                          grain_size_)
                                    : 0;
                 if (segment_size <= 1) {
-                    io_.close();
-                    return -EINVAL;
+                    return abandon(-EINVAL);
                 }
                 continue;
             }
@@ -1286,8 +1338,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
                 if (ns == 1) break;
             }
             if (best == 0 || best >= segment_size) {
-                io_.close();
-                return -EINVAL;
+                return abandon(-EINVAL);
             }
             segment_size = best;
             continue;
@@ -1382,8 +1433,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
                 static_cast<unsigned long long>(segment_size * grain_size_ >>
                                                 10),
                 memcache_ ? "memcache" : "KV", overprovision, why);
-            io_.close();
-            return init_err == ENOMEM ? -ENOMEM : -EINVAL;
+            return abandon(init_err == ENOMEM ? -ENOMEM : -EINVAL);
         }
         if (fitted_table != 0) {
             fitted_table /= 2;
@@ -1402,8 +1452,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
                     "a table and %u data segments at any segment size. Give "
                     "it a larger device.\n",
                     kMcCapSegments, kMcMinDataSegments);
-            io_.close();
-            return -EINVAL;
+            return abandon(-EINVAL);
         }
     }
 
@@ -1468,8 +1517,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
     if (rc != 0) {
         delete scm_;
         scm_ = nullptr;
-        io_.close();
-        return -rc;
+        return abandon(-rc);
     }
     // The index's controller, registered second so its id is the same on
     // every open.
@@ -1486,8 +1534,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
         scm_ = nullptr;
         delete directory_;
         directory_ = nullptr;
-        io_.close();
-        return err;
+        return abandon(err);
     };
     if (rc != 0) return fail(-rc);
 
@@ -1544,6 +1591,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
                         decline_text(decline));
                 seed_ = new_seed();
                 rc = persist_dev_md();
+                md_persisted = rc == 0;
                 if (rc == 0) rc = create_directory();
             } else {
                 rc = crash_recovery();
@@ -1552,6 +1600,7 @@ int uDepot<IO>::open(const StoreConfig& config) {
         if (rc != 0) return fail(rc);
     } else {
         rc = persist_dev_md();
+        md_persisted = rc == 0;
         if (rc == 0) rc = create_directory();
         if (rc != 0) return fail(rc);
     }

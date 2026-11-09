@@ -553,7 +553,9 @@ stream. (A memcache store differs: see below.)
     segment metadata is taken for a new one, and prints why: no persisted
     index (not shut down cleanly), or an index it cannot restore (another
     format or geometry, incomplete, unreadable, inconsistent). A device
-    with no valid device metadata is made new as always. If close cannot
+    with no valid device metadata is no store: it is made new only if it
+    is a new or empty file or `force_destroy` asks, else the open fails
+    with -EEXIST, as for any store. If close cannot
     persist the index, it says the entries are lost.
   - **The mode is not on the device (legacy's design), with three
     consequences.** A store that crashed as KV and is opened with
