@@ -35,6 +35,8 @@ struct UringThread {
     // depth I/Os. Returns 0 or -errno.
     int setup(unsigned n) {
         struct io_uring r{};
+        if (auto hook = UringIO::setup_test_hook.load(std::memory_order_relaxed))
+            if (int rc = hook(); rc != 0) return rc;
         if (int rc = io_uring_queue_init(n, &r, 0); rc < 0) return rc;
         handoff(r, tsan_acquire_from_kernel);
         if (initialized) exit_ring();
@@ -175,19 +177,24 @@ int UringIO::open(const char* path, size_t size) {
         return err;
     }
 
-    if (int rc = size_direct_file(fd_, path, size); rc != 0) {
+    size_t used = 0;
+    bool fresh = false;
+    if (int rc = size_store_fd(fd_, path, size, true, force_destroy_, &used, &fresh); rc != 0) {
         ::close(fd_);
         fd_ = -1;
         return rc;
     }
 
-    size_ = size;
+    size_ = used;
+    fresh_ = fresh;
+    path_ = path;
 
     // This thread's ring, at this store's depth, unless it has I/O in
     // flight (as SpdkIO::open creates this thread's queue pair).
     UringThread& t = tl_uring;
     if (!t.initialized || (t.depth != queue_depth_ && t.pending == 0)) {
         if (int rc = t.setup(queue_depth_); rc != 0) {
+            discard_fresh();  // a new file goes back to empty
             ::close(fd_);
             fd_ = -1;
             return rc;

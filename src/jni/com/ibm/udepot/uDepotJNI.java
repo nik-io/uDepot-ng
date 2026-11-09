@@ -20,7 +20,9 @@ public class uDepotJNI {
    * Initialize the Key Value provider, with DEFAULT_TABLE_SIZE tables.
    * @param fname    Path to file/device for backend storage.
    * @param size     Desired capacity in bytes. 0 for full capacity.
-   * @param force_destroy If true, assume empty device (no restore).
+   * @param force_destroy If true, start a new store over whatever is there.
+   *     If false, a store is restored, and a backing with no store on it is
+   *     refused (a nonzero return) unless it is a new or empty file.
    * @return 0 on success, errno on failure.
    */
   public int init(String fname, long size, boolean force_destroy) {
@@ -31,7 +33,9 @@ public class uDepotJNI {
    * Initialize the Key Value provider.
    * @param fname    Path to file/device for backend storage.
    * @param size     Desired capacity in bytes. 0 for full capacity.
-   * @param force_destroy If true, assume empty device (no restore).
+   * @param force_destroy If true, start a new store over whatever is there.
+   *     If false, a store is restored, and a backing with no store on it is
+   *     refused (a nonzero return) unless it is a new or empty file.
    * @param table_size Bytes of each index table: a power of two of at least
    *                 4096, or 0 for the store's default (512 MiB tables).
    * @return 0 on success, errno on failure (EINVAL for a bad table_size).

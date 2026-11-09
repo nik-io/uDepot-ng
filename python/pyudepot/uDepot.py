@@ -48,6 +48,13 @@ DEFAULT_TABLE_SIZE = 2 * 1024 * 1024
 
 class uDepot:
     def __init__(self, **kwargs):
+        """Opens the store on file_name (a file or a block device).
+
+        force_destroy=True starts a new store over whatever is there.
+        force_destroy=False restores the store, and raises IOError for a
+        backing with no store on it (one created with another size, say)
+        unless it is a new or empty file.
+        """
         self._fname = kwargs.get('file_name', '/tmp/pyudepot-test')
         self._size = kwargs.get('size', 1024 * 1024 + 4096)
         self._force_destroy = 1 if kwargs.get('force_destroy', False) else 0

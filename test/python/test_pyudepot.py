@@ -127,6 +127,37 @@ class TestClose:
         kv._cleanup()  # closing twice is harmless
 
 
+class TestForceDestroy:
+    """force_destroy reaches the store: a reopen under another size finds no
+    store and fails unless asked to start a new one; under the size it was
+    created with, it restores the store."""
+
+    def test_force_destroy_is_honoured(self, tmp_path):
+        path = str(tmp_path / "force")
+        other = STORE_SIZE + 1024 * 1024
+        kv = pyudepot.uDepot(file_name=path, size=STORE_SIZE,
+                             force_destroy=True)
+        assert kv.put(_key("keep"), _val("me"))
+        kv._cleanup()
+
+        # Another size, no force_destroy: refused.
+        with pytest.raises(IOError):
+            pyudepot.uDepot(file_name=path, size=other, force_destroy=False)
+
+        # The size it was created with: the key is there.
+        kv = pyudepot.uDepot(file_name=path, size=STORE_SIZE,
+                             force_destroy=False)
+        out = np.zeros(2, dtype=np.uint8)
+        assert kv.get(_key("keep"), out)
+        np.testing.assert_array_equal(out, _val("me"))
+        kv._cleanup()
+
+        # Another size, force_destroy: a new store, the key is gone.
+        kv = pyudepot.uDepot(file_name=path, size=other, force_destroy=True)
+        assert not kv.get(_key("keep"), np.zeros(2, dtype=np.uint8))
+        kv._cleanup()
+
+
 class TestTableSize:
     """The index table size is the caller's: 2 MiB by default, for tests;
     any power of two of at least 4096 bytes, or 0 for the store's default.
