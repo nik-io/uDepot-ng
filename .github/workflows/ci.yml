@@ -38,13 +38,27 @@ jobs:
           key: ccache-${{ matrix.build_type }}-${{ github.sha }}
           restore-keys: ccache-${{ matrix.build_type }}-
 
+      # googletest from a pinned, checksummed, cached copy: CMake's own
+      # configure-time download failed on a GitHub 5xx. The script is
+      # idempotent, so it runs on a hit too. See scripts/ci-fetch-googletest.sh.
+      - name: googletest cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/googletest-1.15.2
+          key: googletest-1.15.2-7b42b4d6ed48
+
+      - name: Fetch googletest
+        run: scripts/ci-fetch-googletest.sh "$HOME/.cache/googletest-1.15.2"
+
       - name: Configure
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DUDEPOT_BUILD_JNI=ON
+            -DUDEPOT_BUILD_JNI=ON \
+            -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST="$HOME/.cache/googletest-1.15.2"
+          scripts/ci-check-no-gtest-download.sh build
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
@@ -110,6 +124,18 @@ jobs:
           key: ccache-tsan-${{ github.sha }}
           restore-keys: ccache-tsan-
 
+      # googletest from a pinned, checksummed, cached copy: CMake's own
+      # configure-time download failed on a GitHub 5xx. The script is
+      # idempotent, so it runs on a hit too. See scripts/ci-fetch-googletest.sh.
+      - name: googletest cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/googletest-1.15.2
+          key: googletest-1.15.2-7b42b4d6ed48
+
+      - name: Fetch googletest
+        run: scripts/ci-fetch-googletest.sh "$HOME/.cache/googletest-1.15.2"
+
       # The runner's default ASLR entropy leaves TSAN's runtime no room for
       # its shadow memory ("unexpected memory mapping").
       - name: Allow TSAN's memory layout
@@ -127,7 +153,9 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             "-DCMAKE_C_FLAGS=-fsanitize=thread -O1 -g" \
             "-DCMAKE_CXX_FLAGS=-fsanitize=thread -O1 -g -Wno-tsan" \
-            -DUDEPOT_BUILD_PYTHON=OFF
+            -DUDEPOT_BUILD_PYTHON=OFF \
+            -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST="$HOME/.cache/googletest-1.15.2"
+          scripts/ci-check-no-gtest-download.sh build
 
       - name: Build
         run: cmake --build build -j"$(nproc)"
@@ -234,12 +262,26 @@ jobs:
           key: ccache-spdk-${{ matrix.mode }}-${{ github.sha }}
           restore-keys: ccache-spdk-${{ matrix.mode }}-
 
+      # googletest from a pinned, checksummed, cached copy: CMake's own
+      # configure-time download failed on a GitHub 5xx. The script is
+      # idempotent, so it runs on a hit too. See scripts/ci-fetch-googletest.sh.
+      - name: googletest cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/googletest-1.15.2
+          key: googletest-1.15.2-7b42b4d6ed48
+
+      - name: Fetch googletest
+        run: scripts/ci-fetch-googletest.sh "$HOME/.cache/googletest-1.15.2"
+
       - name: Build (${{ matrix.build_type }})
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DUDEPOT_BUILD_SPDK=ON -DUDEPOT_BUILD_PYTHON=OFF
+            -DUDEPOT_BUILD_SPDK=ON -DUDEPOT_BUILD_PYTHON=OFF \
+            -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST="$HOME/.cache/googletest-1.15.2"
+          scripts/ci-check-no-gtest-download.sh build
           cmake --build build -j"$(nproc)" --target ${{ matrix.target }}
 
       # As uDepot's CI: the SPDK backend as an NVMe-oF initiator against a
@@ -272,12 +314,26 @@ jobs:
           key: ccache-perf-${{ github.sha }}
           restore-keys: ccache-perf-
 
+      # googletest from a pinned, checksummed, cached copy: CMake's own
+      # configure-time download failed on a GitHub 5xx. The script is
+      # idempotent, so it runs on a hit too. See scripts/ci-fetch-googletest.sh.
+      - name: googletest cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/googletest-1.15.2
+          key: googletest-1.15.2-7b42b4d6ed48
+
+      - name: Fetch googletest
+        run: scripts/ci-fetch-googletest.sh "$HOME/.cache/googletest-1.15.2"
+
       - name: Build (Release)
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DUDEPOT_BUILD_PYTHON=OFF
+            -DUDEPOT_BUILD_PYTHON=OFF \
+            -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST="$HOME/.cache/googletest-1.15.2"
+          scripts/ci-check-no-gtest-download.sh build
           cmake --build build -j"$(nproc)" --target udepot_ng_bench
 
       # After uDepot's CI: zero-copy put/get must be strictly faster than the
