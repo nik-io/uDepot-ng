@@ -442,7 +442,7 @@ no-copy property end to end.
 
 Grains come from salsa, configured as uDepot's non-memcache store: relocating
 GC (`init_local(14, 2, 4)`), 20% overprovisioning, one user and one relocation
-stream.
+stream. (A memcache store differs: see below.)
 
 - **Release.** Every allocation is released once its write is committed or
   invalidated; salsa seals a segment, making it a GC candidate, only when all
@@ -475,6 +475,125 @@ stream.
     erasing a freed segment's metadata, a write per segment) without
     agreement. `TombstoneIsDroppedOnlyWhenNoOlderCopyIsOnDisk` writes until
     GC has had a window, rather than expecting one in a fixed workload.
+- **Memcache mode (`StoreConfig::memcache`)** is uDepot's *MC runtimes
+  (`udepot-lsa.cc:338-380`, `889-915`): salsa gets `init_local(1, 20, 40)`,
+  the circular-buffer GC, which cleans the oldest sealed segment first and
+  runs from 20 free segments to 40 (the watermarks count segments). Legacy
+  also set overprovision 40 per mille (4%: its "// 1%" comment is wrong);
+  uDepot-ng does not, by the maintainer's decision, and
+  `StoreConfig::overprovision` is not used: see "Capacity" below. The mode
+  is not on the device.
+  - **GC evicts.** For every record the directory still points at, live or
+    a tombstone, `gc_record` removes the entry and invalidates its grains
+    under the key's stripe locks, as for a drop of a tombstone, and nothing
+    is relocated or written. It still reads the victim segment, to learn
+    its keys. The store keeps no live-entry or byte counters (a delete
+    keeps none either), so the table entry and salsa's valid-grain count
+    are what stay consistent. A reader that found an entry before it went
+    keeps its segment for a grace period, as for relocation.
+  - **Eviction speed.** Eviction reads each victim segment whole, so
+    writers that outrun GC wait: see `docs/TODO-memcache-eviction.md`.
+  - **Capacity.** Live data is capped at the device's grains (its tail,
+    the part past the last whole segment, included) less half the low
+    watermark's segments (10 with the defaults), exactly, in grains:
+    `Scm::init` takes the cap directly (its only change; it used to derive
+    it from a per-mille overprovision, which cannot say 10 segments on a
+    large device). With legacy's 4% the cap was reached with more than the
+    low watermark still free once the device had over ~500 segments, so no
+    GC was due and puts failed with ENOSPC. Under the cap, live data
+    reaching it means at least (N - 10) full segments, each holding at most
+    a segment less its metadata grain, so under 10 are free, and GC is due
+    from 20: GC is due for about 10 segments before the cap can bite.
+    Partly filled stream segments and the index's segments (a table's
+    segment is provisioned whole until retired) only raise the number of
+    non-free segments for a given amount of live data, so GC is due
+    earlier. GC being due is not GC having caught up: several writers can
+    fill those 10 segments faster than it evicts them, so a refusal by the
+    cap in a memcache store makes the put wait for GC (`-EAGAIN`, the space
+    wait it already has for no free segment), not fail with ENOSPC. So does
+    a directory grow, which keeps the tables it has already gathered
+    (`Directory::grow`'s spare list); one whose peak (old tables plus twice
+    as many new, and 4 data segments) could never fit under the cap fails
+    with ENOSPC and a message. `capacity_waits()` counts both. A KV store
+    keeps its overprovision and its ENOSPC.
+  - **Sizing.** Salsa's spare-segment check (4 spare segments besides the 2
+    GC reserves) passes at any size under this cap, which leaves 8. What
+    binds is the cap's room: it must hold the first table and 4 data
+    segments (one filling, one sealed for GC to evict, one filling after
+    it, one staged), or a put refused for space could wait for a GC with
+    nothing to evict. That is 5 net segments of cap: 15 whole segments
+    always suffice (10 off, 5 of room), 14 do with a tail of nearly a
+    segment, so 15 is a sufficient bound, not the exact one. Measured, a
+    KV store of 14 segments of 256 grains (with a 4 KiB tail) is refused as
+    memcache and one of 15 opens. The margin for growing is 3 tables' worth
+    per table plus 4 data segments, so a store near the minimum cannot
+    grow past its first table (the guard says so if the cap refuses it a
+    segment); its 4 data segments hold several times fewer entries than a
+    table does (measured: a table of a 128 KiB segment held ~5000 entries
+    before growing, 4 such segments hold 1020 one-grain records), so it
+    does not need to. A new store
+    below that has its segment halved until it fits (the usual message
+    names the cap); an *existing* store keeps the segment size in its
+    device metadata, so its open fails (-EINVAL, with a message naming the
+    real cause, the device untouched). GC runs from 20 free segments to
+    40, and some segments are never free (the first table's, and two more
+    salsa keeps: measured, with 128 KiB segments GC rests at 43 segments
+    and not at 42, each table the directory grows raising it by one), so
+    a device of fewer than 43 segments cannot let it rest and the open
+    says so; with the default fitted segment (~512 MiB) that is a device
+    over ~21 GiB. The open prints the mode, the GC parameters, the cap and
+    the segment count once it has succeeded.
+  - **A clean shutdown is exact; a crash starts empty.** A persisted index
+    is restored as for any store. Without one, the log is *not* scanned:
+    eviction removes entries without writing anything and freed segments
+    are reused out of age order, so a scan could bring back an older value
+    of a key whose newer copy's segment was reused, or a key whose
+    tombstone was evicted. The open takes a new seed, writes new device
+    metadata and a fresh directory, as for a new store, so no old record or
+    segment metadata is taken for a new one, and prints why: no persisted
+    index (not shut down cleanly), or an index it cannot restore (another
+    format or geometry, incomplete, unreadable, inconsistent). A device
+    with no valid device metadata is no store: it is made new only if it
+    is a new or empty file or `force_destroy` asks, else the open fails
+    with -EEXIST, as for any store. If close cannot
+    persist the index, it says the entries are lost.
+  - **The mode is not on the device (legacy's design), with three
+    consequences.** A store that crashed as KV and is opened with
+    `memcache = true` is wiped at open. A store that crashed as memcache
+    and is opened as KV replays the log this mode calls unsafe (stale
+    values, deleted keys back), with no message. A memcache store closed
+    cleanly and opened as KV can hold more live data than a KV store's cap,
+    so salsa refuses to restore it: the open fails (-EIO) with a message,
+    and, as any open does, has cleared the index, so reopened as memcache
+    it starts empty. Open a store in the mode it was created in.
+  - **Index segments.** The circular GC frees a segment only when the
+    relocation upcall returns 0 (nbin also frees at zero valid grains), so
+    `IndexCtlr::gc_callback` returns 0 for a retired table's segment and
+    keeps ENOSYS (uDepot's) for a live one, tracked by a per-segment atomic
+    flag set when the table is retired: no lock. A KV store is unchanged.
+    Salsa's circular GC puts a segment whose relocation upcall returned
+    ENOSYS back on its queue and tries the next at once, so with only such
+    segments left (live tables') it would spin on them. It now notices a
+    lap of its queue (back at the first such segment, nothing freed or
+    cleaned since) and waits on its watermark waitqueue for a kick: a
+    generation counter (`kick_gen`) bumped, before a broadcast, by
+    `gc_kick()`, which a segment entering the queue calls
+    (`gc_base_seg_destaged`) and so does the store when it retires a
+    table's segment (`Scm::gc_kick()`, after setting the retired flag; and on the error paths
+    that retire a segment it allocated). The generation is read before each
+    candidate is tried and the waiter compares under the waitqueue's mutex,
+    so a kick is not missed. The empty-queue wait (it used to sleep a
+    millisecond) is the same wait. Once per segment entering the queue or
+    retired, never per put or get; no new lock. `gc_waits()` counts the
+    waits (only actual sleeps; empty-queue and lap waits are not told
+    apart). Only the circular GC's loop changed, in `gc-base.c`; the greedy
+    loop is unchanged and only gets the extra wakeups, and a KV store's
+    nbin GC does not use any of it. An error that persists (a segment whose
+    read fails) takes part in the lap like ENOSYS, and its message prints
+    once per run of failures.
+  - **Restore order.** After a clean reopen the segments go back to GC
+    oldest first (by timestamp), not in index order, so eviction stays
+    oldest first.
 - **Recovery** reads each segment with valid metadata in one pass and replays
   its records; for each key the newest in recovery order (segment timestamp,
   then grain) wins, tombstones included. Grains holding no valid record are

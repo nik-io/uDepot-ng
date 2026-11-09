@@ -130,6 +130,9 @@ static void gc_base_seg_destaged(
 	os_spinlock_lock(&gc->fifo.sl);
 	cds_list_add_tail(&seg->list, &gc->fifo.lst);
 	os_spinlock_unlock(&gc->fifo.sl);
+	/* The circular GC may be waiting for something to appear in its queue
+	 * (or to become freeable): a new segment is both. */
+	gc_kick(gc_in);
 }
 
 static void gc_base_page_invalidate(
@@ -214,6 +217,12 @@ gc_circular_run(void *arg)
 		" HIGH_WATERMARK=%"PRIu64, LOW_WATERMARK, HIGH_WATERMARK);
 
 	for (; 0 == os_atomic32_read(exit); ) {
+		/* The first segment the frontend could not free in the current
+		 * run of such, and the kick generation when it was tried. */
+		struct segment *lap_mark = NULL;
+		u64 lap_gen = 0;
+		/* Whether this lap has said that a segment failed. */
+		bool lap_reported = false;
 		os_wait_event_interruptible(gc->base.low_watermark_waitq,
 			os_atomic64_read(nfree_segs) <= LOW_WATERMARK ||
 			1 == os_atomic32_read(exit));
@@ -228,9 +237,24 @@ gc_circular_run(void *arg)
 			u32 relocs;
 			gc_reloc_fn_t fn = NULL;
 			struct sto_ctlr *sc = NULL;
+			/* Read before looking at the queue and before trying
+			 * the candidate: a kick after this is not missed by
+			 * the waits below, which compare against it. */
+			const u64 gen = os_atomic64_read(&gc->base.kick_gen);
 			gc_base_get_first_seg(gc, &seg);
 			if (NULL == seg) {
-				os_msleep(1);
+				/* Nothing to clean: wait for a segment to
+				 * enter the queue (gc_base_seg_destaged
+				 * kicks), or to be told to stop. */
+				/* (counted only if it is going to sleep) */
+				if (gen == os_atomic64_read(&gc->base.kick_gen)
+				    && 0 == os_atomic32_read(exit))
+					os_atomic64_inc(&gc->base.kick_waits);
+				os_wait_event_interruptible(
+					gc->base.low_watermark_waitq,
+					gen != os_atomic64_read(
+						&gc->base.kick_gen) ||
+					1 == os_atomic32_read(exit));
 				continue;
 			}
 
@@ -247,11 +271,48 @@ gc_circular_run(void *arg)
 			if (unlikely(0 != rc)) {
 				gc_base_add_seg_to_tail(gc, seg);
 				/* gc_base_add_seg_to_head(gc, seg); */
-				if (EAGAIN != rc && ENOSYS != rc)
+				if (EAGAIN == rc) {
+					/* transient (stopping): try again */
+					lap_mark = NULL;
+					lap_reported = false;
+					continue;
+				}
+				/* A real failure is said once per lap, whichever
+				 * segment started the lap (a live table's, say),
+				 * not per visit. */
+				if (ENOSYS != rc && !lap_reported) {
 					ERR("ctlr_relocate_segment " \
 						" failed with %d.", rc);
+					lap_reported = true;
+				}
+				/* ENOSYS (the frontend cannot free it now) or
+				 * an error that persists (a read that fails):
+				 * a lap of the queue with nothing freed (back
+				 * at the first such segment, no kick since)
+				 * means all that is left is such segments:
+				 * wait for a kick instead of spinning on
+				 * them. */
+				if (NULL == lap_mark) {
+					lap_mark = seg;
+					lap_gen = gen;
+				} else if (seg == lap_mark) {
+					if (lap_gen == os_atomic64_read(
+						    &gc->base.kick_gen) &&
+					    0 == os_atomic32_read(exit))
+						os_atomic64_inc(
+							&gc->base.kick_waits);
+					os_wait_event_interruptible(
+						gc->base.low_watermark_waitq,
+						lap_gen != os_atomic64_read(
+							&gc->base.kick_gen) ||
+						1 == os_atomic32_read(exit));
+					lap_mark = NULL;
+					lap_reported = false;
+				}
 				continue;
 			}
+			lap_mark = NULL;
+			lap_reported = false;
 			/* push it to the free list */
 			scm_put_free_seg(scm, seg, 0);
 			gc_seg_released(&gc->base, &gc->fifo, relocs);
