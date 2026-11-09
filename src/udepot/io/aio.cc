@@ -209,19 +209,24 @@ int AioIO::open(const char* path, size_t size) {
         return err;
     }
 
-    if (int rc = size_direct_file(fd_, path, size); rc != 0) {
+    size_t used = 0;
+    bool fresh = false;
+    if (int rc = size_store_fd(fd_, path, size, true, force_destroy_, &used, &fresh); rc != 0) {
         ::close(fd_);
         fd_ = -1;
         return rc;
     }
 
-    size_ = size;
+    size_ = used;
+    fresh_ = fresh;
+    path_ = path;
 
     // This thread's context, at this store's depth, unless it has I/O in
     // flight (as SpdkIO::open creates this thread's queue pair).
     AioThread& t = tl_aio;
     if (t.ctx == 0 || (t.depth != queue_depth_ && t.pending == 0)) {
         if (int rc = t.setup(queue_depth_); rc != 0) {
+            discard_fresh();  // a new file goes back to empty
             ::close(fd_);
             fd_ = -1;
             // Not "retry": a depth past what aio-max-nr leaves.

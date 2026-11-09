@@ -167,6 +167,40 @@ class uDepotJNITest {
         return bad;
     }
 
+    // force_destroy reaches the store: a reopen under another size finds no
+    // store and fails unless asked to start a new one; under the size it
+    // was created with, it restores the store. Returns the failures.
+    static int testForceDestroy(String fname, long size) throws Exception {
+        int bad = 0;
+        byte[] key = "keep".getBytes();
+        byte[] val = "me".getBytes();
+        byte[] buf = new byte[16];
+        long other = size + (1L << 20);
+        Files.deleteIfExists(Path.of(fname));
+        try {
+            uDepotJNI kv = new uDepotJNI();
+            if (kv.initWithTables(fname, size, true, 1L << 20) != 0) return 1;
+            if (kv.put(key, key.length, val, val.length) < 0) bad++;
+            kv.shutdown();
+            // Another size, no force_destroy: refused.
+            if (kv.initWithTables(fname, other, false, 1L << 20) == 0) {
+                bad++;
+                kv.shutdown();
+            }
+            // The size it was created with: the key is there.
+            if (kv.initWithTables(fname, size, false, 1L << 20) != 0) return bad + 1;
+            if (kv.get(key, key.length, buf, buf.length) != val.length) bad++;
+            kv.shutdown();
+            // Another size, force_destroy: a new store, the key is gone.
+            if (kv.initWithTables(fname, other, true, 1L << 20) != 0) return bad + 1;
+            if (kv.get(key, key.length, buf, buf.length) >= 0) bad++;
+            kv.shutdown();
+        } finally {
+            Files.deleteIfExists(Path.of(fname));
+        }
+        return bad;
+    }
+
     public static void main(String[] argv) throws Exception {
         String fname;
         if (argv.length > 0) {
@@ -196,6 +230,8 @@ class uDepotJNITest {
             Files.deleteIfExists(Path.of(fname));
         }
         test.check(testClosedStoreRejectsOps() == 0, "ops after shutdown fail");
+        test.check(testForceDestroy(fname + ".force", size) == 0,
+                   "force_destroy reaches the store");
 
         System.out.println("Passed: " + test.passed +
                            ", Failed: " + test.failed);

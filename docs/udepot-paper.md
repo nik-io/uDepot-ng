@@ -207,8 +207,20 @@ Quotes below are from the paper; section numbers are the paper's.
 - Cache semantics are weaker than the store's. Evicting or losing a cached
   entry is acceptable, so Memcache paths need not carry the store's strongest
   durability guarantees (decided with the author).
-- uDepot-ng status: Memcache uses relocating GC today. Eviction-in-GC is a
-  follow-up.
+- uDepot-ng status: `StoreConfig::memcache` selects uDepot's *MC runtimes'
+  GC (`udepot-lsa.cc:338-380`, `889-915`): eviction in GC, but with legacy's
+  policy, not the paper's. Legacy's is the circular buffer (salsa `gc_type`
+  1): the oldest segment first, whatever its contents, and GETs write
+  nothing; the paper's segment LRU would update a segment on every hit.
+  The decision is the maintainer's, and legacy first. The mode is not stored
+  on the device, as in legacy. A clean shutdown's persisted index is
+  restored as for any store; after a crash the store opens empty rather
+  than scanning the log (see `docs/architecture.md`, §9). Legacy's
+  overprovision 40 per mille is replaced by a live-data cap of the device
+  less 10 segments, by the maintainer's decision (§9, "Capacity"). Every
+  backend gets it; legacy's `TrtUringMC` runtime had the *MC salsa parameters but not the
+  eviction callback, which looks like an oversight. The network server
+  (`src/net`) and the bindings do not set it yet.
 
 ## Evaluation defaults worth matching (§5)
 

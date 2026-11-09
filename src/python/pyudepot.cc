@@ -24,9 +24,8 @@ static constexpr uint64_t kDefaultTableBytes = uint64_t{2} << 20;
 
 void* uDepotOpenTables(const char* fname, uint64_t size, int force_destroy,
                        uint64_t table_bytes) {
-    (void)force_destroy;
-
     udepot::StoreConfig config;
+    config.force_destroy = force_destroy != 0;
     config.path = fname;
     config.size = static_cast<size_t>(size);
     config.grain_size = 4096;

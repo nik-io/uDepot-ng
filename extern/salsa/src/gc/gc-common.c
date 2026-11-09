@@ -88,6 +88,8 @@ int gc_ctr(
 	os_atomic32_zero(&gc->exit);
 	os_atomic64_zero(&gc->valid_seg_nr);
 	os_atomic64_zero(&gc->inval_page_nr);
+	os_atomic64_zero(&gc->kick_gen);
+	os_atomic64_zero(&gc->kick_waits);
 	*((struct sto_capacity_mgr **) &gc->scm) = scm;
 	*((u64 *) &gc->seg_size) = scm_get_seg_size(scm);
 	*((enum gc_type *) &gc->gc_type) = params->gc;
@@ -206,6 +208,20 @@ void gc_reset_stats(struct gc *const gc)
 u32 gc_get_bin_nr(const struct gc *const gc)
 {
 	return gc->fns->get_bin_nr(gc);
+}
+
+void gc_kick(struct gc *const gc)
+{
+	/* The generation is bumped before the broadcast, and the waiter checks
+	 * it under the waitqueue's mutex, which the broadcast takes: a kick
+	 * cannot fall between the waiter's check and its wait. */
+	os_atomic64_inc(&gc->kick_gen);
+	os_wakeup_all(&gc->low_watermark_waitq);
+}
+
+u64 gc_get_kick_waits(const struct gc *const gc)
+{
+	return os_atomic64_read(&gc->kick_waits);
 }
 
 void gc_seg_destaged(

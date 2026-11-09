@@ -74,6 +74,20 @@ jobs:
       - name: Unit tests
         run: ctest --test-dir build -j"$(nproc)" --output-on-failure
 
+      # Block devices as the store, on loop devices: needs root and
+      # losetup, so the plain ctest run above skips it. Run it under sudo
+      # and fail on any skip, or it would pass here without ever touching a
+      # block device.
+      - name: Block device tests (root, loop devices)
+        run: |
+          sudo timeout 300 build/block_device_test 2>&1 | tee block_device_test.log
+          test "${PIPESTATUS[0]}" -eq 0
+          if grep -q 'SKIPPED' block_device_test.log; then
+            echo "::error::block_device_test skipped tests: it needs root and losetup"
+            exit 1
+          fi
+          grep -q 'PASSED' block_device_test.log
+
   tsan:
     name: unit tests (ThreadSanitizer)
     runs-on: ubuntu-24.04
@@ -142,6 +156,18 @@ jobs:
         env:
           TSAN_OPTIONS: halt_on_error=1
         run: ctest --test-dir build -j"$(nproc)" --output-on-failure
+
+      # As in the unit-test job: root and loop devices, so the plain ctest
+      # run skips it; fail on a skip or a hang.
+      - name: Block device tests (root, loop devices)
+        run: |
+          sudo env TSAN_OPTIONS=halt_on_error=1 timeout 300 build/block_device_test 2>&1 | tee block_device_test.log
+          test "${PIPESTATUS[0]}" -eq 0
+          if grep -q 'SKIPPED' block_device_test.log; then
+            echo "::error::block_device_test skipped tests: it needs root and losetup"
+            exit 1
+          fi
+          grep -q 'PASSED' block_device_test.log
 
   # Two checks on one setup: the SPDK backend tests (Debug, asserts on) and
   # the SPDK zero-copy perf invariant (Release, as the other backends' gate

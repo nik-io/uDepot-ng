@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <string>
 #include <sys/types.h>
 
 #include <liburing.h>
@@ -71,6 +72,19 @@ public:
     }
 
     size_t get_size() const noexcept { return size_; }
+    // Whether the last open() found a new or empty regular file: no store
+    // on it to restore (see size_store_fd).
+    bool fresh() const noexcept { return fresh_; }
+    // Whether a file with data may be grown to a size above its length
+    // (StoreConfig::force_destroy; true for a raw backend, which has no
+    // store to protect: store.cc sets it from its config before open()).
+    void set_force_destroy(bool v) noexcept { force_destroy_ = v; }
+    // After a failed first open: a new file the open took to its size goes
+    // back to empty (see truncate_fresh_file). Not for a device.
+    void discard_fresh() noexcept {
+        if (fresh_ && fd_ >= 0) truncate_fresh_file(fd_, path_.c_str());
+        fresh_ = false;
+    }
     // Whether the file is open O_DIRECT (see open_direct): a filesystem
     // that refuses it gets buffered I/O, and no zero copy.
     bool direct() const noexcept { return direct_; }
@@ -81,6 +95,10 @@ public:
     // io_uring_submit; a negative return is used as its result instead
     // (e.g. -EBUSY, which this kernel never returns), 0 submits for real.
     inline static std::atomic<int (*)()> submit_test_hook{nullptr};
+
+    // Test seam, never set in production: called before each ring setup;
+    // returning -errno fails it with that. 0 lets it go on.
+    inline static std::atomic<int (*)()> setup_test_hook{nullptr};
 
     // Reap this thread's completed I/Os and resume their coroutines, and
     // push submissions the kernel refused. Returns whether any of this
@@ -99,6 +117,9 @@ private:
 
     int fd_ = -1;
     size_t size_ = 0;
+    bool fresh_ = false;
+    bool force_destroy_ = true;
+    std::string path_;
     bool direct_ = false;
     unsigned queue_depth_ = kDefaultQueueDepth;
     bool poll_yields_set_ = false;

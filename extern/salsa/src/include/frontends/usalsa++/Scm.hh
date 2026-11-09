@@ -61,7 +61,10 @@ public:
 	Scm(); // invalid scm
 	~Scm();
 
-	int init(int argc, char **argv, u32 overprovision = 200U);
+	// max_capacity_grains != 0 sets the live-data cap directly, instead of
+	// deriving it from overprovision (per mille of the device).
+	int init(int argc, char **argv, u32 overprovision = 200U,
+	         u64 max_capacity_grains = 0);
 
 	// register/unregister controler
 	struct RegistrationInfo {
@@ -86,6 +89,14 @@ public:
 	void set_defer_free_seg(void (*fn)(void *arg, struct segment *seg),
 	                        void *arg);
 	void put_free_seg(struct segment *seg);
+	// A segment the circular GC met and the frontend could not free (its
+	// relocation upcall returned ENOSYS) may be freeable now: wake the GC,
+	// which waits after a lap of such segments. Once per such event.
+	void gc_kick();
+	// How many times the circular GC went to sleep waiting for a kick (its
+	// queue empty, or a lap of it freed nothing); not waits that returned at
+	// once.
+	u64 gc_waits() const;
 	u64 get_size(void) const;
 	u64 get_seg_size(void) const;
 	u64 get_grain_size(void) const;
