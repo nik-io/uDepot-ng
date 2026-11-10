@@ -219,6 +219,20 @@ class GetBuffer:
         return _value_array(self._owned, ptr, size.value, False)
 
 
+class MultiGetError(IOError):
+    """multi_get_into: some gets failed other than as a missing key.
+
+    An IOError (OSError) whose errno/strerror are those of the first failure.
+    `failed` is the list of (index, rc) of every such key, index into the
+    `keys` passed, in batch order, rc a negative errno as the C layer returns
+    it. The keys not listed were read or are missing (their buffers say which).
+    """
+
+    def __init__(self, failed, errno_, msg):
+        super().__init__(errno_, msg)
+        self.failed = failed
+
+
 # Index tables of 2 MiB: small, for tests. A store sized for real use
 # passes its own table_size (a power of two of at least 4096 bytes, or 0
 # for the store's default, 512 MiB tables); tables this small map on
@@ -377,8 +391,10 @@ class uDepot:
         Returns a list of bools, one per key: True with bufs[i].value the
         value of keys[i]; False for a key that is not in the store, with
         bufs[i].value empty. Any other failure (-EAGAIN, an I/O error) raises
-        IOError naming the first such key and its error, after every other
-        buffer has been filled: it is not a missing key, so it is not False.
+        MultiGetError (an IOError) naming the first such key and its error,
+        after every other buffer has been filled: it is not a missing key, so
+        it is not False. Its `failed` attribute lists (index, rc) for every
+        such key, indices into `keys`, rc a negative errno.
         (get_into still returns False for every failure; making it raise is a
         separate change.)
 
@@ -428,8 +444,8 @@ class uDepot:
                 ok.append(False)
         if failed:
             i, rc = failed[0]
-            raise IOError(
-                -rc, 'multi_get_into: {} of {} gets failed, not as a missing '
+            raise MultiGetError(
+                failed, -rc, 'multi_get_into: {} of {} gets failed, not as a missing '
                 'key; the first, key {}: {}. The buffers of the keys that '
                 'succeeded hold their values; retry the failed ones'.format(
                     len(failed), n, i, os.strerror(-rc)))

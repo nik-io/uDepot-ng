@@ -2,6 +2,7 @@
 # Copyright (c) 2024-2026 Nikolas Ioannou
 # SPDX-License-Identifier: BSD-3-Clause
 
+import errno
 import gc
 import os
 import sys
@@ -857,7 +858,16 @@ class TestMultiGetInto:
         msg = str(e.value)
         assert "key 1" in msg and "Invalid argument" in msg
         assert e.value.errno == 22
+        assert isinstance(e.value, pyudepot.MultiGetError)
+        assert e.value.failed == [(1, -errno.EINVAL)]
         np.testing.assert_array_equal(c.value, _mval(0))  # the others read
+        # every failed key is listed, in batch order, a missing one is not
+        bufs = [qstore.alloc_get_buffer(13, 300) for _ in range(5)]
+        with pytest.raises(IOError) as e:
+            qstore.multi_get_into([empty, _mkey(2), _mkey(0), empty.copy(),
+                                   _mkey(1)], bufs)
+        assert e.value.failed == [(0, -errno.EINVAL), (3, -errno.EINVAL)]
+        assert "key 0" in str(e.value) and "2 of 5" in str(e.value)
         # a missing key alone is not an error
         assert qstore.multi_get_into([_mkey(2)], [a]) == [False]
 

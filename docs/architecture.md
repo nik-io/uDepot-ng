@@ -741,9 +741,13 @@ and uses no threads and no locks.
   a context for at least 8 I/Os per possible CPU whatever depth was asked for,
   so the window is a safe bound, not an exact one.
 - **Errors.** A missing key (`-ENOENT`) is `False`. Any other failure
-  (`-EAGAIN`, `-EINVAL`, an I/O error) raises `IOError` naming the first such
-  key and its error, after the other buffers have been filled; it is not
-  reported as a missing key. (`get_into` still returns `False` for every
+  (`-EAGAIN`, `-EINVAL`, an I/O error) raises `pyudepot.MultiGetError` (an
+  `IOError`, so `errno`/`strerror` are those of the first failure; the message
+  names it) after the other buffers have been filled; it is not reported as a
+  missing key. Its `failed` attribute is the list of `(index, rc)` of every
+  such key, as data: indices into the `keys` argument in batch order, `rc` a
+  negative errno as the C layer returns it. It is a subclass so the attribute
+  is always there. (`get_into` still returns `False` for every
   failure.)
 - **Buffers** must be distinct objects (one buffer serves one get): a repeat
   raises `ValueError` before anything runs. The lifetime rule is `get_into`'s:
