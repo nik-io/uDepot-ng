@@ -707,3 +707,180 @@ class TestZeroCopyReachesTheCallersBuffer:
             addr - key.size))
         assert after == key.tobytes()
 
+
+
+W = 8  # the queue_depth the multi-get tests open their store with
+
+
+@pytest.fixture
+def qstore(tmp_path):
+    path = str(tmp_path / "pyudepot_mget")
+    kv = pyudepot.uDepot(file_name=path, size=STORE_SIZE, force_destroy=True,
+                         queue_depth=W)
+    yield kv
+    kv._cleanup()
+
+
+def _mkey(i):
+    return _key("mget_key_%04d" % i)
+
+
+def _present(i):
+    return i % 3 != 2  # every third key is never stored
+
+
+def _mval(i):
+    return _bytes_of(300, i)
+
+
+def _fill(kv, n):
+    for i in range(n):
+        if _present(i):
+            _zc_put(kv, _mkey(i), _mval(i))
+
+
+class TestMultiGetInto:
+    @pytest.mark.parametrize("n", [0, 1, 2, W - 1, W, W + 1, 4 * W, 200])
+    def test_each_key_gets_its_own_result_and_value(self, qstore, n):
+        _fill(qstore, max(n, 1))
+        keys = [_mkey(i) for i in range(n)]
+        bufs = [qstore.alloc_get_buffer(keys[i].size, 300) if keys else None
+                for i in range(n)]
+        ok = qstore.multi_get_into(keys, bufs)
+        assert ok == [_present(i) for i in range(n)]
+        for i in range(n):
+            if _present(i):
+                np.testing.assert_array_equal(bufs[i].value, _mval(i))
+                # the same bytes get_into returns
+                one = qstore.alloc_get_buffer(keys[i].size, 300)
+                assert qstore.get_into(keys[i], one)
+                np.testing.assert_array_equal(bufs[i].value, one.value)
+            else:
+                assert bufs[i].value.size == 0
+
+    def test_a_batch_far_past_the_kernels_queue_floor_needs_the_window(
+            self, tmp_path):
+        # The kernel sizes an AIO context for at least 8 I/Os per possible
+        # CPU whatever depth was asked for, so only a batch past that fills
+        # the queue: with every get in flight at once, some get -EAGAIN.
+        n = max(4096, 16 * (os.cpu_count() or 1) + 1024)
+        kv = pyudepot.uDepot(file_name=str(tmp_path / "wide"),
+                             size=64 * 1024 * 1024, force_destroy=True,
+                             queue_depth=W)
+        try:
+            data = _bytes_of(100, 1)
+            keys = [_mkey(i) for i in range(n)]
+            for k in keys:
+                _zc_put(kv, k, data)
+            bufs = [kv.alloc_get_buffer(13, 100) for _ in keys]
+            assert kv.multi_get_into(keys, bufs) == [True] * n
+            for b in bufs:
+                np.testing.assert_array_equal(b.value, data)
+        finally:
+            kv._cleanup()
+
+    def test_a_buffer_passed_twice_is_refused(self, qstore):
+        _fill(qstore, 4)
+        gb = qstore.alloc_get_buffer(13, 300)
+        other = qstore.alloc_get_buffer(13, 300)
+        with pytest.raises(ValueError, match="more than once"):
+            qstore.multi_get_into([_mkey(0), _mkey(1), _mkey(3)],
+                                  [gb, other, gb])
+        # refused before anything ran: neither buffer holds a value
+        assert gb.value.size == 0 and other.value.size == 0
+
+    def test_bad_arguments_are_refused(self, qstore, tmp_path):
+        _fill(qstore, 2)
+        gb = qstore.alloc_get_buffer(13, 300)
+        pb = qstore.alloc_put_buffer(13, 300)
+        with pytest.raises(ValueError):
+            qstore.multi_get_into([_mkey(0), _mkey(1)], [gb])
+        with pytest.raises(ValueError):
+            qstore.multi_get_into([_mkey(0)], [pb])
+        with pytest.raises(ValueError):
+            qstore.multi_get_into([_mkey(0).astype(np.int32)], [gb])
+        with pytest.raises(ValueError):
+            qstore.multi_get_into([_mkey(0)], [None])
+        foreign = pyudepot.uDepot(file_name=str(tmp_path / "other"),
+                                  size=STORE_SIZE, force_destroy=True)
+        try:
+            with pytest.raises(ValueError):
+                qstore.multi_get_into([_mkey(0)],
+                                      [foreign.alloc_get_buffer(13, 300)])
+        finally:
+            foreign._cleanup()
+
+    def test_copies_no_value(self, qstore):
+        _fill(qstore, 30)
+        keys = [_mkey(i) for i in range(30)]
+        bufs = [qstore.alloc_get_buffer(13, 300) for _ in keys]
+        before = pyudepot.thread_value_copies()
+        qstore.multi_get_into(keys, bufs)
+        assert pyudepot.thread_value_copies() == before
+
+    def test_a_live_array_is_not_overwritten_or_freed(self, qstore):
+        _fill(qstore, 2)
+        a = qstore.alloc_get_buffer(13, 300)
+        b = qstore.alloc_get_buffer(13, 300)
+        assert qstore.multi_get_into([_mkey(0), _mkey(1)], [a, b]) == \
+            [True, True]
+        held = a.value                      # a live array over a's buffer
+        assert qstore.multi_get_into([_mkey(1), _mkey(0)], [a, b]) == \
+            [True, True]
+        np.testing.assert_array_equal(held, _mval(0))   # not overwritten
+        np.testing.assert_array_equal(a.value, _mval(1))
+        np.testing.assert_array_equal(b.value, _mval(0))
+
+    def test_a_failed_key_leaves_an_empty_value(self, qstore):
+        _fill(qstore, 3)
+        a = qstore.alloc_get_buffer(13, 300)
+        b = qstore.alloc_get_buffer(13, 300)
+        assert qstore.multi_get_into([_mkey(0), _mkey(1)], [a, b]) == \
+            [True, True]
+        assert qstore.multi_get_into([_mkey(1), _mkey(2)], [a, b]) == \
+            [True, False]
+        assert a.value.size == 300 and b.value.size == 0
+
+    def test_queue_depth_is_the_open_parameter(self, tmp_path, capfd):
+        # A depth the kernel cannot give fails the open, saying so.
+        with pytest.raises(IOError):
+            pyudepot.uDepot(file_name=str(tmp_path / "huge"), size=STORE_SIZE,
+                            force_destroy=True, queue_depth=2**31)
+        assert "failed to init uDepot-ng" in capfd.readouterr().err
+
+    def test_a_failure_that_is_not_a_missing_key_raises(self, qstore):
+        _fill(qstore, 2)
+        empty = np.empty(0, dtype=np.uint8)  # the store refuses it: -EINVAL
+        a, b, c = (qstore.alloc_get_buffer(13, 300) for _ in range(3))
+        with pytest.raises(IOError) as e:
+            qstore.multi_get_into([_mkey(2), empty, _mkey(0)], [a, b, c])
+        msg = str(e.value)
+        assert "key 1" in msg and "Invalid argument" in msg
+        assert e.value.errno == 22
+        np.testing.assert_array_equal(c.value, _mval(0))  # the others read
+        # a missing key alone is not an error
+        assert qstore.multi_get_into([_mkey(2)], [a]) == [False]
+
+    def test_the_window_follows_the_thread_not_the_store(self, tmp_path):
+        # A thread's AIO context is shared by every store on it, and the
+        # store opened last sizes it. Opening a shallow store here shrinks
+        # the context the deep store's gets run in: a window of the deep
+        # store's own depth would fail the gets past it with -EAGAIN.
+        n = max(4096, 16 * (os.cpu_count() or 1) + 1024)
+        deep = pyudepot.uDepot(file_name=str(tmp_path / "deep"),
+                               size=64 * 1024 * 1024, force_destroy=True)
+        shallow = None
+        try:
+            data = _bytes_of(100, 2)
+            keys = [_mkey(i) for i in range(n)]
+            for k in keys:
+                _zc_put(deep, k, data)
+            shallow = pyudepot.uDepot(file_name=str(tmp_path / "shallow"),
+                                      size=STORE_SIZE, force_destroy=True,
+                                      queue_depth=W)
+            bufs = [deep.alloc_get_buffer(13, 100) for _ in keys]
+            assert deep.multi_get_into(keys, bufs) == [True] * n
+        finally:
+            if shallow:
+                shallow._cleanup()
+            deep._cleanup()

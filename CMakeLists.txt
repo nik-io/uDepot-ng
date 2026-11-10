@@ -204,6 +204,7 @@ if(UDEPOT_BUILD_TESTS)
     # contention from tests running alongside it makes that a coin flip.
     set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 180
                          RUN_SERIAL TRUE)
+    udepot_add_test(multi_get_test test/multi_get_test.cc)
     udepot_add_test(net_test test/io/net_test.cc)
 
     if(UDEPOT_BUILD_NET)
@@ -233,6 +234,16 @@ if(UDEPOT_BUILD_TESTS)
                     -q --tb=short
         )
         set_tests_properties(pyudepot_test PROPERTIES TIMEOUT 60)
+
+        # The C ABI as the binding calls it, with the store's test hooks:
+        # pyudepot.cc is compiled in, not loaded.
+        add_executable(pyudepot_abi_test test/pyudepot_abi_test.cc
+                       src/python/pyudepot.cc)
+        target_include_directories(pyudepot_abi_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/python)
+        target_link_libraries(pyudepot_abi_test PRIVATE udepot GTest::gtest_main)
+        add_test(NAME pyudepot_abi_test COMMAND pyudepot_abi_test)
+        set_tests_properties(pyudepot_abi_test PROPERTIES TIMEOUT 120)
     endif()
 
     if(UDEPOT_BUILD_JNI)

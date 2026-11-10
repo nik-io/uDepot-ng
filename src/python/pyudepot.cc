@@ -3,11 +3,13 @@
 
 #include "pyudepot.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <span>
 
+#include "udepot/multi_get.h"
 #include "udepot/store.h"
 #include "udepot/io/aio.h"
 
@@ -22,9 +24,10 @@ extern "C" {
 // segment this small maps on 4 KiB pages, and open() says so.
 static constexpr uint64_t kDefaultTableBytes = uint64_t{2} << 20;
 
-void* uDepotOpenTables(const char* fname, uint64_t size, int force_destroy,
-                       uint64_t table_bytes) {
+void* uDepotOpenQueue(const char* fname, uint64_t size, int force_destroy,
+                      uint64_t table_bytes, uint32_t queue_depth) {
     udepot::StoreConfig config;
+    config.queue_depth = queue_depth;
     config.force_destroy = force_destroy != 0;
     config.path = fname;
     config.size = static_cast<size_t>(size);
@@ -47,6 +50,11 @@ void* uDepotOpenTables(const char* fname, uint64_t size, int force_destroy,
         return nullptr;
     }
     return static_cast<void*>(store);
+}
+
+void* uDepotOpenTables(const char* fname, uint64_t size, int force_destroy,
+                       uint64_t table_bytes) {
+    return uDepotOpenQueue(fname, size, force_destroy, table_bytes, 0);
 }
 
 void* uDepotOpen(const char* fname, uint64_t size, int force_destroy) {
@@ -157,6 +165,22 @@ int uDepotGetBuf(void* kv, const uint8_t key[], uint32_t key_size,
     auto key_span = std::span<const uint8_t>(key, key_size);
     return store->get(key_span, static_cast<udepot::GetBuffer*>(get_buf))
         .run_sync();
+}
+
+int uDepotMultiGetBuf(void* kv, uint32_t n, const uint8_t* const keys[],
+                      const uint32_t key_sizes[], void* const get_bufs[],
+                      int results[]) {
+    auto* store = static_cast<Store*>(kv);
+    // At most what the calling thread's AIO context takes (a get past it
+    // fails -EAGAIN). The context is the thread's, shared by every store on
+    // it and sized by the store opened last, so the store's own
+    // queue_depth() (StoreConfig::queue_depth, default 1024) can exceed it.
+    const unsigned window =
+        std::min(store->io().queue_depth(), udepot::AioIO::thread_queue_room());
+    return udepot::multi_get(
+        *store, n, keys, key_sizes,
+        reinterpret_cast<udepot::GetBuffer* const*>(get_bufs), results,
+        window);
 }
 
 const uint8_t* uDepotGetBufferValue(void* get_buf, uint64_t* size_out) {

@@ -88,6 +88,15 @@ public:
     // Returns whether any of this thread's I/O is still outstanding.
     static bool poll_thread();
 
+    // How many more I/Os the calling thread can submit before one fails
+    // -EAGAIN: its context's depth less what it has in flight. The context
+    // belongs to the thread, not to a store: every AioIO on the thread
+    // shares it, open() of any store resizes it when it is idle, and a
+    // thread's first I/O creates it at the depth of the store opened last
+    // (so a thread with no context yet reports that). A caller keeping many
+    // I/Os in flight sizes itself by this, not by queue_depth().
+    static unsigned thread_queue_room() noexcept;
+
     // AIO contexts that exist now, across all threads: one per thread that
     // has done AIO, released when the thread exits. Each reserves its
     // depth against fs.aio-max-nr, so this is what a server that adds
