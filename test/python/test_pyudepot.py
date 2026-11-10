@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import os
+import re
 import tempfile
 
 import numpy as np
@@ -237,3 +238,67 @@ class TestTableSize:
     def test_invalid_table_size_fails_open(self, tmp_path, table_size):
         with pytest.raises(IOError):
             self._open(tmp_path, table_size=table_size)
+
+
+class TestMaxValue:
+    """A record (14-byte header, key, value, 2-byte CRC, rounded up to
+    4096-byte grains) must fit one segment's data grains (the segment less
+    its one metadata grain) and a hash entry's 11-bit size (2047 grains):
+    the longest value is the smaller of the two, and one byte more is
+    refused.
+
+    put() returns a bool, so these tests cannot tell the -EINVAL the store
+    returns for a record that cannot fit from -ENOSPC or -ENOMEM; the C++
+    tests (test/store_geometry_test.cc) check the code.
+    """
+
+    @pytest.mark.parametrize("table_size,size,seg_grains,grains,limit", [
+        # Segment 514 grains: 513 of data, the segment is the limit.
+        (2 * 1024 * 1024, 64 * 1024 * 1024, 514, 513, "the segment"),
+        # Segment 2050 grains: the entry's 2047 grains are the limit.
+        (8 * 1024 * 1024, TestTableSize._fitting_size(8 * 1024 * 1024),
+         2050, 2047, "a hash entry"),
+    ])
+    @pytest.mark.parametrize("key_size", [1, 8, 100])
+    def test_boundary(self, tmp_path, capfd, table_size, size, seg_grains,
+                      grains, limit, key_size):
+        kv = pyudepot.uDepot(file_name=str(tmp_path / "max"), size=size,
+                             force_destroy=True, table_size=table_size)
+        err = capfd.readouterr().err
+        assert kv.grain_size() == 4096
+        # The segment is what the comments above say, and one grain of it
+        # is metadata: the 2047-grain term binds only past 2048 grains.
+        assert kv.segment_size() // kv.grain_size() == seg_grains
+        assert (seg_grains - 1 > 2047) == (grains == 2047)
+        # The store's own message agrees with the accessors.
+        m = re.search(r"udepot: (\d+) segments of (\d+) KiB \((\d+)-byte "
+                      r"grains, (\d+) of them data\); the largest record is "
+                      r"(\d+) grains, (\d+) bytes \(a value of up to (\d+) "
+                      r"bytes under an 8-byte key\); .*Limited by ([a-z ]+)",
+                      err)
+        assert m, err
+        assert kv.segment_size() == int(m.group(2)) * 1024
+        assert int(m.group(3)) == kv.grain_size()
+        assert int(m.group(5)) == grains
+        assert int(m.group(6)) == grains * 4096
+        assert int(m.group(7)) == kv.max_value_bytes(8)
+        assert m.group(8).startswith(limit)
+
+        n = kv.max_value_bytes(key_size)
+        assert n == grains * 4096 - (14 + key_size + 2)
+        key = np.full(key_size, 7, dtype=np.uint8)
+        val = np.arange(n, dtype=np.uint64).astype(np.uint8)
+        assert kv.put(key, val)
+        out = np.zeros(n, dtype=np.uint8)
+        assert kv.get(key, out)
+        assert np.array_equal(out, val)
+
+        key2 = np.full(key_size, 9, dtype=np.uint8)
+        assert not kv.put(key2, np.zeros(n + 1, dtype=np.uint8))
+        assert kv.exists(key2) is None
+        kv._cleanup()
+
+    def test_invalid_key_sizes_hold_no_value(self, store):
+        assert store.max_value_bytes(0) == 0
+        assert store.max_value_bytes(65536) == 0
+        assert store.max_value_bytes(1) > 0

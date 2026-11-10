@@ -711,7 +711,10 @@ On the sync backend (posix) the coroutines never suspend, so it degrades to
 sequential I/O — correct but not concurrent, same as today.
 
 The Python `uDepot` class exposes `get`, `put`, `delete`, `exists`, and
-`multi_get`. `multi_get` is a single ctypes call into `udepot_multi_get`, not a
+`multi_get`, and the store's geometry: `max_value_bytes(key_size)` (the
+longest value `put` takes under such a key, see "Largest record"),
+`grain_size()` and `segment_size()` in bytes. A `put` of a longer value
+returns False. `multi_get` is a single ctypes call into `udepot_multi_get`, not a
 Python-side thread pool.
 
 An async Python API (asyncio-compatible, mapping each coroutine to an asyncio
@@ -774,6 +777,49 @@ multiple of the segment size gets the smaller segment size that leaves one
 and wastes least, and a restored store without one fails to open. Without
 the check, the device metadata sat inside the last segment, so filling the
 device overwrote it and the next open started an empty store.
+
+### Largest record
+
+A record (header, key, value and checksum, 16 bytes besides key and value,
+rounded up to whole grains) is written whole into one segment, and a hash
+entry says its size in 11 bits of grains. Two limits follow, and the largest
+record is the smaller of them:
+
+- **the entry's**: 2047 grains (`HashEntry::kKvSizeMask`): 1 MiB - 512 B at
+  512-byte grains, 8 MiB - 4 KiB at 4 KiB grains. This one is a divergence
+  from uDepot, which has not been agreed: in uDepot the field *saturates*,
+  it is not a cap. `uDepotMap` stores `min(kv_size, UDEPOT_SALSA_MAX_KV_SIZE)`
+  (`udepot-map.hh:199,207`), and where the field equals the maximum, a
+  record's true size is read from its header (`udepot-directory-map.cc:
+  669-684`: "have to read from disk the KV metadata to figure out its full
+  size"), the paper's "second IO" (`docs/udepot-paper.md`, the entry layout).
+  So uDepot accepts records past 2047 grains, up to a segment. uDepot-ng
+  refuses them; implementing the second IO is a low-priority todo, not part
+  of this change, which keeps the cap as it was.
+- **the segment's**: its data grains, the segment less its metadata grains
+  (`seg_md_grains_`, one at 512 and 4096). Salsa refuses a longer record
+  (`SalsaCtlr::allocate_grains_no_wait`, EINVAL: legacy's put returns that
+  error to its caller too).
+  Only a segment under 2048 grains meets this limit: a small device, which
+  shrinks the segment, or a small table.
+
+`uDepot::max_record_grains()` is that minimum, `max_record_bytes()` times the
+grain, and `max_value_bytes(key_size)` the longest value under a key (valid
+after `open()`). `check_sizes`, which `put`, `alloc_put_buffer` and
+`alloc_get_buffer` call before allocating anything, uses the same function
+and refuses a longer record with `-EINVAL`. Before this, `check_sizes` knew
+only the entry's limit: a record over the segment but within it got `-ENOSPC`
+from salsa, which reads as a full store.
+
+`alloc_get_buffer` is sized as the record it will read, so on a store whose
+segment holds fewer than 2047 data grains it now refuses a buffer larger than
+any record that could be stored, where it used to hand one out. Nothing in
+the repository relied on that: the bindings do not use it, and the tests and
+the bench allocate for values they put.
+
+`open()` says the segment, the grain, the largest record and which limit it
+comes from; the Python binding reports them as `max_value_bytes(key_size)`,
+`grain_size()` and `segment_size()`.
 
 ### Index segments (paper §4.4)
 

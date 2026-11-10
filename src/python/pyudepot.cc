@@ -99,4 +99,17 @@ int uDepotExists(void* kv, const uint8_t key[], uint32_t key_size,
     return rc;
 }
 
+uint64_t uDepotMaxValueBytes(void* kv, uint32_t key_size) {
+    return static_cast<Store*>(kv)->max_value_bytes(key_size);
+}
+
+uint32_t uDepotGrainBytes(void* kv) {
+    return static_cast<Store*>(kv)->grain_size();
+}
+
+uint64_t uDepotSegmentBytes(void* kv) {
+    auto* store = static_cast<Store*>(kv);
+    return store->segment_grains() * store->grain_size();
+}
+
 }  // extern "C"

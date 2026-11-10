@@ -1630,6 +1630,25 @@ int uDepot<IO>::open(const StoreConfig& config) {
         space_stop_ = false;
     }
     space_waker_ = std::thread(&uDepot::space_waker_loop, this);
+    // The geometry the open ended up with, said whether or not it is the
+    // one asked for (a small device shrinks it, and the largest value
+    // follows the segment): what max_record_bytes() and the bindings report.
+    std::fprintf(
+        stderr,
+        "udepot: %llu segments of %llu KiB (%u-byte grains, %llu of them "
+        "data); the largest record is %llu grains, %zu bytes (a value of up "
+        "to %zu bytes under an 8-byte key); a longer one is refused with "
+        "EINVAL. Limited by %s.\n",
+        static_cast<unsigned long long>(total_grains_ / get_seg_size()),
+        static_cast<unsigned long long>(get_seg_size() * grain_size_ >> 10),
+        grain_size_,
+        static_cast<unsigned long long>(get_seg_size() - seg_md_grains_),
+        static_cast<unsigned long long>(max_record_grains()),
+        max_record_bytes(), max_value_bytes(8),
+        get_seg_size() - seg_md_grains_ < HashEntry::kKvSizeMask
+            ? "the segment (a record never spans two)"
+            : "a hash entry's 11-bit record size (2047 grains)");
+
     // Said once the open has succeeded, so a failed open does not claim a
     // memcache store.
     if (memcache_) {
@@ -2233,10 +2252,31 @@ int uDepot<IO>::commit_put(uint64_t hash, const KeyProbe& probe,
 }
 
 template <typename IO>
+uint64_t uDepot<IO>::max_record_grains() const {
+    if (!scm_) return 0;
+    // A record is written whole into one segment's data grains: salsa
+    // refuses a longer one (SalsaCtlr::allocate_grains_no_wait, EINVAL),
+    // so put must not get that far (it would report it as -ENOSPC).
+    const uint64_t net_grains = get_seg_size() - seg_md_grains_;
+    return std::min<uint64_t>(HashEntry::kKvSizeMask, net_grains);
+}
+
+template <typename IO>
+size_t uDepot<IO>::max_value_bytes(size_t key_size) const {
+    if (key_size == 0 || key_size > UINT16_MAX) return 0;
+    const size_t fixed = kv_total_bytes(key_size, 0);
+    const size_t max_bytes = max_record_bytes();
+    // The record's last grain holds whatever the value leaves of it, so
+    // the longest value fills the largest record exactly.
+    return max_bytes > fixed ? max_bytes - fixed : 0;
+}
+
+template <typename IO>
 int uDepot<IO>::check_sizes(size_t key_size, size_t val_size) const {
     if (key_size == 0 || key_size > UINT16_MAX) return -EINVAL;
     if (val_size >= kTombstoneValSize) return -EINVAL;  // reserved
-    if (kv_total_grains(key_size, val_size) > HashEntry::kKvSizeMask)
+    // Both limits (max_record_grains): the hash entry's and the segment's.
+    if (kv_total_grains(key_size, val_size) > max_record_grains())
         return -EINVAL;
     return 0;
 }

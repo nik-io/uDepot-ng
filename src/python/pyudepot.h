@@ -25,4 +25,13 @@ DLLOUT int   uDepotDel(void* kv, const uint8_t key[], uint32_t key_size);
 DLLOUT int   uDepotExists(void* kv, const uint8_t key[], uint32_t key_size,
                            uint64_t* val_size_out);
 
+// The store's geometry, as open() ended up with it (a small device shrinks
+// the segment). Largest value a put under a key of key_size bytes can
+// store; 0 if the key size is invalid or leaves room for at most an empty
+// value. A larger one is refused with EINVAL: see uDepot::max_record_grains.
+DLLOUT uint64_t uDepotMaxValueBytes(void* kv, uint32_t key_size);
+// The store's grain, and its segment (a record never spans two), in bytes.
+DLLOUT uint32_t uDepotGrainBytes(void* kv);
+DLLOUT uint64_t uDepotSegmentBytes(void* kv);
+
 }
