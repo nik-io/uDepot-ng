@@ -363,15 +363,39 @@ class TestZeroCopyRoundTrip:
         assert store.get_into(key, gb)
         np.testing.assert_array_equal(gb.value, _bytes_of(100, 3))
 
-    def test_get_value_is_read_only_and_put_value_writable(self, store):
+    def test_put_and_get_values_are_writable(self, store):
         key = _key("flags!!!")
         pb = store.alloc_put_buffer(8, 10)
         assert pb.value.flags.writeable
         assert store.put_buffer(key, pb)
         gb = store.alloc_get_buffer(8, 10)
         assert store.get_into(key, gb)
-        assert not gb.value.flags.writeable
+        assert gb.value.flags.writeable
         assert gb.value.dtype == np.uint8
+
+    def test_writing_into_a_get_value_changes_nothing_stored(self, store):
+        key, data = _key("private!"), _bytes_of(5000, 3)
+        _zc_put(store, key, data)
+        gb = store.alloc_get_buffer(8, 5000)
+        assert store.get_into(key, gb)
+        v = gb.value
+        v[:] = 0xEE                       # scribble over the whole value
+        assert (gb.value == 0xEE).all()   # same memory, so it is visible here
+        # The store still holds the original ...
+        np.testing.assert_array_equal(_zc_get(store, key, 5000), data)
+        out = np.zeros(5000, dtype=np.uint8)
+        assert store.get(key, out)
+        np.testing.assert_array_equal(out, data)
+        # ... and a later get into the same buffer (while v is alive, so into
+        # a fresh one; after v is gone, into the scribbled one) returns it.
+        assert store.get_into(key, gb)
+        np.testing.assert_array_equal(gb.value, data)
+        np.testing.assert_array_equal(v, 0xEE)  # v untouched by that get
+        del v
+        gc.collect()
+        gb.value[:] = 0x11
+        assert store.get_into(key, gb)
+        np.testing.assert_array_equal(gb.value, data)
 
 
 class TestZeroCopyIsZeroCopy:

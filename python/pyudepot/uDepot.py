@@ -178,7 +178,7 @@ class PutBuffer:
 class GetBuffer:
     """A buffer for get_into() to read values into, reused across gets.
 
-    `value` is a read-only uint8 array viewing the value of the last
+    `value` is a writable uint8 array viewing the value of the last
     successful get_into, empty before one and after a failed one. Like a
     PutBuffer's it is unaligned (starts 14 + key_size bytes into a
     4096-aligned record buffer, key_size being the key just read).
@@ -191,7 +191,10 @@ class GetBuffer:
     serves one call at a time, as the C++ buffers do; using one buffer from
     two threads at once is undefined. Arrays taken from `.value` may be
     shared between threads: a later get_into never overwrites or frees a
-    buffer that an array still views. The memory is the AIO backend's aligned_alloc memory
+    buffer that an array still views, so the buffer is private to the arrays
+    made from it: writing into `value` changes nothing in the store and
+    nothing a later get returns (it is writable so that consumers such as
+    torch.from_numpy need not copy). The memory is the AIO backend's aligned_alloc memory
     (this binding is AIO-only); on SPDK it would be rte_malloc DMA memory
     tied to the SPDK environment, which the binding does not expose.
     """
@@ -205,10 +208,10 @@ class GetBuffer:
     @property
     def value(self):
         if not self._has_value:
-            return _value_array(self._owned, None, 0, True)
+            return _value_array(self._owned, None, 0, False)
         size = c_ulonglong(0)
         ptr = pygetvalue(self._owned.handle, byref(size))
-        return _value_array(self._owned, ptr, size.value, True)
+        return _value_array(self._owned, ptr, size.value, False)
 
 
 # Index tables of 2 MiB: small, for tests. A store sized for real use

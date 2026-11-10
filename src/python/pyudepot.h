@@ -58,8 +58,10 @@ DLLOUT void* uDepotNewGetBuffer(void);
 // get). On error the value is empty and the buffer is kept.
 DLLOUT int   uDepotGetBuf(void* kv, const uint8_t key[], uint32_t key_size,
                            void* get_buf);
-// The value of the last uDepotGetBuf: read-only, *size_out bytes (NULL
-// when there is none).
+// The value of the last uDepotGetBuf: *size_out bytes (NULL when there is
+// none). The memory is the buffer's own, private to the caller until the
+// next uDepotGetBuf on it, so the caller may write into it (the store keeps
+// no reference to it); the const only says the store does not.
 DLLOUT const uint8_t* uDepotGetBufferValue(void* get_buf,
                                            uint64_t* size_out);
 DLLOUT void  uDepotFreeGetBuffer(void* get_buf);

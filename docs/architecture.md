@@ -722,8 +722,8 @@ Python-side thread pool.
 `uDepotAllocGetBuffer`, `uDepotGetBuf`, ...). `PutBuffer.value` is a writable
 numpy `uint8` array over the record buffer's value region: fill it in place and
 `kv.put_buffer(key, pb)` writes it, with no copy (`pb` is reusable once that
-returns). `kv.get_into(key, gb)` reads into `gb`, and `gb.value` (read-only)
-views the value as of that get. `pyudepot.thread_value_copies()` is
+returns). `kv.get_into(key, gb)` reads into `gb`, and `gb.value` (also
+writable) views the value as of that get. `pyudepot.thread_value_copies()` is
 `uDepot::thread_value_copies()` for the calling thread; the tests assert it does
 not move across a zero-copy put and get, and moves by one per copying call.
 
@@ -736,6 +736,12 @@ not move across a zero-copy put and get, and moves by one per copying call.
   keeps as that array's base and which holds the owner of the C handle; a view
   holds the array it was made from, so it keeps the region alive too (on
   numpy 1.26 a slice's `.base` is the ndarray, not the region).
+- **Get values are writable.** A get buffer is private to the arrays made
+  from it: `get_into` never overwrites or frees a buffer a live array views
+  (it reads into a fresh one), and the store keeps no reference to the
+  buffer's memory (no cache, no index pointing into it), so writing into
+  `gb.value` changes neither the stored value nor what a later get returns.
+  Read-only would only force consumers (`torch.from_numpy`) to copy.
 - **Replacement.** A get into a `GetBuffer` that is too small reads into a new
   buffer, freeing the old one (`GetBuffer::value()` can move). The binding never
   lets that, or a reuse of the buffer, change or free memory an earlier array
