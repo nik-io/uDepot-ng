@@ -99,4 +99,76 @@ int uDepotExists(void* kv, const uint8_t key[], uint32_t key_size,
     return rc;
 }
 
+void* uDepotAllocPutBuffer(void* kv, uint32_t key_size, uint64_t val_size) {
+    auto* store = static_cast<Store*>(kv);
+    auto* pb = new (std::nothrow) udepot::PutBuffer();
+    if (pb) *pb = store->alloc_put_buffer(key_size,
+                                          static_cast<size_t>(val_size));
+    if (!pb || !pb->valid()) {
+        fprintf(stderr, "uDepot-ng: cannot allocate a put buffer for a key "
+                "of %u bytes and a value of %llu bytes\n", key_size,
+                static_cast<unsigned long long>(val_size));
+        delete pb;
+        return nullptr;
+    }
+    return pb;
+}
+
+uint8_t* uDepotPutBufferValue(void* put_buf, uint64_t* size_out) {
+    auto value = static_cast<udepot::PutBuffer*>(put_buf)->value();
+    *size_out = value.size();
+    return value.data();
+}
+
+int uDepotPutBuf(void* kv, const uint8_t key[], uint32_t key_size,
+                 void* put_buf) {
+    auto* store = static_cast<Store*>(kv);
+    auto key_span = std::span<const uint8_t>(key, key_size);
+    return store->put(key_span, *static_cast<udepot::PutBuffer*>(put_buf))
+        .run_sync();
+}
+
+void uDepotFreePutBuffer(void* put_buf) {
+    delete static_cast<udepot::PutBuffer*>(put_buf);
+}
+
+void* uDepotAllocGetBuffer(void* kv, uint32_t key_size, uint64_t val_size) {
+    auto* store = static_cast<Store*>(kv);
+    auto* gb = new (std::nothrow) udepot::GetBuffer();
+    if (gb) *gb = store->alloc_get_buffer(key_size,
+                                          static_cast<size_t>(val_size));
+    if (!gb || !gb->valid()) {
+        fprintf(stderr, "uDepot-ng: cannot allocate a get buffer for a key "
+                "of %u bytes and a value of %llu bytes\n", key_size,
+                static_cast<unsigned long long>(val_size));
+        delete gb;
+        return nullptr;
+    }
+    return gb;
+}
+
+void* uDepotNewGetBuffer(void) {
+    return new (std::nothrow) udepot::GetBuffer();
+}
+
+int uDepotGetBuf(void* kv, const uint8_t key[], uint32_t key_size,
+                 void* get_buf) {
+    auto* store = static_cast<Store*>(kv);
+    auto key_span = std::span<const uint8_t>(key, key_size);
+    return store->get(key_span, static_cast<udepot::GetBuffer*>(get_buf))
+        .run_sync();
+}
+
+const uint8_t* uDepotGetBufferValue(void* get_buf, uint64_t* size_out) {
+    auto value = static_cast<udepot::GetBuffer*>(get_buf)->value();
+    *size_out = value.size();
+    return value.data();
+}
+
+void uDepotFreeGetBuffer(void* get_buf) {
+    delete static_cast<udepot::GetBuffer*>(get_buf);
+}
+
+uint64_t uDepotThreadValueCopies(void) { return Store::thread_value_copies(); }
+
 }  // extern "C"
