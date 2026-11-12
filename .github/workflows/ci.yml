@@ -67,7 +67,7 @@ jobs:
       # disables io_uring when liburing is absent), and the run would pass
       # while covering less. Fail instead.
       - name: Every test is built
-        run: scripts/ci-check-tests-built.sh build pyudepot_test jni_test
+        run: scripts/ci-check-tests-built.sh build pyudepot_test pyudepot_abi_test jni_test
 
       # The AIO and io_uring tests make their stores in /tmp and open them
       # O_DIRECT, as uDepot does. A /tmp that refused it would run them all
@@ -101,6 +101,19 @@ jobs:
             exit 1
           fi
           grep -q 'PASSED' block_device_test.log
+
+      # The binding's grain check on a 4Kn loop device: root and losetup
+      # again, so ctest skips it; fail on a skip, or it would pass here
+      # without ever touching a 4Kn device.
+      - name: Binding grain check on a 4Kn loop device (root)
+        run: |
+          sudo timeout 300 build/pyudepot_abi_test --gtest_filter='PyudepotGrainLoop.*' 2>&1 | tee pyudepot_4kn.log
+          test "${PIPESTATUS[0]}" -eq 0
+          if grep -q 'SKIPPED' pyudepot_4kn.log; then
+            echo "::error::the 4Kn grain test skipped: it needs root and losetup --sector-size"
+            exit 1
+          fi
+          grep -q 'PASSED' pyudepot_4kn.log
 
   tsan:
     name: unit tests (ThreadSanitizer)
