@@ -38,6 +38,21 @@ DLLOUT void* uDepotOpenQueue(const char* fname, uint64_t size,
 DLLOUT void* uDepotOpenGrain(const char* fname, uint64_t size,
                              int force_destroy, uint64_t table_bytes,
                              uint32_t queue_depth, uint32_t grain_bytes);
+// As uDepotOpenGrain, with segments of segment_bytes instead of a segment
+// fitted to table_bytes (StoreConfig::segment_size; each directory table
+// fills one segment, so it also sets the table: the largest power of two
+// that fits the segment). segment_bytes 0 is uDepotOpenGrain's. Otherwise
+// table_bytes must be 0 (the two set the same thing; both is refused), and
+// segment_bytes a multiple of the grain and of 4096 (the store rounds
+// any other down), and at least a metadata grain plus the room a table
+// needs; else NULL with a message on stderr. A device too small for the
+// segment gets it halved by the store, which says so (the result is
+// uDepotSegmentBytes). A store keeps the segment it was created with: on a
+// reopen segment_bytes is checked as above, then ignored, as table_bytes is.
+DLLOUT void* uDepotOpenSegment(const char* fname, uint64_t size,
+                               int force_destroy, uint64_t table_bytes,
+                               uint32_t queue_depth, uint32_t grain_bytes,
+                               uint64_t segment_bytes);
 DLLOUT void  uDepotClose(void* kv);
 DLLOUT int   uDepotGet(void* kv, const uint8_t key[], uint32_t key_size,
                         uint8_t val_buf[], uint64_t val_buf_size);

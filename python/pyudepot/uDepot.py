@@ -17,7 +17,7 @@ _lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 libudepot = ctypes.cdll.LoadLibrary(
     _lib_path if os.path.exists(_lib_path) else 'libpyudepot.so')
 
-pyopen = libudepot.uDepotOpenGrain
+pyopen = libudepot.uDepotOpenSegment
 pyclose = libudepot.uDepotClose
 pyget = libudepot.uDepotGet
 pyput = libudepot.uDepotPut
@@ -28,7 +28,7 @@ pygrain = libudepot.uDepotGrainBytes
 pysegment = libudepot.uDepotSegmentBytes
 
 pyopen.argtypes = [c_char_p, c_ulonglong, c_int, c_ulonglong, c_uint,
-                   c_uint]
+                   c_uint, c_ulonglong]
 pyopen.restype = c_void_p
 pyclose.argtypes = [c_void_p]
 pyget.argtypes = [c_void_p,
@@ -279,12 +279,29 @@ class uDepot:
         that force_destroy once formatted at a smaller grain or size can
         still open the older store left under it (see "Grain size" in
         docs/architecture.md); use a new file to change it.
+
+        segment_size is the store's segment in bytes (default None: the one
+        that fits table_size). Each index table fills one segment, so it is
+        the other way to size the tables, and giving both a
+        table_size (any value, the default's and 0 included) and a
+        segment_size raises ValueError (as does a
+        segment_size that is not an int in 1 .. 2**64 - 1). It must be a
+        multiple of grain_size and of 4096, and large enough for the
+        segment's metadata grain and an index table, else IOError (the
+        reason is on stderr); the longest value is the segment less its
+        metadata grain, in grains, capped at 2047 (max_value_bytes). A
+        device too small for it makes the store halve it and say so:
+        segment_size() is what it ended up as. A reopen takes the segment
+        the store was created with and ignores segment_size (as it does
+        table_size), after checking it as above (see "Segment size" in
+        docs/architecture.md).
         """
         self._fname = kwargs.get('file_name', '/tmp/pyudepot-test')
         self._size = kwargs.get('size', 1024 * 1024 + 4096)
         self._force_destroy = 1 if kwargs.get('force_destroy', False) else 0
         self._table_size = kwargs.get('table_size', DEFAULT_TABLE_SIZE)
         self._queue_depth = kwargs.get('queue_depth', 0)
+        self._segment_size = kwargs.get('segment_size', None)
         self._grain_size = kwargs.get('grain_size', DEFAULT_GRAIN_SIZE)
         # ctypes would wrap a value past 32 bits into a valid-looking grain.
         if (not isinstance(self._grain_size, int)
@@ -292,15 +309,32 @@ class uDepot:
             raise ValueError(
                 'grain_size={!r} is not valid: it must be a power of two '
                 'from 512 to 1048576 bytes'.format(self._grain_size))
+        table_size = self._table_size
+        if self._segment_size is not None:
+            seg = self._segment_size
+            # bool is an int; ctypes would wrap 2**64 + 4096 to a valid one.
+            if (not isinstance(seg, int) or isinstance(seg, bool)
+                    or not 0 < seg < 2**64):
+                raise ValueError(
+                    'segment_size={!r} is not valid: it must be an int of '
+                    'bytes, a multiple of grain_size and of 4096'.format(seg))
+            if 'table_size' in kwargs:
+                raise ValueError(
+                    'both segment_size={} and table_size={} were given: they '
+                    'set the same thing (a table fills one segment), so '
+                    'give one'.format(seg, table_size))
+            table_size = 0  # the segment sets the tables
         self._kv = pyopen(
             self._fname.encode('utf-8'), self._size, self._force_destroy,
-            self._table_size, self._queue_depth, self._grain_size)
+            table_size, self._queue_depth, self._grain_size,
+            self._segment_size or 0)
         if not self._kv:
             raise IOError(
                 'failed to open uDepot for {} (size={}, grain_size={}, '
-                'force_destroy={}); the reason is on stderr'.format(
+                'segment_size={}, force_destroy={}); the reason is on '
+                'stderr'.format(
                     self._fname, self._size, self._grain_size,
-                    bool(self._force_destroy)))
+                    self._segment_size, bool(self._force_destroy)))
         atexit.register(self.close)
 
     def close(self):

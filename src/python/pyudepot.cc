@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "sto-ctlr/sto-capacity-mgr-parameters.h"
 #include "udepot/multi_get.h"
 #include "udepot/store.h"
 #include "udepot/io/aio.h"
@@ -69,6 +70,34 @@ bool grain_fits_alignment(uint32_t grain, uint32_t align, const char* path,
     return false;
 }
 
+// The least a caller-set segment can be, in grains: the segment's metadata
+// grains (seg_md_grains_, store.cc) plus the data grains a directory table
+// needs, which create_directory and restore_index (store.cc) refuse a
+// segment without: index_bits_for(net bytes) != 0 (a header, a footer and
+// more than one neighborhood of slots) and net bytes of at least two
+// align_up(kIndexMdBytes, grain). That is also room for one record grain.
+// The store has no function for it; this follows its checks, and
+// TheMinimumIsTheStoresMinimum (pyudepot_abi_test) opens a store at the
+// minimum and one unit under it to keep the two in step.
+uint64_t min_segment_grains(uint32_t grain) {
+    const uint64_t md_bytes = sizeof(salsa::salsa_seg_md);
+    const uint64_t md_grains = (md_bytes + grain - 1) / grain;
+    const uint64_t index_md = (udepot::TableRegion::kMdBytes + grain - 1) / grain *
+                              grain;
+    uint64_t net = 1;
+    while (net * grain < 2 * index_md ||
+           udepot::HashTable::index_bits_for(static_cast<size_t>(net * grain)) == 0)
+        ++net;
+    return md_grains + net;
+}
+
+// The unit a caller-set segment is a multiple of: the grain, and the whole
+// 4096-byte pages uDepot::open's `sanitize` would otherwise round it down
+// to (a segment of 4096 / grain grains below a 4096 grain).
+uint64_t segment_unit_bytes(uint32_t grain) {
+    return grain < 4096 ? 4096 : grain;
+}
+
 }  // namespace pyudepot_internal
 
 extern "C" {
@@ -107,9 +136,9 @@ static bool grain_is_valid(uint32_t grain) {
            (grain & (grain - 1)) == 0;
 }
 
-void* uDepotOpenGrain(const char* fname, uint64_t size, int force_destroy,
-                      uint64_t table_bytes, uint32_t queue_depth,
-                      uint32_t grain_bytes) {
+void* uDepotOpenSegment(const char* fname, uint64_t size, int force_destroy,
+                        uint64_t table_bytes, uint32_t queue_depth,
+                        uint32_t grain_bytes, uint64_t segment_bytes) {
     if (!grain_is_valid(grain_bytes)) {
         fprintf(stderr, "uDepot-ng: grain size %u is not valid: it must be "
                 "a power of two from %u to %u bytes (O_DIRECT needs at least "
@@ -126,15 +155,69 @@ void* uDepotOpenGrain(const char* fname, uint64_t size, int force_destroy,
                                                      fname, what))
             return nullptr;
     }
+    if (segment_bytes != 0) {
+        // The segment and the table size set the same thing (a table fills
+        // its segment): the caller says one, never both.
+        if (table_bytes != 0) {
+            fprintf(stderr, "uDepot-ng: both a segment size (%llu) and a "
+                    "table size (%llu) were given: they set the same thing "
+                    "(a table fills one segment), so give one; table size 0 "
+                    "with a segment size\n",
+                    static_cast<unsigned long long>(segment_bytes),
+                    static_cast<unsigned long long>(table_bytes));
+            return nullptr;
+        }
+        const uint64_t unit =
+            pyudepot_internal::segment_unit_bytes(grain_bytes);
+        if (segment_bytes % unit != 0) {
+            fprintf(stderr, "uDepot-ng: segment size %llu is not a multiple "
+                    "of %llu bytes: a segment is whole grains of %u bytes "
+                    "and whole 4096-byte pages, and the store would round "
+                    "any other down\n",
+                    static_cast<unsigned long long>(segment_bytes),
+                    static_cast<unsigned long long>(unit), grain_bytes);
+            return nullptr;
+        }
+        const uint64_t min_bytes =
+            (pyudepot_internal::min_segment_grains(grain_bytes) *
+                 grain_bytes + unit - 1) / unit * unit;
+        // Salsa refuses a segment of more than SALSA_MAX_SEGMENT_SIZE grains
+        // (INT_MAX - 1: extern/salsa/src/util/parse-storage-args.c, "Invalid
+        // parameter segment_size"), and the store would then halve it and
+        // blame the device, so it is refused here, naming the limit.
+        if (segment_bytes / grain_bytes > SALSA_MAX_SEGMENT_SIZE) {
+            fprintf(stderr, "uDepot-ng: segment size %llu is too large for "
+                    "grains of %u bytes: salsa takes at most %llu grains "
+                    "(SALSA_MAX_SEGMENT_SIZE), %llu bytes\n",
+                    static_cast<unsigned long long>(segment_bytes),
+                    grain_bytes,
+                    static_cast<unsigned long long>(SALSA_MAX_SEGMENT_SIZE),
+                    static_cast<unsigned long long>(
+                        uint64_t{SALSA_MAX_SEGMENT_SIZE} * grain_bytes));
+            return nullptr;
+        }
+        if (segment_bytes < min_bytes) {
+            fprintf(stderr, "uDepot-ng: segment size %llu is too small for "
+                    "grains of %u bytes: it must hold the segment's "
+                    "metadata grain and a directory table's header, footer "
+                    "and buckets, at least %llu bytes\n",
+                    static_cast<unsigned long long>(segment_bytes),
+                    grain_bytes,
+                    static_cast<unsigned long long>(min_bytes));
+            return nullptr;
+        }
+    }
     udepot::StoreConfig config;
     config.queue_depth = queue_depth;
     config.force_destroy = force_destroy != 0;
     config.path = fname;
     config.size = static_cast<size_t>(size);
     config.grain_size = grain_bytes;
-    if (int rc = udepot::segment_size_for_table(table_bytes, config.grain_size,
-                                                &config.segment_size);
-        rc != 0) {
+    if (segment_bytes != 0) {
+        config.segment_size = segment_bytes / grain_bytes;
+    } else if (int rc = udepot::segment_size_for_table(
+                   table_bytes, config.grain_size, &config.segment_size);
+               rc != 0) {
         fprintf(stderr, "uDepot-ng: table size %llu is not a power of two "
                 "of at least 4096 bytes, nor 0 (the default)\n",
                 static_cast<unsigned long long>(table_bytes));
@@ -150,6 +233,13 @@ void* uDepotOpenGrain(const char* fname, uint64_t size, int force_destroy,
         return nullptr;
     }
     return static_cast<void*>(store);
+}
+
+void* uDepotOpenGrain(const char* fname, uint64_t size, int force_destroy,
+                      uint64_t table_bytes, uint32_t queue_depth,
+                      uint32_t grain_bytes) {
+    return uDepotOpenSegment(fname, size, force_destroy, table_bytes,
+                             queue_depth, grain_bytes, 0);
 }
 
 void* uDepotOpenQueue(const char* fname, uint64_t size, int force_destroy,
