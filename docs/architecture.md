@@ -629,6 +629,7 @@ uDepot-ng/
 │   ├── rcu.cc
 │   ├── buffer.h                 # IoBuffer, allocator tags
 │   ├── coro.h                   # CoroTask (eager start, symmetric transfer)
+│   ├── multi_get.h              # N gets on one thread, windowed by queue depth
 │   └── io/
 │       ├── backend.h            # IoBackend concept
 │       ├── posix.h              # pread/pwrite (sync)
@@ -646,7 +647,7 @@ uDepot-ng/
 │   └── memcache.cc              # memcache protocol server
 ├── python/
 │   ├── wrapper/
-│   │   ├── pyudepot.h           # C ABI (17 functions)
+│   │   ├── pyudepot.h           # C ABI (19 functions)
 │   │   └── pyudepot.cc          # bridges C ABI to uDepot via run_sync()
 │   └── pyudepot/
 │       ├── __init__.py
@@ -687,32 +688,74 @@ ccache is picked up automatically when present (same as the original).
 
 ## Python Bindings (pyudepot)
 
-**No thread-per-get.** Flywheel's old `ThreadPoolExecutor.submit(self.get, …)`
-per key in `multi_get` is exactly the overhead this rewrite eliminates. All I/O
-concurrency comes from the eager-start coroutine model — one thread, zero thread
-creation.
+**No thread-per-get.** A `ThreadPoolExecutor.submit(get, …)` per key is exactly
+the overhead this rewrite eliminates. All I/O concurrency comes from the
+eager-start coroutine model: one thread, zero thread creation.
 
-The C ABI exposes both single-key and batch entry points:
+The C ABI is `src/python/pyudepot.h` (19 functions, `extern "C"`, over
+`uDepot<AioIO>`; the binding is AIO-only), each call a `run_sync()` on the
+calling thread except the batch below:
+
+| group | functions |
+|---|---|
+| open/close | `uDepotOpen`, `uDepotOpenTables` (+ table size), `uDepotOpenQueue` (+ `queue_depth`), `uDepotClose` |
+| copying | `uDepotGet`, `uDepotPut`, `uDepotDel`, `uDepotExists` |
+| zero copy | `uDepotAllocPutBuffer`, `uDepotPutBufferValue`, `uDepotPutBuf`, `uDepotFreePutBuffer`, `uDepotAllocGetBuffer`, `uDepotNewGetBuffer`, `uDepotGetBuf`, `uDepotGetBufferValue`, `uDepotFreeGetBuffer`, `uDepotThreadValueCopies` |
+| batch | `uDepotMultiGetBuf` |
+
+The Python `uDepot` class (`python/pyudepot/uDepot.py`) exposes `get`, `put`,
+`delete`, `exists`, the zero-copy calls below, and `multi_get_into`. Keys are
+C-contiguous `uint8` numpy arrays.
+
+### multi_get_into: N gets, one thread, one call
 
 ```c
-int udepot_get(udepot_t h, const void* key, uint32_t klen,
-               void* val, uint32_t vlen, uint32_t* val_size);
-
-int udepot_multi_get(udepot_t h, uint32_t n,
-                     const udepot_iov* keys,
-                     udepot_iov* vals,
-                     int* results);
+int uDepotMultiGetBuf(void* kv, uint32_t n, const uint8_t* const keys[],
+                      const uint32_t key_sizes[], void* const get_bufs[],
+                      int results[]);
 ```
 
-`udepot_multi_get` launches N eager-start coroutines — each submits its I/O
-immediately — then drives the poller until all complete. On an async backend
-(uring, SPDK) this is true I/O concurrency from a single call, single thread.
-On the sync backend (posix) the coroutines never suspend, so it degrades to
-sequential I/O — correct but not concurrent, same as today.
+`kv.multi_get_into(keys, bufs)` reads `keys[i]` into `bufs[i]` (`GetBuffer`s of
+this store) and returns one `bool` per key, as `get_into`: `bufs[i].value` is
+the value where `True`, empty where `False` (a missing key); any other failure
+raises `IOError`, see Errors below. It is one ctypes call, so the GIL is released once
+for the whole batch. `udepot::multi_get` (`src/udepot/multi_get.h`) launches
+eager-start `get` coroutines, each submitting its I/O at once, keeps at most a
+**window** of them in flight, starts the next as each completes, and drives
+`poll_this_thread()` until all are done, writing each rc into `results[i]`. It
+is the slot loop of `test/perf/udepot_ng_bench.cc` (`op_window()`, its `--qd`),
+and uses no threads and no locks.
 
-The Python `uDepot` class exposes `get`, `put`, `delete`, `exists`, and
-`multi_get`. `multi_get` is a single ctypes call into `udepot_multi_get`, not a
-Python-side thread pool.
+- **The window** is what the calling thread's AIO context takes: an I/O past
+  a full context fails `-EAGAIN`, and a get holds one entry. The binding uses
+  `min(store->io().queue_depth(), AioIO::thread_queue_room())`: the store's
+  `StoreConfig::queue_depth` (1024, `AioIO::kDefaultQueueDepth`, unless opened
+  with `uDepot(..., queue_depth=N)`, i.e. `uDepotOpenQueue`; the default is
+  unchanged), and the thread's context depth less what it has in flight. **W
+  follows the thread, not the store**, because the context belongs to the
+  thread: every `AioIO` on a thread shares it, `open()` of any store resizes it
+  if it is idle (`aio.cc`, `AioIO::open`), and a thread's first I/O creates its
+  context at `new_ctx_depth_`, process-wide, the depth of whichever store was
+  opened last. So a store opened with a deep queue and used after a shallow one
+  was opened on the same thread runs in the shallow context. The kernel sizes
+  a context for at least 8 I/Os per possible CPU whatever depth was asked for,
+  so the window is a safe bound, not an exact one.
+- **Errors.** A missing key (`-ENOENT`) is `False`. Any other failure
+  (`-EAGAIN`, `-EINVAL`, an I/O error) raises `pyudepot.MultiGetError` (an
+  `IOError`, so `errno`/`strerror` are those of the first failure; the message
+  names it) after the other buffers have been filled; it is not reported as a
+  missing key. Its `failed` attribute is the list of `(index, rc)` of every
+  such key, as data: indices into the `keys` argument in batch order, `rc` a
+  negative errno as the C layer returns it. It is a subclass so the attribute
+  is always there. (`get_into` still returns `False` for every
+  failure.)
+- **Buffers** must be distinct objects (one buffer serves one get): a repeat
+  raises `ValueError` before anything runs. The lifetime rule is `get_into`'s:
+  a buffer with a live `.value` array reads into a fresh C buffer.
+- **Backends.** On AIO the gets overlap. On `PosixIO` each get completes as it
+  starts, so a batch is serial gets: correct, not concurrent.
+- **Shared arrays.** The arrays from `.value` are writable, and one shared
+  between threads is the caller's to synchronise.
 
 ### Zero-copy values from Python
 

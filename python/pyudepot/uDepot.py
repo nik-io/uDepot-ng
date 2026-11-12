@@ -3,6 +3,7 @@
 
 import ctypes
 from ctypes import c_char_p, c_int, c_ubyte, c_uint, c_ulonglong, c_void_p, byref, POINTER
+import errno
 import os
 import logging
 import atexit
@@ -16,14 +17,14 @@ _lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 libudepot = ctypes.cdll.LoadLibrary(
     _lib_path if os.path.exists(_lib_path) else 'libpyudepot.so')
 
-pyopen = libudepot.uDepotOpenTables
+pyopen = libudepot.uDepotOpenQueue
 pyclose = libudepot.uDepotClose
 pyget = libudepot.uDepotGet
 pyput = libudepot.uDepotPut
 pydel = libudepot.uDepotDel
 pyexists = libudepot.uDepotExists
 
-pyopen.argtypes = [c_char_p, c_ulonglong, c_int, c_ulonglong]
+pyopen.argtypes = [c_char_p, c_ulonglong, c_int, c_ulonglong, c_uint]
 pyopen.restype = c_void_p
 pyclose.argtypes = [c_void_p]
 pyget.argtypes = [c_void_p,
@@ -49,6 +50,7 @@ pygetbuf = libudepot.uDepotGetBuf
 pygetvalue = libudepot.uDepotGetBufferValue
 pyfreeget = libudepot.uDepotFreeGetBuffer
 pycopies = libudepot.uDepotThreadValueCopies
+pymultiget = libudepot.uDepotMultiGetBuf
 
 pyallocput.argtypes = [c_void_p, c_uint, c_ulonglong]
 pyallocput.restype = c_void_p
@@ -74,6 +76,9 @@ pyfreeget.argtypes = [c_void_p]
 pyfreeget.restype = None
 pycopies.argtypes = []
 pycopies.restype = c_ulonglong
+pymultiget.argtypes = [c_void_p, c_uint, c_void_p, c_void_p, c_void_p,
+                       c_void_p]
+pymultiget.restype = c_int
 
 
 def thread_value_copies():
@@ -214,6 +219,20 @@ class GetBuffer:
         return _value_array(self._owned, ptr, size.value, False)
 
 
+class MultiGetError(IOError):
+    """multi_get_into: some gets failed other than as a missing key.
+
+    An IOError (OSError) whose errno/strerror are those of the first failure.
+    `failed` is the list of (index, rc) of every such key, index into the
+    `keys` passed, in batch order, rc a negative errno as the C layer returns
+    it. The keys not listed were read or are missing (their buffers say which).
+    """
+
+    def __init__(self, failed, errno_, msg):
+        super().__init__(errno_, msg)
+        self.failed = failed
+
+
 # Index tables of 2 MiB: small, for tests. A store sized for real use
 # passes its own table_size (a power of two of at least 4096 bytes, or 0
 # for the store's default, 512 MiB tables); tables this small map on
@@ -229,14 +248,20 @@ class uDepot:
         force_destroy=False restores the store, and raises IOError for a
         backing with no store on it (one created with another size, say)
         unless it is a new or empty file.
+
+        queue_depth is the number of I/Os each thread may have in flight
+        (the size of its AIO context; 0, the default, is 1024); multi_get_into
+        keeps at most that many gets in flight on the calling thread, fewer
+        if that thread's AIO context has less room.
         """
         self._fname = kwargs.get('file_name', '/tmp/pyudepot-test')
         self._size = kwargs.get('size', 1024 * 1024 + 4096)
         self._force_destroy = 1 if kwargs.get('force_destroy', False) else 0
         self._table_size = kwargs.get('table_size', DEFAULT_TABLE_SIZE)
+        self._queue_depth = kwargs.get('queue_depth', 0)
         self._kv = pyopen(
             self._fname.encode('utf-8'), self._size, self._force_destroy,
-            self._table_size)
+            self._table_size, self._queue_depth)
         if not self._kv:
             raise IOError('failed to open uDepot for {}'.format(self._fname))
         atexit.register(self._cleanup)
@@ -335,13 +360,7 @@ class uDepot:
         from buf.value. Returns False if the key is missing or the get
         fails, with buf.value empty."""
         kv = self._own(buf, GetBuffer)
-        owned = buf._owned
-        if owned.in_use():
-            # An earlier array still views this buffer: read into a new one.
-            handle = pynewget()
-            if not handle:
-                raise MemoryError('cannot allocate a get buffer')
-            owned = _Owned(handle, _free_get)
+        owned = self._get_target(buf)
         buf._has_value = False
         rc = pygetbuf(kv, key, key.size, owned.handle)
         if rc != 0:
@@ -350,6 +369,87 @@ class uDepot:
         buf._owned = owned
         buf._has_value = True
         return True
+
+    @staticmethod
+    def _get_target(buf):
+        """The C buffer a get into `buf` reads into: its own, or a new one
+        if an earlier array still views it (which a get must not overwrite
+        or free)."""
+        owned = buf._owned
+        if owned.in_use():
+            handle = pynewget()
+            if not handle:
+                raise MemoryError('cannot allocate a get buffer')
+            owned = _Owned(handle, _free_get)
+        return owned
+
+    def multi_get_into(self, keys, bufs):
+        """get_into for every keys[i] and bufs[i], with the gets in flight
+        together on this thread (one C call, no threads): up to the smaller of
+        the store's queue_depth and this thread's AIO context room at once,
+        each new one starting as another completes.
+        Returns a list of bools, one per key: True with bufs[i].value the
+        value of keys[i]; False for a key that is not in the store, with
+        bufs[i].value empty. Any other failure (-EAGAIN, an I/O error) raises
+        MultiGetError (an IOError) naming the first such key and its error,
+        after every other buffer has been filled: it is not a missing key, so
+        it is not False. Its `failed` attribute lists (index, rc) for every
+        such key, indices into `keys`, rc a negative errno.
+        (get_into still returns False for every failure; making it raise is a
+        separate change.)
+
+        keys are C-contiguous uint8 arrays; bufs are GetBuffers of this
+        store, all different (a buffer serves one get): ValueError otherwise.
+        The buffers' lifetime rules are get_into's: one with a live array
+        reads into a new C buffer.
+        """
+        kv = self._handle()
+        n = len(keys)
+        if len(bufs) != n:
+            raise ValueError('{} keys but {} buffers'.format(n, len(bufs)))
+        if len({id(b) for b in bufs}) != n:
+            raise ValueError(
+                'a GetBuffer appears more than once: one buffer serves one '
+                'get, so each key needs its own')
+        for k in keys:
+            if (not isinstance(k, np.ndarray) or k.dtype != np.uint8
+                    or k.ndim != 1 or not k.flags.c_contiguous):
+                raise ValueError('a key is not a C-contiguous 1-d uint8 array')
+        for b in bufs:
+            self._own(b, GetBuffer)
+        if n == 0:
+            return []
+        targets = [self._get_target(b) for b in bufs]
+        for b in bufs:
+            b._has_value = False
+        c_keys = (c_void_p * n)(*[k.ctypes.data for k in keys])
+        c_sizes = (c_uint * n)(*[k.size for k in keys])
+        c_bufs = (c_void_p * n)(*[t.handle for t in targets])
+        results = (c_int * n)()
+        rc = pymultiget(kv, n, c_keys, c_sizes, c_bufs, results)
+        if rc != 0:
+            raise MemoryError('multi_get_into: out of memory (rc={})'
+                              .format(rc))
+        ok = []
+        failed = []  # (index, rc) of the gets that failed for another reason
+        for i in range(n):
+            if results[i] == 0:
+                bufs[i]._owned = targets[i]
+                bufs[i]._has_value = True
+                ok.append(True)
+            else:
+                if results[i] != -errno.ENOENT:
+                    failed.append((i, results[i]))
+                logging.info('pymultiget key %d returned=%d', i, results[i])
+                ok.append(False)
+        if failed:
+            i, rc = failed[0]
+            raise MultiGetError(
+                failed, -rc, 'multi_get_into: {} of {} gets failed, not as a missing '
+                'key; the first, key {}: {}. The buffers of the keys that '
+                'succeeded hold their values; retry the failed ones'.format(
+                    len(failed), n, i, os.strerror(-rc)))
+        return ok
 
     def delete(self, key):
         rc = pydel(self._handle(), key, key.size)
