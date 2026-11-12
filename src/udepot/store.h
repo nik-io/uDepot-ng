@@ -461,6 +461,23 @@ public:
     Rcu& rcu() { return rcu_; }
     IO& io() { return io_; }
     uint32_t grain_size() const { return grain_size_; }
+    // The store's segment, in grains, as open() ended up with it (a small
+    // device shrinks the one asked for). 0 before open().
+    uint64_t segment_grains() const { return scm_ ? get_seg_size() : 0; }
+    // The largest record (header, key, value and CRC, rounded up to grains)
+    // the store can hold, in grains and in bytes: the smaller of what a
+    // hash entry's 11-bit kv_size can say (HashEntry::kKvSizeMask) and a
+    // segment's data grains (the segment less its metadata), since a
+    // record never spans segments (salsa refuses a longer one). put and
+    // alloc_put_buffer refuse a larger record with -EINVAL. 0 before open().
+    uint64_t max_record_grains() const;
+    size_t max_record_bytes() const {
+        return static_cast<size_t>(max_record_grains()) * grain_size_;
+    }
+    // The longest value a put of a key of `key_size` bytes can store, as
+    // the one check_sizes applies. 0 if the key size is invalid, or the key
+    // leaves room for at most an empty value. Valid after open().
+    size_t max_value_bytes(size_t key_size) const;
     // The device seed: binds segment metadata and records to this store.
     uint64_t seed() const noexcept { return seed_; }
     // Whether open() restored the index from its segments (the store was

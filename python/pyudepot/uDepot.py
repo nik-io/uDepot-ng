@@ -23,6 +23,9 @@ pyget = libudepot.uDepotGet
 pyput = libudepot.uDepotPut
 pydel = libudepot.uDepotDel
 pyexists = libudepot.uDepotExists
+pymaxvalue = libudepot.uDepotMaxValueBytes
+pygrain = libudepot.uDepotGrainBytes
+pysegment = libudepot.uDepotSegmentBytes
 
 pyopen.argtypes = [c_char_p, c_ulonglong, c_int, c_ulonglong, c_uint,
                    c_uint]
@@ -40,6 +43,12 @@ pyexists.argtypes = [c_void_p,
                      ndpointer(c_ubyte, flags="C_CONTIGUOUS"), c_uint,
                      POINTER(c_ulonglong)]
 pyexists.restype = c_int
+pymaxvalue.argtypes = [c_void_p, c_uint]
+pymaxvalue.restype = c_ulonglong
+pygrain.argtypes = [c_void_p]
+pygrain.restype = c_uint
+pysegment.argtypes = [c_void_p]
+pysegment.restype = c_ulonglong
 
 pyallocput = libudepot.uDepotAllocPutBuffer
 pyputvalue = libudepot.uDepotPutBufferValue
@@ -507,3 +516,22 @@ class uDepot:
         if rc != 0:
             return None
         return val_size.value
+
+    def max_value_bytes(self, key_size):
+        """The longest value put() can store under a key of key_size bytes.
+
+        A record (14-byte header, key, value, 2-byte CRC, rounded up to
+        grains) must fit one segment's data grains and a hash entry's
+        11-bit size (2047 grains); put() of a longer value fails. 0 if
+        key_size is invalid or the key leaves room for at most an empty
+        value.
+        """
+        return pymaxvalue(self._handle(), key_size)
+
+    def grain_size(self):
+        """The store's grain in bytes (records are rounded up to it)."""
+        return pygrain(self._handle())
+
+    def segment_size(self):
+        """The store's segment in bytes, as opened (a small file shrinks it)."""
+        return pysegment(self._handle())
