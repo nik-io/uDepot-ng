@@ -423,8 +423,8 @@ contiguous buffer instead of a chain of nodes:
   `get_record`), so they differ only in that copy. `scripts/perf-zerocopy.sh`
   gates on it: zero copy must not be slower, on any backend.
 
-The memcache server and the Python and JNI bindings still use the copying
-interface.
+The memcache server and the JNI binding still use the copying interface;
+the Python binding offers both (see "Python Bindings").
 
 ### 8. Network Backend and Memcache Server
 
@@ -646,7 +646,7 @@ uDepot-ng/
 │   └── memcache.cc              # memcache protocol server
 ├── python/
 │   ├── wrapper/
-│   │   ├── pyudepot.h           # C ABI (7 functions)
+│   │   ├── pyudepot.h           # C ABI (17 functions)
 │   │   └── pyudepot.cc          # bridges C ABI to uDepot via run_sync()
 │   └── pyudepot/
 │       ├── __init__.py
@@ -713,6 +713,51 @@ sequential I/O — correct but not concurrent, same as today.
 The Python `uDepot` class exposes `get`, `put`, `delete`, `exists`, and
 `multi_get`. `multi_get` is a single ctypes call into `udepot_multi_get`, not a
 Python-side thread pool.
+
+### Zero-copy values from Python
+
+`kv.alloc_put_buffer(key_size, val_size)` returns a `PutBuffer` and
+`kv.alloc_get_buffer(key_size, val_size)` a `GetBuffer`: handles to the store's
+`PutBuffer`/`GetBuffer` (C ABI `uDepotAllocPutBuffer`, `uDepotPutBuf`,
+`uDepotAllocGetBuffer`, `uDepotGetBuf`, ...). `PutBuffer.value` is a writable
+numpy `uint8` array over the record buffer's value region: fill it in place and
+`kv.put_buffer(key, pb)` writes it, with no copy (`pb` is reusable once that
+returns). `kv.get_into(key, gb)` reads into `gb`, and `gb.value` (also
+writable) views the value as of that get. `pyudepot.thread_value_copies()` is
+`uDepot::thread_value_copies()` for the calling thread; the tests assert it does
+not move across a zero-copy put and get, and moves by one per copying call.
+
+- **Alignment.** The record buffer is 4096-aligned (AIO's `alloc_buffer`), but
+  `value` starts `sizeof(KvHeader) + key_size = 14 + key_size` bytes into it,
+  so it is not aligned beyond that. The record's 2-byte checksum follows it.
+- **Lifetime.** The C buffer is freed exactly once, when the last array over it
+  is gone, not when the `PutBuffer`/`GetBuffer` object is: `.value` is a numpy
+  array over a small `_Region` object (via `__array_interface__`), which numpy
+  keeps as that array's base and which holds the owner of the C handle; a view
+  holds the array it was made from, so it keeps the region alive too (on
+  numpy 1.26 a slice's `.base` is the ndarray, not the region).
+- **Get values are writable.** A get buffer is private to the arrays made
+  from it: `get_into` never overwrites or frees a buffer a live array views
+  (it reads into a fresh one), and the store keeps no reference to the
+  buffer's memory (no cache, no index pointing into it), so writing into
+  `gb.value` changes neither the stored value nor what a later get returns.
+  Read-only would only force consumers (`torch.from_numpy`) to copy.
+- **Replacement.** A get into a `GetBuffer` that is too small reads into a new
+  buffer, freeing the old one (`GetBuffer::value()` can move). The binding never
+  lets that, or a reuse of the buffer, change or free memory an earlier array
+  still views: while one is alive, the next `get_into` reads into a new buffer
+  instead (one allocation that reuse would have saved). Drop the array first
+  to reuse the buffer.
+- **Errors.** Sizes the store cannot hold raise `ValueError` naming them; a
+  `put_buffer` key of another size than the buffer's, or a buffer of another
+  store, raises `ValueError` (the C ABI returns `-EINVAL` for the key size); a
+  closed store raises `ValueError`. The binding is AIO-only, so a buffer is `aligned_alloc`/`free` memory and
+  stays valid after the store is closed (on SPDK it would be `rte_malloc` memory
+  tied to the SPDK environment; not exposed). A `PutBuffer`/`GetBuffer` serves one call at a time, as the C++
+  buffers do; using one buffer from two threads at once is undefined. Arrays
+  taken from `.value` may be shared between threads: a later `get_into` never
+  overwrites or frees a buffer that an array still views. A size over the store's 2047-grain record limit
+  raises `ValueError`; a failed allocation raises `MemoryError`.
 
 An async Python API (asyncio-compatible, mapping each coroutine to an asyncio
 future) is planned as a follow-up once the async backends are working.
