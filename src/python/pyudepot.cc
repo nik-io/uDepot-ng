@@ -3,15 +3,73 @@
 
 #include "pyudepot.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <span>
 
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "udepot/multi_get.h"
 #include "udepot/store.h"
 #include "udepot/io/aio.h"
 
 using Store = udepot::uDepot<udepot::AioIO>;
+
+namespace pyudepot_internal {
+
+// The alignment O_DIRECT needs of the backing at path, in bytes, or 0 when
+// it cannot be told: a block device's logical sector size (BLKSSZGET); a
+// regular file's dio_offset_align (statx STATX_DIOALIGN, Linux 6.1 and a
+// filesystem that reports it). A file that does not exist yet has no
+// filesystem to ask, and a kernel without STATX_DIOALIGN does not say: the
+// grain is then not checked against it, and the store's open reports what
+// the device refuses. (The filesystem's block size is not a fallback: ext4
+// takes 512-byte O_DIRECT I/O on a 4096-byte block.) *what names the source.
+uint32_t direct_io_alignment(const char* path, const char** what) {
+    struct stat st;
+    if (::stat(path, &st) != 0) return 0;
+    if (S_ISBLK(st.st_mode)) {
+        int fd = ::open(path, O_RDONLY);
+        if (fd < 0) return 0;
+        int sector = 0;
+        int rc = ::ioctl(fd, BLKSSZGET, &sector);
+        ::close(fd);
+        if (rc != 0 || sector <= 0) return 0;
+        *what = "the block device's logical sector size";
+        return static_cast<uint32_t>(sector);
+    }
+#ifdef STATX_DIOALIGN
+    if (S_ISREG(st.st_mode)) {
+        struct statx stx;
+        if (::statx(AT_FDCWD, path, 0, STATX_DIOALIGN, &stx) == 0 &&
+            (stx.stx_mask & STATX_DIOALIGN) && stx.stx_dio_offset_align) {
+            *what = "the file's direct I/O offset alignment (statx)";
+            return stx.stx_dio_offset_align;
+        }
+    }
+#endif
+    return 0;
+}
+
+// Whether a grain is a multiple of the backing's O_DIRECT alignment (0 =
+// unknown: accepted). If not, says so on stderr, naming both numbers.
+bool grain_fits_alignment(uint32_t grain, uint32_t align, const char* path,
+                          const char* what) {
+    if (align == 0 || grain % align == 0) return true;
+    fprintf(stderr, "uDepot-ng: grain size %u is smaller than the %u bytes "
+            "O_DIRECT needs on %s (%s): every I/O is a multiple of the grain, "
+            "and the device would refuse it. Use a grain of at least %u "
+            "bytes\n", grain, align, path, what, align);
+    return false;
+}
+
+}  // namespace pyudepot_internal
 
 extern "C" {
 
@@ -22,13 +80,58 @@ extern "C" {
 // segment this small maps on 4 KiB pages, and open() says so.
 static constexpr uint64_t kDefaultTableBytes = uint64_t{2} << 20;
 
-void* uDepotOpenTables(const char* fname, uint64_t size, int force_destroy,
-                       uint64_t table_bytes) {
+static constexpr uint32_t kDefaultGrainBytes = 4096;
+
+// The StoreConfig::grain_size values the AIO store works with, which the
+// store itself does not check (uDepot::open takes any):
+//  - a power of two: below 4096, `sanitize` in uDepot::open rounds a segment
+//    to whole 4096-byte pages by 4096 / grain, which needs a divisor of
+//    4096. At and above 4096 the store needs no such thing that anyone has
+//    found, but only powers of two (uDepot's grains) are ever run, so
+//    nothing else is let in;
+//  - at least 512: the store file is opened O_DIRECT (open_direct), whose
+//    offsets and lengths must be a multiple of the device's logical block
+//    size, 512 at the smallest (a larger one is checked against the
+//    backing, direct_io_alignment); every record, segment and metadata I/O
+//    is a multiple of the grain;
+//  - at most 1 MiB: a record is at most HashEntry::kKvSizeMask = 2047 grains
+//    and is written with one pwrite, which Linux caps at MAX_RW_COUNT =
+//    INT_MAX & PAGE_MASK = 2147479552 bytes. 2047 grains of 1 MiB are
+//    2146435072; of 2 MiB they are twice that, and put would fail with -EIO
+//    (store.cc, put_record: written != total) with no message.
+static constexpr uint32_t kMinGrainBytes = 512;
+static constexpr uint32_t kMaxGrainBytes = uint32_t{1} << 20;
+
+static bool grain_is_valid(uint32_t grain) {
+    return grain >= kMinGrainBytes && grain <= kMaxGrainBytes &&
+           (grain & (grain - 1)) == 0;
+}
+
+void* uDepotOpenGrain(const char* fname, uint64_t size, int force_destroy,
+                      uint64_t table_bytes, uint32_t queue_depth,
+                      uint32_t grain_bytes) {
+    if (!grain_is_valid(grain_bytes)) {
+        fprintf(stderr, "uDepot-ng: grain size %u is not valid: it must be "
+                "a power of two from %u to %u bytes (O_DIRECT needs at least "
+                "512-byte blocks; a record of 2047 grains must fit in one "
+                "write of at most 2147479552 bytes)\n", grain_bytes,
+                kMinGrainBytes, kMaxGrainBytes);
+        return nullptr;
+    }
+    {
+        const char* what = "";
+        const uint32_t align =
+            pyudepot_internal::direct_io_alignment(fname, &what);
+        if (!pyudepot_internal::grain_fits_alignment(grain_bytes, align,
+                                                     fname, what))
+            return nullptr;
+    }
     udepot::StoreConfig config;
+    config.queue_depth = queue_depth;
     config.force_destroy = force_destroy != 0;
     config.path = fname;
     config.size = static_cast<size_t>(size);
-    config.grain_size = 4096;
+    config.grain_size = grain_bytes;
     if (int rc = udepot::segment_size_for_table(table_bytes, config.grain_size,
                                                 &config.segment_size);
         rc != 0) {
@@ -47,6 +150,17 @@ void* uDepotOpenTables(const char* fname, uint64_t size, int force_destroy,
         return nullptr;
     }
     return static_cast<void*>(store);
+}
+
+void* uDepotOpenQueue(const char* fname, uint64_t size, int force_destroy,
+                      uint64_t table_bytes, uint32_t queue_depth) {
+    return uDepotOpenGrain(fname, size, force_destroy, table_bytes,
+                           queue_depth, kDefaultGrainBytes);
+}
+
+void* uDepotOpenTables(const char* fname, uint64_t size, int force_destroy,
+                       uint64_t table_bytes) {
+    return uDepotOpenQueue(fname, size, force_destroy, table_bytes, 0);
 }
 
 void* uDepotOpen(const char* fname, uint64_t size, int force_destroy) {
@@ -157,6 +271,22 @@ int uDepotGetBuf(void* kv, const uint8_t key[], uint32_t key_size,
     auto key_span = std::span<const uint8_t>(key, key_size);
     return store->get(key_span, static_cast<udepot::GetBuffer*>(get_buf))
         .run_sync();
+}
+
+int uDepotMultiGetBuf(void* kv, uint32_t n, const uint8_t* const keys[],
+                      const uint32_t key_sizes[], void* const get_bufs[],
+                      int results[]) {
+    auto* store = static_cast<Store*>(kv);
+    // At most what the calling thread's AIO context takes (a get past it
+    // fails -EAGAIN). The context is the thread's, shared by every store on
+    // it and sized by the store opened last, so the store's own
+    // queue_depth() (StoreConfig::queue_depth, default 1024) can exceed it.
+    const unsigned window =
+        std::min(store->io().queue_depth(), udepot::AioIO::thread_queue_room());
+    return udepot::multi_get(
+        *store, n, keys, key_sizes,
+        reinterpret_cast<udepot::GetBuffer* const*>(get_bufs), results,
+        window);
 }
 
 const uint8_t* uDepotGetBufferValue(void* get_buf, uint64_t* size_out) {

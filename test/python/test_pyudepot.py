@@ -2,10 +2,13 @@
 # Copyright (c) 2024-2026 Nikolas Ioannou
 # SPDX-License-Identifier: BSD-3-Clause
 
+import errno
 import gc
 import os
+import subprocess
 import sys
 import tempfile
+import weakref
 
 import numpy as np
 import pytest
@@ -24,7 +27,7 @@ def store(tmp_path):
     path = str(tmp_path / "pyudepot_test")
     kv = pyudepot.uDepot(file_name=path, size=STORE_SIZE, force_destroy=True)
     yield kv
-    kv._cleanup()
+    kv.close()
     if os.path.exists(path):
         os.unlink(path)
 
@@ -113,14 +116,42 @@ class TestBinaryKeys:
 
 
 class TestClose:
-    """After close the handle is gone: calls raise instead of passing a
-    freed pointer to C. As in uDepot, no call may race the close."""
+    """close() releases the store now. After it the handle is gone: calls
+    raise instead of passing a freed pointer to C. As in uDepot, no call may
+    race the close."""
+
+    def _open(self, tmp_path, **kwargs):
+        kwargs.setdefault("force_destroy", True)
+        return pyudepot.uDepot(file_name=str(tmp_path / "closed"),
+                               size=STORE_SIZE, **kwargs)
+
+    @pytest.fixture
+    def closes(self, monkeypatch):
+        """The handles passed to the C close. One that is not open (a second
+        close of the same handle) is recorded and not passed on, so that a
+        double close fails the test instead of double-freeing."""
+        calls, live = [], set()
+        real_open, real_close = binding.pyopen, binding.pyclose
+
+        def open_(*args):
+            handle = real_open(*args)
+            live.add(handle)
+            return handle
+
+        def close(handle):
+            calls.append(handle)
+            if handle in live:
+                live.remove(handle)
+                real_close(handle)
+
+        monkeypatch.setattr(binding, "pyopen", open_)
+        monkeypatch.setattr(binding, "pyclose", close)
+        return calls
 
     def test_calls_after_close_raise(self, tmp_path):
-        kv = pyudepot.uDepot(file_name=str(tmp_path / "closed"),
-                             size=STORE_SIZE, force_destroy=True)
+        kv = self._open(tmp_path)
         assert kv.put(_key("k"), _val("v"))
-        kv._cleanup()
+        kv.close()
         with pytest.raises(ValueError):
             kv.put(_key("k"), _val("v"))
         with pytest.raises(ValueError):
@@ -129,7 +160,143 @@ class TestClose:
             kv.delete(_key("k"))
         with pytest.raises(ValueError):
             kv.exists(_key("k"))
-        kv._cleanup()  # closing twice is harmless
+        kv.close()  # closing twice is harmless
+
+    def test_every_method_raises_closed_after_close(self, tmp_path):
+        kv = self._open(tmp_path)
+        key, val = _key("12345678"), _val("v")
+        pb = kv.alloc_put_buffer(key.size, 100)
+        gb = kv.alloc_get_buffer(key.size, 100)
+        assert kv.put(key, val)
+        kv.close()
+        out = np.zeros(8, dtype=np.uint8)
+        calls = {
+            "get": lambda: kv.get(key, out),
+            "put": lambda: kv.put(key, val),
+            "delete": lambda: kv.delete(key),
+            "exists": lambda: kv.exists(key),
+            "alloc_put_buffer": lambda: kv.alloc_put_buffer(8, 100),
+            "alloc_get_buffer": lambda: kv.alloc_get_buffer(8, 100),
+            "put_buffer": lambda: kv.put_buffer(key, pb),
+            "get_into": lambda: kv.get_into(key, gb),
+            "multi_get_into": lambda: kv.multi_get_into([key], [gb]),
+            "multi_get_into (none)": lambda: kv.multi_get_into([], []),
+        }
+        for name, call in calls.items():
+            with pytest.raises(ValueError,
+                               match="uDepot store is closed") as e:
+                call()
+            assert e.type is ValueError, name
+
+    def test_close_releases_the_store_once(self, tmp_path, closes):
+        kv = self._open(tmp_path)
+        handle = kv._kv
+        kv.close()
+        kv.close()
+        assert kv._kv is None
+        assert closes == [handle]  # once: the second close called nothing
+
+    def test_close_is_a_context_manager(self, tmp_path, closes):
+        with self._open(tmp_path) as kv:
+            assert kv.put(_key("k"), _val("v"))
+            assert closes == []
+        assert len(closes) == 1
+        with pytest.raises(ValueError, match="closed"):
+            kv.get(_key("k"), np.zeros(1, dtype=np.uint8))
+
+    def test_the_context_manager_closes_on_an_exception(self, tmp_path,
+                                                         closes):
+        with pytest.raises(KeyError):
+            with self._open(tmp_path) as kv:
+                raise KeyError("body")
+        assert len(closes) == 1
+
+    def test_a_closed_store_is_not_kept_alive_by_the_exit_hook(self,
+                                                              tmp_path):
+        # atexit.register(self.close) holds the store until exit; close()
+        # takes the hook back, so a closed store can be collected.
+        kv = self._open(tmp_path)
+        ref = weakref.ref(kv)
+        kv.close()
+        del kv
+        gc.collect()
+        assert ref() is None
+
+    def test_an_open_store_is_closed_at_exit(self, tmp_path):
+        # The hook still closes a store nobody did: the process exits with
+        # the C close called once for it.
+        script = (
+            "import atexit, sys\n"
+            "import numpy as np\n"
+            "import pyudepot\n"
+            "b = sys.modules['pyudepot.uDepot']\n"
+            "calls = []\n"
+            "real = b.pyclose\n"
+            "def close(h):\n"
+            "    calls.append(h)\n"
+            "    real(h)\n"
+            "b.pyclose = close\n"
+            "atexit.register(lambda: print('CLOSES', len(calls)))\n"
+            "kv = pyudepot.uDepot(file_name=sys.argv[1], size=%d,"
+            " force_destroy=True)\n"
+            "gone = pyudepot.uDepot(file_name=sys.argv[1] + '2', size=%d,"
+            " force_destroy=True)\n"
+            "gone.close()\n"
+            "print('EXPLICIT', len(calls))\n" % (STORE_SIZE, STORE_SIZE))
+        # atexit runs last-registered first: the print above is registered
+        # before the stores' hooks, so it runs after them.
+        r = subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path / "exit")],
+            capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        # `gone` is closed by the call, `kv` by the exit hook.
+        assert "EXPLICIT 1" in r.stdout, r.stdout + r.stderr
+        assert "CLOSES 2" in r.stdout, r.stdout + r.stderr
+
+    def test_data_survives_a_close_and_a_reopen_in_this_process(self,
+                                                                tmp_path):
+        keys = [_key("key%04d" % i) for i in range(50)]
+        kv = self._open(tmp_path)
+        for i, k in enumerate(keys[:25]):
+            assert kv.put(k, _val("copy%d" % i))
+        for i, k in enumerate(keys[25:]):
+            _zc_put(kv, k, _bytes_of(1000 + i, i))
+        assert kv.delete(keys[3])
+        kv.close()
+        kv = self._open(tmp_path, force_destroy=False)
+        for i, k in enumerate(keys[:25]):
+            out = np.zeros(16, dtype=np.uint8)
+            if i == 3:
+                assert not kv.get(k, out)
+                continue
+            assert kv.get(k, out)
+            assert out[:len("copy%d" % i)].tobytes() == ("copy%d" % i).encode()
+        for i, k in enumerate(keys[25:]):
+            np.testing.assert_array_equal(_zc_get(kv, k, 1000 + i),
+                                          _bytes_of(1000 + i, i))
+        kv.close()
+
+    def test_a_reopened_store_closes_independently(self, tmp_path, closes):
+        first = self._open(tmp_path)
+        first.close()
+        second = self._open(tmp_path, force_destroy=False)
+        first.close()  # the earlier object's close does not touch the new one
+        assert second.exists(_key("nothing")) is None
+        second.close()
+        assert len(closes) == 2
+
+    def test_buffers_stay_valid_after_close(self, tmp_path):
+        kv = self._open(tmp_path)
+        _zc_put(kv, _key("k"), _bytes_of(300, 5))
+        gb = kv.alloc_get_buffer(1, 300)
+        assert kv.get_into(_key("k"), gb)
+        value = gb.value
+        pb = kv.alloc_put_buffer(1, 100)
+        written = pb.value
+        kv.close()
+        np.testing.assert_array_equal(value, _bytes_of(300, 5))
+        written[:] = 7  # the memory is the buffer's, not the store's
+        assert (written == 7).all()
 
 
 class TestForceDestroy:
@@ -143,7 +310,7 @@ class TestForceDestroy:
         kv = pyudepot.uDepot(file_name=path, size=STORE_SIZE,
                              force_destroy=True)
         assert kv.put(_key("keep"), _val("me"))
-        kv._cleanup()
+        kv.close()
 
         # Another size, no force_destroy: refused.
         with pytest.raises(IOError):
@@ -155,12 +322,12 @@ class TestForceDestroy:
         out = np.zeros(2, dtype=np.uint8)
         assert kv.get(_key("keep"), out)
         np.testing.assert_array_equal(out, _val("me"))
-        kv._cleanup()
+        kv.close()
 
         # Another size, force_destroy: a new store, the key is gone.
         kv = pyudepot.uDepot(file_name=path, size=other, force_destroy=True)
         assert not kv.get(_key("keep"), np.zeros(2, dtype=np.uint8))
-        kv._cleanup()
+        kv.close()
 
 
 class TestTableSize:
@@ -180,7 +347,7 @@ class TestTableSize:
                              size=32 * (2 * 1024 * 1024 + 8192) + 4096,
                              force_destroy=True)
         assert kv.put(_key("k"), _val("v"))
-        kv._cleanup()
+        kv.close()
         err = capfd.readouterr().err
         assert "index tables map on 4 KiB pages" in err
         assert "directory grows to be slower" in err
@@ -191,7 +358,7 @@ class TestTableSize:
         # smaller, and with them the tables, and says so.
         kv = self._open(tmp_path)
         assert kv.put(_key("k"), _val("v"))
-        kv._cleanup()
+        kv.close()
         err = capfd.readouterr().err
         assert "the requested segments of" in err
         assert "do not fit" in err
@@ -206,7 +373,7 @@ class TestTableSize:
         # On a device too small for them the store names the tables it was
         # asked for: the size given here, not the binding's default.
         kv = self._open(tmp_path, table_size=table_size)
-        kv._cleanup()
+        kv.close()
         assert named in capfd.readouterr().err
 
     @staticmethod
@@ -226,7 +393,7 @@ class TestTableSize:
         out = np.zeros(1, dtype=np.uint8)
         assert kv.get(_key("k"), out)
         assert out.tobytes() == b"v"
-        kv._cleanup()
+        kv.close()
         assert "do not fit" not in capfd.readouterr().err
 
     def test_the_default_table_size_round_trips(self, tmp_path):
@@ -235,13 +402,150 @@ class TestTableSize:
         out = np.zeros(1, dtype=np.uint8)
         assert kv.get(_key("k"), out)
         assert out.tobytes() == b"v"
-        kv._cleanup()
+        kv.close()
 
     @pytest.mark.parametrize("table_size",
                              [3000, 2048, 6 * 1024 * 1024, 1 << 41, 1 << 63])
     def test_invalid_table_size_fails_open(self, tmp_path, table_size):
         with pytest.raises(IOError):
             self._open(tmp_path, table_size=table_size)
+
+
+_GRAINS = [512, 4096, 32768]
+
+
+class TestGrainSize:
+    """grain_size is the caller's: a power of two from 512 to 1 MiB, 4096 by
+    default. A larger grain stores larger values (a record is at most 2047
+    grains); a store is reopened with the grain it was created with."""
+
+    def _open(self, tmp_path, grain_size, **kwargs):
+        kwargs.setdefault("size", STORE_SIZE)
+        kwargs.setdefault("force_destroy", True)
+        return pyudepot.uDepot(file_name=str(tmp_path / "grains"),
+                               grain_size=grain_size, **kwargs)
+
+    def test_default_is_4096(self, tmp_path):
+        assert pyudepot.DEFAULT_GRAIN_SIZE == 4096
+        kv = pyudepot.uDepot(file_name=str(tmp_path / "grains"),
+                             size=STORE_SIZE, force_destroy=True)
+        assert kv._grain_size == 4096
+        kv.close()
+
+    @pytest.mark.parametrize("grain", _GRAINS)
+    def test_each_grain_round_trips(self, tmp_path, grain):
+        kv = self._open(tmp_path, grain)
+        assert kv.put(_key("k"), _val("value"))
+        out = np.zeros(5, dtype=np.uint8)
+        assert kv.get(_key("k"), out)
+        assert out.tobytes() == b"value"
+        pb = kv.alloc_put_buffer(1, 100)
+        pb.value[:] = 9
+        assert kv.put_buffer(_key("z"), pb)
+        assert _zc_get(kv, _key("z"), 100).tobytes() == b"\x09" * 100
+        kv.close()
+
+    @pytest.mark.parametrize("grain", [0, 1, 256, 511, 513, 3000, 65535,
+                                       2 * 1024 * 1024, 4 * 1024 * 1024])
+    def test_an_invalid_grain_fails_the_open_naming_it(self, tmp_path, capfd,
+                                                      grain):
+        path = tmp_path / "grains"
+        with pytest.raises((IOError, ValueError)) as e:
+            self._open(tmp_path, grain)
+        assert "grain_size={}".format(grain) in str(e.value) or \
+            "grain_size={!r}".format(grain) in str(e.value)
+        if grain != 0:  # 0 is refused before the C layer
+            err = capfd.readouterr().err
+            assert "grain size {} is not valid".format(grain) in err
+            assert "a power of two from 512 to 1048576 bytes" in err
+        assert not path.exists(), "a refused grain must not create the file"
+
+    @pytest.mark.parametrize("grain", [2**32 + 4096, -4096, 4096.0, "4096",
+                                       None])
+    def test_a_grain_ctypes_would_wrap_or_coerce_is_refused(self, tmp_path,
+                                                           grain):
+        # 2**32 + 4096 would reach the C layer as a valid 4096.
+        with pytest.raises(ValueError, match="grain_size="):
+            self._open(tmp_path, grain)
+
+    def test_the_largest_grain_opens_and_round_trips(self, tmp_path):
+        # 1 MiB: 2047 of them are one write below Linux's 2147479552-byte cap.
+        kv = self._open(tmp_path, 1 << 20, size=128 * 1024 * 1024 + 4096,
+                        table_size=1 << 20)
+        assert kv.put(_key("k"), _val("value"))
+        out = np.zeros(5, dtype=np.uint8)
+        assert kv.get(_key("k"), out)
+        assert out.tobytes() == b"value"
+        kv.close()
+
+    def test_a_larger_grain_stores_a_larger_value(self, tmp_path, capfd):
+        # A record is at most 2047 grains: ~8 MiB at 4096, ~64 MiB at 32768.
+        # The record must also fit a segment, so the tables are 16 MiB and
+        # the device holds 32 of their segments: the grain is the only
+        # difference between the two stores (checked: the store did not
+        # shrink its segments).
+        table = 16 * 1024 * 1024
+        size = TestTableSize._fitting_size(table)
+        value = _bytes_of(2047 * 4096 + 5000, 3)
+        key = _key("big")
+        out = np.zeros(value.size, dtype=np.uint8)
+        small = self._open(tmp_path, 4096, size=size, table_size=table)
+        assert not small.put(key, value)
+        with pytest.raises(ValueError, match="2049 grains of 4096 bytes"):
+            small.alloc_put_buffer(3, value.size)
+        small.close()
+        large = self._open(tmp_path, 32768, size=size, table_size=table)
+        assert large.put(key, value)
+        assert large.get(key, out)
+        np.testing.assert_array_equal(out, value)
+        pb = large.alloc_put_buffer(3, value.size)  # the sizes check follows
+        assert pb.value.size == value.size          # the grain, too
+        with pytest.raises(ValueError, match="grains of 32768 bytes"):
+            large.alloc_put_buffer(3, 2047 * 32768)
+        large.close()
+        assert "do not fit" not in capfd.readouterr().err
+
+    @pytest.mark.parametrize("created,other", [
+        (c, o) for c in _GRAINS for o in _GRAINS + [8192] if o != c])
+    def test_reopening_with_another_grain_fails_and_harms_nothing(
+            self, tmp_path, capfd, created, other):
+        kv = self._open(tmp_path, created)
+        assert kv.put(_key("k"), _val("kept"))
+        kv.close()
+        capfd.readouterr()
+        with pytest.raises(IOError) as e:
+            self._open(tmp_path, other, force_destroy=False)
+        # What the store does today: it does not find the store (the
+        # metadata's place depends on the grain), refuses to format over a
+        # file that is not new, and says so. The error names the grain asked.
+        assert "grain_size={}".format(other) in str(e.value)
+        assert "no store of" in capfd.readouterr().err
+        kv = self._open(tmp_path, created, force_destroy=False)
+        out = np.zeros(4, dtype=np.uint8)
+        assert kv.get(_key("k"), out)
+        assert out.tobytes() == b"kept"
+        kv.close()
+
+    @pytest.mark.parametrize("grain", _GRAINS)
+    def test_reopening_with_the_same_grain_finds_the_data(self, tmp_path,
+                                                         grain):
+        kv = self._open(tmp_path, grain)
+        assert kv.put(_key("k"), _val("kept"))
+        kv.close()
+        kv = self._open(tmp_path, grain, force_destroy=False)
+        out = np.zeros(4, dtype=np.uint8)
+        assert kv.get(_key("k"), out)
+        assert out.tobytes() == b"kept"
+        kv.close()
+
+    def test_force_destroy_makes_a_new_store_of_the_new_grain(self, tmp_path):
+        kv = self._open(tmp_path, 4096)
+        assert kv.put(_key("k"), _val("old"))
+        kv.close()
+        kv = self._open(tmp_path, 512)
+        out = np.zeros(3, dtype=np.uint8)
+        assert not kv.get(_key("k"), out)
+        kv.close()
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +590,7 @@ def big_store(tmp_path):
     kv = pyudepot.uDepot(file_name=path, size=256 * 1024 * 1024,
                          force_destroy=True, table_size=16 * 1024 * 1024)
     yield kv
-    kv._cleanup()
+    kv.close()
 
 
 @pytest.fixture
@@ -567,7 +871,7 @@ class TestBufferLifetime:
                              size=STORE_SIZE, force_destroy=True)
         pb = kv.alloc_put_buffer(8, 100)
         view = pb.value
-        kv._cleanup()
+        kv.close()
         view[:] = 3  # the memory is the buffer's, not the store's
         with pytest.raises(ValueError, match="closed"):
             kv.put_buffer(_key("12345678"), pb)
@@ -672,7 +976,7 @@ class TestZeroCopyErrors:
             with pytest.raises(ValueError, match="GetBuffer of this store"):
                 store.get_into(_key("12345678"), gb)
         finally:
-            other._cleanup()
+            other.close()
 
     def test_things_that_are_not_buffers_are_refused(self, store):
         gb = store.alloc_get_buffer(8, 10)
@@ -707,3 +1011,189 @@ class TestZeroCopyReachesTheCallersBuffer:
             addr - key.size))
         assert after == key.tobytes()
 
+
+
+W = 8  # the queue_depth the multi-get tests open their store with
+
+
+@pytest.fixture
+def qstore(tmp_path):
+    path = str(tmp_path / "pyudepot_mget")
+    kv = pyudepot.uDepot(file_name=path, size=STORE_SIZE, force_destroy=True,
+                         queue_depth=W)
+    yield kv
+    kv.close()
+
+
+def _mkey(i):
+    return _key("mget_key_%04d" % i)
+
+
+def _present(i):
+    return i % 3 != 2  # every third key is never stored
+
+
+def _mval(i):
+    return _bytes_of(300, i)
+
+
+def _fill(kv, n):
+    for i in range(n):
+        if _present(i):
+            _zc_put(kv, _mkey(i), _mval(i))
+
+
+class TestMultiGetInto:
+    @pytest.mark.parametrize("n", [0, 1, 2, W - 1, W, W + 1, 4 * W, 200])
+    def test_each_key_gets_its_own_result_and_value(self, qstore, n):
+        _fill(qstore, max(n, 1))
+        keys = [_mkey(i) for i in range(n)]
+        bufs = [qstore.alloc_get_buffer(keys[i].size, 300) if keys else None
+                for i in range(n)]
+        ok = qstore.multi_get_into(keys, bufs)
+        assert ok == [_present(i) for i in range(n)]
+        for i in range(n):
+            if _present(i):
+                np.testing.assert_array_equal(bufs[i].value, _mval(i))
+                # the same bytes get_into returns
+                one = qstore.alloc_get_buffer(keys[i].size, 300)
+                assert qstore.get_into(keys[i], one)
+                np.testing.assert_array_equal(bufs[i].value, one.value)
+            else:
+                assert bufs[i].value.size == 0
+
+    def test_a_batch_far_past_the_kernels_queue_floor_needs_the_window(
+            self, tmp_path):
+        # The kernel sizes an AIO context for at least 8 I/Os per possible
+        # CPU whatever depth was asked for, so only a batch past that fills
+        # the queue: with every get in flight at once, some get -EAGAIN.
+        n = max(4096, 16 * (os.cpu_count() or 1) + 1024)
+        kv = pyudepot.uDepot(file_name=str(tmp_path / "wide"),
+                             size=64 * 1024 * 1024, force_destroy=True,
+                             queue_depth=W)
+        try:
+            data = _bytes_of(100, 1)
+            keys = [_mkey(i) for i in range(n)]
+            for k in keys:
+                _zc_put(kv, k, data)
+            bufs = [kv.alloc_get_buffer(13, 100) for _ in keys]
+            assert kv.multi_get_into(keys, bufs) == [True] * n
+            for b in bufs:
+                np.testing.assert_array_equal(b.value, data)
+        finally:
+            kv.close()
+
+    def test_a_buffer_passed_twice_is_refused(self, qstore):
+        _fill(qstore, 4)
+        gb = qstore.alloc_get_buffer(13, 300)
+        other = qstore.alloc_get_buffer(13, 300)
+        with pytest.raises(ValueError, match="more than once"):
+            qstore.multi_get_into([_mkey(0), _mkey(1), _mkey(3)],
+                                  [gb, other, gb])
+        # refused before anything ran: neither buffer holds a value
+        assert gb.value.size == 0 and other.value.size == 0
+
+    def test_bad_arguments_are_refused(self, qstore, tmp_path):
+        _fill(qstore, 2)
+        gb = qstore.alloc_get_buffer(13, 300)
+        pb = qstore.alloc_put_buffer(13, 300)
+        with pytest.raises(ValueError):
+            qstore.multi_get_into([_mkey(0), _mkey(1)], [gb])
+        with pytest.raises(ValueError):
+            qstore.multi_get_into([_mkey(0)], [pb])
+        with pytest.raises(ValueError):
+            qstore.multi_get_into([_mkey(0).astype(np.int32)], [gb])
+        with pytest.raises(ValueError):
+            qstore.multi_get_into([_mkey(0)], [None])
+        foreign = pyudepot.uDepot(file_name=str(tmp_path / "other"),
+                                  size=STORE_SIZE, force_destroy=True)
+        try:
+            with pytest.raises(ValueError):
+                qstore.multi_get_into([_mkey(0)],
+                                      [foreign.alloc_get_buffer(13, 300)])
+        finally:
+            foreign.close()
+
+    def test_copies_no_value(self, qstore):
+        _fill(qstore, 30)
+        keys = [_mkey(i) for i in range(30)]
+        bufs = [qstore.alloc_get_buffer(13, 300) for _ in keys]
+        before = pyudepot.thread_value_copies()
+        qstore.multi_get_into(keys, bufs)
+        assert pyudepot.thread_value_copies() == before
+
+    def test_a_live_array_is_not_overwritten_or_freed(self, qstore):
+        _fill(qstore, 2)
+        a = qstore.alloc_get_buffer(13, 300)
+        b = qstore.alloc_get_buffer(13, 300)
+        assert qstore.multi_get_into([_mkey(0), _mkey(1)], [a, b]) == \
+            [True, True]
+        held = a.value                      # a live array over a's buffer
+        assert qstore.multi_get_into([_mkey(1), _mkey(0)], [a, b]) == \
+            [True, True]
+        np.testing.assert_array_equal(held, _mval(0))   # not overwritten
+        np.testing.assert_array_equal(a.value, _mval(1))
+        np.testing.assert_array_equal(b.value, _mval(0))
+
+    def test_a_failed_key_leaves_an_empty_value(self, qstore):
+        _fill(qstore, 3)
+        a = qstore.alloc_get_buffer(13, 300)
+        b = qstore.alloc_get_buffer(13, 300)
+        assert qstore.multi_get_into([_mkey(0), _mkey(1)], [a, b]) == \
+            [True, True]
+        assert qstore.multi_get_into([_mkey(1), _mkey(2)], [a, b]) == \
+            [True, False]
+        assert a.value.size == 300 and b.value.size == 0
+
+    def test_queue_depth_is_the_open_parameter(self, tmp_path, capfd):
+        # A depth the kernel cannot give fails the open, saying so.
+        with pytest.raises(IOError):
+            pyudepot.uDepot(file_name=str(tmp_path / "huge"), size=STORE_SIZE,
+                            force_destroy=True, queue_depth=2**31)
+        assert "failed to init uDepot-ng" in capfd.readouterr().err
+
+    def test_a_failure_that_is_not_a_missing_key_raises(self, qstore):
+        _fill(qstore, 2)
+        empty = np.empty(0, dtype=np.uint8)  # the store refuses it: -EINVAL
+        a, b, c = (qstore.alloc_get_buffer(13, 300) for _ in range(3))
+        with pytest.raises(IOError) as e:
+            qstore.multi_get_into([_mkey(2), empty, _mkey(0)], [a, b, c])
+        msg = str(e.value)
+        assert "key 1" in msg and "Invalid argument" in msg
+        assert e.value.errno == 22
+        assert isinstance(e.value, pyudepot.MultiGetError)
+        assert e.value.failed == [(1, -errno.EINVAL)]
+        np.testing.assert_array_equal(c.value, _mval(0))  # the others read
+        # every failed key is listed, in batch order, a missing one is not
+        bufs = [qstore.alloc_get_buffer(13, 300) for _ in range(5)]
+        with pytest.raises(IOError) as e:
+            qstore.multi_get_into([empty, _mkey(2), _mkey(0), empty.copy(),
+                                   _mkey(1)], bufs)
+        assert e.value.failed == [(0, -errno.EINVAL), (3, -errno.EINVAL)]
+        assert "key 0" in str(e.value) and "2 of 5" in str(e.value)
+        # a missing key alone is not an error
+        assert qstore.multi_get_into([_mkey(2)], [a]) == [False]
+
+    def test_the_window_follows_the_thread_not_the_store(self, tmp_path):
+        # A thread's AIO context is shared by every store on it, and the
+        # store opened last sizes it. Opening a shallow store here shrinks
+        # the context the deep store's gets run in: a window of the deep
+        # store's own depth would fail the gets past it with -EAGAIN.
+        n = max(4096, 16 * (os.cpu_count() or 1) + 1024)
+        deep = pyudepot.uDepot(file_name=str(tmp_path / "deep"),
+                               size=64 * 1024 * 1024, force_destroy=True)
+        shallow = None
+        try:
+            data = _bytes_of(100, 2)
+            keys = [_mkey(i) for i in range(n)]
+            for k in keys:
+                _zc_put(deep, k, data)
+            shallow = pyudepot.uDepot(file_name=str(tmp_path / "shallow"),
+                                      size=STORE_SIZE, force_destroy=True,
+                                      queue_depth=W)
+            bufs = [deep.alloc_get_buffer(13, 100) for _ in keys]
+            assert deep.multi_get_into(keys, bufs) == [True] * n
+        finally:
+            if shallow:
+                shallow.close()
+            deep.close()

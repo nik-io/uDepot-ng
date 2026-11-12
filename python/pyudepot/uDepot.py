@@ -3,6 +3,7 @@
 
 import ctypes
 from ctypes import c_char_p, c_int, c_ubyte, c_uint, c_ulonglong, c_void_p, byref, POINTER
+import errno
 import os
 import logging
 import atexit
@@ -16,14 +17,15 @@ _lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 libudepot = ctypes.cdll.LoadLibrary(
     _lib_path if os.path.exists(_lib_path) else 'libpyudepot.so')
 
-pyopen = libudepot.uDepotOpenTables
+pyopen = libudepot.uDepotOpenGrain
 pyclose = libudepot.uDepotClose
 pyget = libudepot.uDepotGet
 pyput = libudepot.uDepotPut
 pydel = libudepot.uDepotDel
 pyexists = libudepot.uDepotExists
 
-pyopen.argtypes = [c_char_p, c_ulonglong, c_int, c_ulonglong]
+pyopen.argtypes = [c_char_p, c_ulonglong, c_int, c_ulonglong, c_uint,
+                   c_uint]
 pyopen.restype = c_void_p
 pyclose.argtypes = [c_void_p]
 pyget.argtypes = [c_void_p,
@@ -49,6 +51,7 @@ pygetbuf = libudepot.uDepotGetBuf
 pygetvalue = libudepot.uDepotGetBufferValue
 pyfreeget = libudepot.uDepotFreeGetBuffer
 pycopies = libudepot.uDepotThreadValueCopies
+pymultiget = libudepot.uDepotMultiGetBuf
 
 pyallocput.argtypes = [c_void_p, c_uint, c_ulonglong]
 pyallocput.restype = c_void_p
@@ -74,6 +77,9 @@ pyfreeget.argtypes = [c_void_p]
 pyfreeget.restype = None
 pycopies.argtypes = []
 pycopies.restype = c_ulonglong
+pymultiget.argtypes = [c_void_p, c_uint, c_void_p, c_void_p, c_void_p,
+                       c_void_p]
+pymultiget.restype = c_int
 
 
 def thread_value_copies():
@@ -156,7 +162,7 @@ class PutBuffer:
     beyond the record layout: the buffer is 4096-aligned and the value starts
     sizeof(KvHeader) + key_size = 14 + key_size bytes into it, so its address
     is (14 + key_size) mod 4096 within a page. The record's checksum (2
-    bytes) follows the value, then zero padding to the 4096-byte grain; none
+    bytes) follows the value, then zero padding to the grain (grain_size); none
     of that is in `value`. An array outlives the PutBuffer: it keeps the
     buffer alive until it and every view of it are gone.
     """
@@ -214,11 +220,29 @@ class GetBuffer:
         return _value_array(self._owned, ptr, size.value, False)
 
 
+class MultiGetError(IOError):
+    """multi_get_into: some gets failed other than as a missing key.
+
+    An IOError (OSError) whose errno/strerror are those of the first failure.
+    `failed` is the list of (index, rc) of every such key, index into the
+    `keys` passed, in batch order, rc a negative errno as the C layer returns
+    it. The keys not listed were read or are missing (their buffers say which).
+    """
+
+    def __init__(self, failed, errno_, msg):
+        super().__init__(errno_, msg)
+        self.failed = failed
+
+
 # Index tables of 2 MiB: small, for tests. A store sized for real use
 # passes its own table_size (a power of two of at least 4096 bytes, or 0
 # for the store's default, 512 MiB tables); tables this small map on
 # 4 KiB pages and directory grows are slower, which the store prints.
 DEFAULT_TABLE_SIZE = 2 * 1024 * 1024
+
+# The store's grain: its unit of allocation and I/O. A record holds at most
+# 2047 grains, so this is also what bounds a value (~8 MiB at 4096).
+DEFAULT_GRAIN_SIZE = 4096
 
 
 class uDepot:
@@ -229,24 +253,66 @@ class uDepot:
         force_destroy=False restores the store, and raises IOError for a
         backing with no store on it (one created with another size, say)
         unless it is a new or empty file.
+
+        queue_depth is the number of I/Os each thread may have in flight
+        (the size of its AIO context; 0, the default, is 1024); multi_get_into
+        keeps at most that many gets in flight on the calling thread, fewer
+        if that thread's AIO context has less room.
+
+        grain_size is the store's grain in bytes (default 4096): a power of
+        two from 512 to 1 MiB, else IOError (ValueError if it is not a
+        positive 32-bit int); a grain below the O_DIRECT alignment of an
+        existing file or device is an IOError too. A record is at most 2047
+        grains, so a larger grain stores larger values (32768: ~64 MiB, with
+        table_size and size to match) at the price of a grain per small
+        record. A store is reopened with the grain it was created with: another
+        raises IOError (the store's message is on stderr), except that a file
+        that force_destroy once formatted at a smaller grain or size can
+        still open the older store left under it (see "Grain size" in
+        docs/architecture.md); use a new file to change it.
         """
         self._fname = kwargs.get('file_name', '/tmp/pyudepot-test')
         self._size = kwargs.get('size', 1024 * 1024 + 4096)
         self._force_destroy = 1 if kwargs.get('force_destroy', False) else 0
         self._table_size = kwargs.get('table_size', DEFAULT_TABLE_SIZE)
+        self._queue_depth = kwargs.get('queue_depth', 0)
+        self._grain_size = kwargs.get('grain_size', DEFAULT_GRAIN_SIZE)
+        # ctypes would wrap a value past 32 bits into a valid-looking grain.
+        if (not isinstance(self._grain_size, int)
+                or not 0 < self._grain_size < 2**32):
+            raise ValueError(
+                'grain_size={!r} is not valid: it must be a power of two '
+                'from 512 to 1048576 bytes'.format(self._grain_size))
         self._kv = pyopen(
             self._fname.encode('utf-8'), self._size, self._force_destroy,
-            self._table_size)
+            self._table_size, self._queue_depth, self._grain_size)
         if not self._kv:
-            raise IOError('failed to open uDepot for {}'.format(self._fname))
-        atexit.register(self._cleanup)
+            raise IOError(
+                'failed to open uDepot for {} (size={}, grain_size={}, '
+                'force_destroy={}); the reason is on stderr'.format(
+                    self._fname, self._size, self._grain_size,
+                    bool(self._force_destroy)))
+        atexit.register(self.close)
 
-    def _cleanup(self):
-        # As uDepot's close: shut down and free the store. The caller must
-        # ensure no call on this object is in progress or follows.
-        if self._kv:
-            pyclose(self._kv)
-            self._kv = None
+    def close(self):
+        """Closes the store now: its index is written back and the handle
+        freed, so the file can be opened again in this process. Idempotent.
+        Every other call on this store then raises ValueError, but the
+        PutBuffers, GetBuffers and arrays taken from it stay valid (their
+        memory is the buffer's own). As uDepot's close, no call on this store
+        may be in progress, or follow, on another thread. A store that is
+        never closed is closed at interpreter exit.
+        """
+        kv, self._kv = self._kv, None
+        if kv:
+            atexit.unregister(self.close)
+            pyclose(kv)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
 
     def _handle(self):
         # Calls after close would pass a freed pointer to C.
@@ -273,7 +339,7 @@ class uDepot:
 
         Raises ValueError if the sizes cannot be stored (key 1..65535
         bytes; the record, 14 + key_size + val_size + 2 bytes, at most 2047
-        grains of 4096 bytes) and MemoryError if the allocation fails.
+        grains of grain_size bytes) and MemoryError if the allocation fails.
         """
         handle = self._alloc(pyallocput, key_size, val_size, 'put')
         return PutBuffer(self, _Owned(handle, _free_put), key_size, val_size)
@@ -293,14 +359,16 @@ class uDepot:
                 'key_size must be 1..65535 and val_size below 2**32-1'
                 .format(what, key_size, val_size))
         # The store's check_sizes: a record is at most 2047 grains (11 bits
-        # of HashEntry's kv size); the binding's grain is 4096 bytes.
-        grains = (14 + key_size + val_size + 2 + 4095) // 4096
+        # of HashEntry's kv size).
+        grain = self._grain_size
+        grains = (14 + key_size + val_size + 2 + grain - 1) // grain
         if grains > 2047:
             raise ValueError(
                 'cannot allocate a {} buffer for key_size={} val_size={}: '
-                'the record needs {} grains of 4096 bytes, the store holds '
-                'at most 2047 per record'
-                .format(what, key_size, val_size, grains))
+                'the record needs {} grains of {} bytes, the store holds '
+                'at most 2047 per record (open it with a larger grain_size '
+                'for larger values)'
+                .format(what, key_size, val_size, grains, grain))
         handle = alloc(kv, key_size, val_size)
         if not handle:
             raise MemoryError(
@@ -335,13 +403,7 @@ class uDepot:
         from buf.value. Returns False if the key is missing or the get
         fails, with buf.value empty."""
         kv = self._own(buf, GetBuffer)
-        owned = buf._owned
-        if owned.in_use():
-            # An earlier array still views this buffer: read into a new one.
-            handle = pynewget()
-            if not handle:
-                raise MemoryError('cannot allocate a get buffer')
-            owned = _Owned(handle, _free_get)
+        owned = self._get_target(buf)
         buf._has_value = False
         rc = pygetbuf(kv, key, key.size, owned.handle)
         if rc != 0:
@@ -350,6 +412,87 @@ class uDepot:
         buf._owned = owned
         buf._has_value = True
         return True
+
+    @staticmethod
+    def _get_target(buf):
+        """The C buffer a get into `buf` reads into: its own, or a new one
+        if an earlier array still views it (which a get must not overwrite
+        or free)."""
+        owned = buf._owned
+        if owned.in_use():
+            handle = pynewget()
+            if not handle:
+                raise MemoryError('cannot allocate a get buffer')
+            owned = _Owned(handle, _free_get)
+        return owned
+
+    def multi_get_into(self, keys, bufs):
+        """get_into for every keys[i] and bufs[i], with the gets in flight
+        together on this thread (one C call, no threads): up to the smaller of
+        the store's queue_depth and this thread's AIO context room at once,
+        each new one starting as another completes.
+        Returns a list of bools, one per key: True with bufs[i].value the
+        value of keys[i]; False for a key that is not in the store, with
+        bufs[i].value empty. Any other failure (-EAGAIN, an I/O error) raises
+        MultiGetError (an IOError) naming the first such key and its error,
+        after every other buffer has been filled: it is not a missing key, so
+        it is not False. Its `failed` attribute lists (index, rc) for every
+        such key, indices into `keys`, rc a negative errno.
+        (get_into still returns False for every failure; making it raise is a
+        separate change.)
+
+        keys are C-contiguous uint8 arrays; bufs are GetBuffers of this
+        store, all different (a buffer serves one get): ValueError otherwise.
+        The buffers' lifetime rules are get_into's: one with a live array
+        reads into a new C buffer.
+        """
+        kv = self._handle()
+        n = len(keys)
+        if len(bufs) != n:
+            raise ValueError('{} keys but {} buffers'.format(n, len(bufs)))
+        if len({id(b) for b in bufs}) != n:
+            raise ValueError(
+                'a GetBuffer appears more than once: one buffer serves one '
+                'get, so each key needs its own')
+        for k in keys:
+            if (not isinstance(k, np.ndarray) or k.dtype != np.uint8
+                    or k.ndim != 1 or not k.flags.c_contiguous):
+                raise ValueError('a key is not a C-contiguous 1-d uint8 array')
+        for b in bufs:
+            self._own(b, GetBuffer)
+        if n == 0:
+            return []
+        targets = [self._get_target(b) for b in bufs]
+        for b in bufs:
+            b._has_value = False
+        c_keys = (c_void_p * n)(*[k.ctypes.data for k in keys])
+        c_sizes = (c_uint * n)(*[k.size for k in keys])
+        c_bufs = (c_void_p * n)(*[t.handle for t in targets])
+        results = (c_int * n)()
+        rc = pymultiget(kv, n, c_keys, c_sizes, c_bufs, results)
+        if rc != 0:
+            raise MemoryError('multi_get_into: out of memory (rc={})'
+                              .format(rc))
+        ok = []
+        failed = []  # (index, rc) of the gets that failed for another reason
+        for i in range(n):
+            if results[i] == 0:
+                bufs[i]._owned = targets[i]
+                bufs[i]._has_value = True
+                ok.append(True)
+            else:
+                if results[i] != -errno.ENOENT:
+                    failed.append((i, results[i]))
+                logging.info('pymultiget key %d returned=%d', i, results[i])
+                ok.append(False)
+        if failed:
+            i, rc = failed[0]
+            raise MultiGetError(
+                failed, -rc, 'multi_get_into: {} of {} gets failed, not as a missing '
+                'key; the first, key {}: {}. The buffers of the keys that '
+                'succeeded hold their values; retry the failed ones'.format(
+                    len(failed), n, i, os.strerror(-rc)))
+        return ok
 
     def delete(self, key):
         rc = pydel(self._handle(), key, key.size)

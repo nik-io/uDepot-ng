@@ -195,6 +195,14 @@ struct AioSubmitAwaitable {
     ssize_t await_resume() noexcept { return req->result; }
 };
 
+unsigned AioIO::thread_queue_room() noexcept {
+    const AioThread& t = tl_aio;
+    // No context yet: AioSubmitAwaitable creates it at new_ctx_depth_.
+    const size_t depth =
+        t.ctx != 0 ? t.depth : new_ctx_depth_.load(std::memory_order_relaxed);
+    return static_cast<unsigned>(depth > t.pending ? depth - t.pending : 0);
+}
+
 unsigned AioIO::live_contexts() noexcept {
     return g_live_contexts.load(std::memory_order_relaxed);
 }

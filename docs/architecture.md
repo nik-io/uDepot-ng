@@ -629,6 +629,7 @@ uDepot-ng/
 │   ├── rcu.cc
 │   ├── buffer.h                 # IoBuffer, allocator tags
 │   ├── coro.h                   # CoroTask (eager start, symmetric transfer)
+│   ├── multi_get.h              # N gets on one thread, windowed by queue depth
 │   └── io/
 │       ├── backend.h            # IoBackend concept
 │       ├── posix.h              # pread/pwrite (sync)
@@ -646,7 +647,7 @@ uDepot-ng/
 │   └── memcache.cc              # memcache protocol server
 ├── python/
 │   ├── wrapper/
-│   │   ├── pyudepot.h           # C ABI (17 functions)
+│   │   ├── pyudepot.h           # C ABI (19 functions)
 │   │   └── pyudepot.cc          # bridges C ABI to uDepot via run_sync()
 │   └── pyudepot/
 │       ├── __init__.py
@@ -687,32 +688,167 @@ ccache is picked up automatically when present (same as the original).
 
 ## Python Bindings (pyudepot)
 
-**No thread-per-get.** Flywheel's old `ThreadPoolExecutor.submit(self.get, …)`
-per key in `multi_get` is exactly the overhead this rewrite eliminates. All I/O
-concurrency comes from the eager-start coroutine model — one thread, zero thread
-creation.
+**No thread-per-get.** A `ThreadPoolExecutor.submit(get, …)` per key is exactly
+the overhead this rewrite eliminates. All I/O concurrency comes from the
+eager-start coroutine model: one thread, zero thread creation.
 
-The C ABI exposes both single-key and batch entry points:
+The C ABI is `src/python/pyudepot.h` (20 functions, `extern "C"`, over
+`uDepot<AioIO>`; the binding is AIO-only), each call a `run_sync()` on the
+calling thread except the batch below:
+
+| group | functions |
+|---|---|
+| open/close | `uDepotOpen`, `uDepotOpenTables` (+ table size), `uDepotOpenQueue` (+ `queue_depth`), `uDepotOpenGrain` (+ `grain_bytes`), `uDepotClose` |
+| copying | `uDepotGet`, `uDepotPut`, `uDepotDel`, `uDepotExists` |
+| zero copy | `uDepotAllocPutBuffer`, `uDepotPutBufferValue`, `uDepotPutBuf`, `uDepotFreePutBuffer`, `uDepotAllocGetBuffer`, `uDepotNewGetBuffer`, `uDepotGetBuf`, `uDepotGetBufferValue`, `uDepotFreeGetBuffer`, `uDepotThreadValueCopies` |
+| batch | `uDepotMultiGetBuf` |
+
+The Python `uDepot` class (`python/pyudepot/uDepot.py`) exposes `get`, `put`,
+`delete`, `exists`, the zero-copy calls below, and `multi_get_into`. Keys are
+C-contiguous `uint8` numpy arrays.
+
+### Grain size
+
+`uDepot(..., grain_size=4096)` is `uDepotOpenGrain(..., grain_bytes)`:
+`StoreConfig::grain_size`, the unit of allocation and I/O. `uDepotOpen`,
+`uDepotOpenTables` and `uDepotOpenQueue` are unchanged and open with 4096
+(`kDefaultGrainBytes`). A record is at most 2047 grains
+(`HashEntry::kKvSizeMask`), so the grain bounds the value: ~8 MiB at 4096,
+~64 MiB at 32768, in one I/O (flywheel raises the grain to store larger
+tensors rather than split them). The cost is a grain per record: a small value
+occupies a whole grain, and the segment must hold a record, so larger values
+need larger tables (`table_size`) and a device that holds several segments.
+
+The store (`uDepot::open`) checks nothing about the grain, so the binding does
+(`grain_is_valid`, `pyudepot.cc`); anything else fails the open with a message
+on stderr naming the value and the rule, never a fallback to 4096:
+
+- **a power of two**: below 4096, `sanitize` in `uDepot::open` rounds a segment
+  to whole 4096-byte pages by `4096 / grain`, which needs a divisor of 4096.
+  At and above 4096 no requirement of the store was found; only powers of two
+  (uDepot's grains) have ever been run, so nothing else is let in;
+- **at least 512**: the file is opened O_DIRECT (`open_direct`), whose offsets
+  and lengths are multiples of the device's logical block size, 512 at the
+  smallest, and every record, segment and metadata I/O is a multiple of the
+  grain. Where the backing says more, the grain is checked against it before
+  the open (`direct_io_alignment`): a block device's logical sector size
+  (`BLKSSZGET`), an existing regular file's `dio_offset_align` (`statx`
+  `STATX_DIOALIGN`, Linux 6.1+, where the filesystem reports it). A grain that
+  is not a multiple fails with a message naming both numbers (otherwise the
+  open fails with only `Input/output error`, a 512 grain on a 4Kn device).
+  The filesystem's block size is not used as a fallback: ext4 takes 512-byte
+  O_DIRECT I/O on 4096-byte blocks, so it would refuse grains that work. What
+  cannot be told is not checked: a file that does not exist yet, a kernel or
+  filesystem without `STATX_DIOALIGN`. The store's open then reports what the
+  device refuses;
+- **at most 1 MiB**: a record is at most 2047 grains (`HashEntry::kKvSizeMask`)
+  and is written with one `pwrite`, which Linux caps at `MAX_RW_COUNT` =
+  `INT_MAX & PAGE_MASK` = 2147479552 bytes. 2047 grains of 1 MiB are
+  2146435072 bytes; of 2 MiB they would be twice that, and the put would fail
+  with `-EIO` and no message (`put_record`, `written != total`). 1 MiB was
+  checked to open and round-trip a small value; a value near 2 GiB was not.
+
+The Python wrapper also refuses (ValueError) a `grain_size` that is not an
+int in `1 .. 2**32 - 1`, since ctypes would wrap `2**32 + 4096` to a valid
+4096.
+
+**Reopening.** A store must be reopened with the grain it was created with.
+On a file that has only ever held a store of that grain, another grain fails
+the open (`IOError`; `-EEXIST` from the store): the device metadata sits in the
+last `align_up(sizeof(salsa_dev_md), grain)` bytes of the whole grains
+(`dev_md_grain_offset`), so a different grain looks where there is none, finds
+no store, and `uDepot::open` will not format a file that is not new
+(`no store of N bytes found ...`). Nothing is read as another grain and nothing
+written then (`ReopeningWithAnotherGrainFailsAndHarmsNothing`,
+`test_reopening_with_another_grain_...`, every pair of 512, 4096, 32768 and
+8192, each on a new file). The store's own grain-mismatch message
+(`validate_dev_md`, "created with grains of %u bytes") is reached only if the
+metadata is found, and the message the caller sees names the size, not the
+grain, so the Python `IOError` names the `grain_size` it was given.
+
+**`force_destroy` does not clear the old store, and this is not safe across
+grains.** `force_destroy` keeps the file's data (`size_direct_file`) and
+writes the new store's metadata at the new grain's offset, zero padded to one
+grain. When the new grain is smaller than the old (or the size differs at the
+same grain), that write does not cover the old store's metadata, which stays
+valid where it is: a reopen at the old grain, without `force_destroy`, then
+opens the old store, with its old data, and writes over the new one (seen:
+4096 then 512, the new store cannot be opened any more; 32768 then 4096 or
+512, and 8192 then 4096, the new store opens with its keys gone). A smaller
+grain after a larger one is the dangerous direction; a larger one is not.
+This is the store's, not the binding's, and not new here (the same happens
+after a `force_destroy` at a different size and the same grain): `force_destroy`
+should invalidate the earlier metadata. It is a follow-up PR of its own; until
+it lands, change a store's grain (or size) on a new file. No test asserts the
+current behaviour.
+
+### Closing
+
+`kv.close()` is `uDepotClose` now: the store writes its index back, shuts
+down and is freed, and the same file can be opened again in this process (the
+data comes back; `test_data_survives_a_close_and_a_reopen_in_this_process`).
+It is idempotent, and `with pyudepot.uDepot(...) as kv:` closes on exit, also
+on an exception. Every other method then raises `ValueError("uDepot store is
+closed")` (all of them go through `_handle()`; `test_every_method_raises_closed_after_close`
+lists them, `multi_get_into` and the buffer calls included), rather than passing
+the freed pointer to C. As in uDepot, no call on the store may be in progress
+on another thread, or follow, when it is closed: `close()` is not a lock.
+
+A store nobody closes is closed at interpreter exit by an `atexit` hook
+(`atexit.register(self.close)`). `close()` takes the hook back, so the exit
+does not close it a second time and the hook does not keep a closed store
+alive until exit. PutBuffers, GetBuffers and the arrays taken from them stay
+valid after the store is closed (see Zero-copy values below).
+
+### multi_get_into: N gets, one thread, one call
 
 ```c
-int udepot_get(udepot_t h, const void* key, uint32_t klen,
-               void* val, uint32_t vlen, uint32_t* val_size);
-
-int udepot_multi_get(udepot_t h, uint32_t n,
-                     const udepot_iov* keys,
-                     udepot_iov* vals,
-                     int* results);
+int uDepotMultiGetBuf(void* kv, uint32_t n, const uint8_t* const keys[],
+                      const uint32_t key_sizes[], void* const get_bufs[],
+                      int results[]);
 ```
 
-`udepot_multi_get` launches N eager-start coroutines — each submits its I/O
-immediately — then drives the poller until all complete. On an async backend
-(uring, SPDK) this is true I/O concurrency from a single call, single thread.
-On the sync backend (posix) the coroutines never suspend, so it degrades to
-sequential I/O — correct but not concurrent, same as today.
+`kv.multi_get_into(keys, bufs)` reads `keys[i]` into `bufs[i]` (`GetBuffer`s of
+this store) and returns one `bool` per key, as `get_into`: `bufs[i].value` is
+the value where `True`, empty where `False` (a missing key); any other failure
+raises `IOError`, see Errors below. It is one ctypes call, so the GIL is released once
+for the whole batch. `udepot::multi_get` (`src/udepot/multi_get.h`) launches
+eager-start `get` coroutines, each submitting its I/O at once, keeps at most a
+**window** of them in flight, starts the next as each completes, and drives
+`poll_this_thread()` until all are done, writing each rc into `results[i]`. It
+is the slot loop of `test/perf/udepot_ng_bench.cc` (`op_window()`, its `--qd`),
+and uses no threads and no locks.
 
-The Python `uDepot` class exposes `get`, `put`, `delete`, `exists`, and
-`multi_get`. `multi_get` is a single ctypes call into `udepot_multi_get`, not a
-Python-side thread pool.
+- **The window** is what the calling thread's AIO context takes: an I/O past
+  a full context fails `-EAGAIN`, and a get holds one entry. The binding uses
+  `min(store->io().queue_depth(), AioIO::thread_queue_room())`: the store's
+  `StoreConfig::queue_depth` (1024, `AioIO::kDefaultQueueDepth`, unless opened
+  with `uDepot(..., queue_depth=N)`, i.e. `uDepotOpenQueue`; the default is
+  unchanged), and the thread's context depth less what it has in flight. **W
+  follows the thread, not the store**, because the context belongs to the
+  thread: every `AioIO` on a thread shares it, `open()` of any store resizes it
+  if it is idle (`aio.cc`, `AioIO::open`), and a thread's first I/O creates its
+  context at `new_ctx_depth_`, process-wide, the depth of whichever store was
+  opened last. So a store opened with a deep queue and used after a shallow one
+  was opened on the same thread runs in the shallow context. The kernel sizes
+  a context for at least 8 I/Os per possible CPU whatever depth was asked for,
+  so the window is a safe bound, not an exact one.
+- **Errors.** A missing key (`-ENOENT`) is `False`. Any other failure
+  (`-EAGAIN`, `-EINVAL`, an I/O error) raises `pyudepot.MultiGetError` (an
+  `IOError`, so `errno`/`strerror` are those of the first failure; the message
+  names it) after the other buffers have been filled; it is not reported as a
+  missing key. Its `failed` attribute is the list of `(index, rc)` of every
+  such key, as data: indices into the `keys` argument in batch order, `rc` a
+  negative errno as the C layer returns it. It is a subclass so the attribute
+  is always there. (`get_into` still returns `False` for every
+  failure.)
+- **Buffers** must be distinct objects (one buffer serves one get): a repeat
+  raises `ValueError` before anything runs. The lifetime rule is `get_into`'s:
+  a buffer with a live `.value` array reads into a fresh C buffer.
+- **Backends.** On AIO the gets overlap. On `PosixIO` each get completes as it
+  starts, so a batch is serial gets: correct, not concurrent.
+- **Shared arrays.** The arrays from `.value` are writable, and one shared
+  between threads is the caller's to synchronise.
 
 ### Zero-copy values from Python
 
