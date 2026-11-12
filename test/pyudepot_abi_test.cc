@@ -181,8 +181,12 @@ namespace {
 uint32_t grain_of(void* kv) { return static_cast<Store*>(kv)->grain_size(); }
 
 void* open_grain(const std::string& path, uint32_t grain, int force) {
+    // Grain 0 is invalid and refused by the open; fitted_segment_size would
+    // divide by it here (a trap on x86, silently 0 on arm64).
+    const uint64_t segment =
+        grain == 0 ? 0 : segment_for_table(uint64_t{2} << 20, grain);
     return uDepotOpenSegment(path.c_str(), 16 << 20, force, 0, grain,
-                             segment_for_table(uint64_t{2} << 20, grain));
+                             segment);
 }
 
 struct TempPath {
