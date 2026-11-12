@@ -450,17 +450,44 @@ TEST(PyudepotSegment, AnInvalidSegmentFailsTheOpenAndSaysWhy) {
     }
 }
 
-// The least segment is the store's: one under it, the store refuses (so the
-// binding's check is not stricter than needed), at it the store opens (nor
-// looser).
+// The store opened bare (no binding checks) with a segment of seg_grains on a
+// device of dev bytes: its return code.
+static int bare_open(const std::string& path, uint64_t dev, uint32_t grain,
+                     uint64_t seg_grains) {
+    udepot::StoreConfig config;
+    config.path = path.c_str();
+    config.size = dev;
+    config.grain_size = grain;
+    config.force_destroy = true;
+    config.segment_size = seg_grains;
+    Store store;
+    testing::internal::CaptureStderr();
+    const int rc = store.open(config);
+    testing::internal::GetCapturedStderr();
+    if (rc == 0) store.close();
+    return rc;
+}
+
+// The least segment is the store's: one unit under it, the store refuses (so
+// the binding's check is not stricter than needed), at it the store opens
+// (nor looser). (The refusal below comes from the store, but not only from
+// the table check: with the table-room checks of create_directory and
+// restore_index removed, the store still refuses 2 grains of 4096, in salsa
+// after the device is set up. The two floors coincide at 3 grains, so this
+// test pins the binding's minimum to the store's, whichever of them binds.)
+// Each store gets a device built for ITS segment, with a tail
+// for the device metadata (device_of): on an exact multiple of the segment
+// the store abandons for want of a tail before it looks at the table, and the
+// refusal would say nothing about the minimum.
 TEST(PyudepotSegment, TheMinimumIsTheStoresMinimum) {
     TempPath p("seg_min");
-    for (uint32_t grain : {512u, 4096u, 32768u}) {
+    for (uint32_t grain : {4096u, 32768u}) {
         SCOPED_TRACE(grain);
         const uint64_t unit = pyudepot_internal::segment_unit_bytes(grain);
         const uint64_t min_bytes =
             (pyudepot_internal::min_segment_grains(grain) * grain + unit - 1) /
             unit * unit;
+        ASSERT_GT(min_bytes, unit);
         void* kv = open_segment(p.path, device_of(2000, min_bytes, grain), grain,
                                 min_bytes);
         ASSERT_NE(kv, nullptr) << "the minimum, " << min_bytes;
@@ -473,28 +500,44 @@ TEST(PyudepotSegment, TheMinimumIsTheStoresMinimum) {
         EXPECT_EQ(uDepotGet(kv, key, kKeySize, out, 3), 0);
         EXPECT_EQ(std::memcmp(val, out, 3), 0);
         uDepotClose(kv);
-        if (min_bytes <= unit) continue;  // nothing smaller is a whole page
-        // The binding refuses one unit under it...
+        // The bare store takes the minimum on a device built for it...
+        EXPECT_EQ(bare_open(p.path, device_of(2000, min_bytes, grain), grain,
+                            min_bytes / grain), 0);
+        // ...and refuses one unit under it, on a device built for that.
+        const uint64_t below = min_bytes - unit;
+        EXPECT_NE(bare_open(p.path, device_of(2000, below, grain), grain,
+                            below / grain), 0)
+            << "the store takes a segment under the minimum";
+        // The binding refuses it too, before the store.
         void* none = nullptr;
-        const uint64_t dev = device_of(2000, min_bytes, grain);
-        const std::string err = captured_open(p.path, dev, grain,
-                                              min_bytes - unit, &none);
+        const std::string err = captured_open(
+            p.path, device_of(2000, below, grain), grain, below, &none);
         EXPECT_EQ(none, nullptr);
         EXPECT_NE(err.find("is too small"), std::string::npos) << err;
-        // ...and so does the store itself, which is why.
-        udepot::StoreConfig config;
-        config.path = p.path.c_str();
-        config.size = dev;
-        config.grain_size = grain;
-        config.force_destroy = true;
-        config.segment_size = (min_bytes - unit) / grain;
-        Store store;
-        testing::internal::CaptureStderr();
-        const int rc = store.open(config);
-        testing::internal::GetCapturedStderr();
-        EXPECT_NE(rc, 0) << "the store takes a segment under the minimum";
-        if (rc == 0) store.close();
     }
+}
+
+// At 512-byte grains the unit (a 4096-byte page, 8 grains) is above the least
+// the table needs (4 grains: min_segment_grains), so no multiple of the unit is
+// under the minimum and the table check cannot be reached from below. What
+// bounds it there is `sanitize`: the store rounds a segment of 7 grains down to
+// 1, which it refuses, and the binding refuses 7 grains as not a multiple of
+// 4096 rather than let it be rounded.
+TEST(PyudepotSegment, At512ByteGrainsThePageIsTheMinimum) {
+    TempPath p("seg_min512");
+    EXPECT_EQ(pyudepot_internal::min_segment_grains(512), 4u);
+    EXPECT_EQ(bare_open(p.path, device_of(2000, 4096, 512), 512, 8), 0);
+    EXPECT_NE(bare_open(p.path, device_of(2000, 3584, 512), 512, 7), 0);
+    void* kv = nullptr;
+    const std::string err = captured_open(
+        p.path, device_of(2000, 3584, 512), 512, 3584, &kv);
+    EXPECT_EQ(kv, nullptr);
+    EXPECT_NE(err.find("is not a multiple of 4096 bytes"), std::string::npos)
+        << err;
+    kv = open_segment(p.path, device_of(2000, 4096, 512), 512, 4096);
+    ASSERT_NE(kv, nullptr);
+    EXPECT_EQ(uDepotSegmentBytes(kv), 4096u);
+    uDepotClose(kv);
 }
 
 // A store keeps the segment it was created with. On a reopen segment_bytes

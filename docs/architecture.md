@@ -825,14 +825,19 @@ Each of these fails the open, never a fallback or a precedence:
   `4096 / grain` grains below a 4096 grain), and a value the store would
   change is refused rather than rounded. That is a multiple of
   `max(grain, 4096)`. Message on stderr, then `IOError`;
-- **too small**: the least is the segment's metadata grain plus the grains a
+- **too small**: the least the binding takes is the segment's metadata grain plus the grains a
   directory table needs (`create_directory`, `restore_index`:
   `index_bits_for(net) != 0` and at least two `align_up(512, grain)` bytes of
   net), rounded up to the unit above: 3 grains of 4096 (12288 bytes), 3 of
   32768 (98304), one 4096-byte page at 512-byte grains
   (`min_segment_grains`). `TheMinimumIsTheStoresMinimum` opens a store at it
   and checks the store itself refuses one unit under it, so the two checks
-  cannot drift apart.
+  cannot drift apart. The store's own refusal below it is not only the table
+check: with the table-room checks removed the store still refuses 2 grains of
+4096 (in salsa, after the device is set up), so the two floors coincide there;
+the test pins the binding's minimum to the store's, whichever binds. At
+512-byte grains the 4096-byte unit (8 grains) is above the table's 4 grains,
+so no multiple of the unit is under the minimum (`At512ByteGrainsThePageIsTheMinimum`).
 
 **Reopening.** The segment of a store comes from its device metadata
 (`dev_md.segment_size`, `uDepot::open`), so on a reopen `segment_size` is

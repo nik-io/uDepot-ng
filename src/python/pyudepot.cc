@@ -76,8 +76,8 @@ bool grain_fits_alignment(uint32_t grain, uint32_t align, const char* path,
 // more than one neighborhood of slots) and net bytes of at least two
 // align_up(kIndexMdBytes, grain). That is also room for one record grain.
 // The store has no function for it; this follows its checks, and
-// SegmentBelowTheStoresMinimumIsRefused (pyudepot_abi_test) opens a store
-// at the minimum and one page under it to keep the two in step.
+// TheMinimumIsTheStoresMinimum (pyudepot_abi_test) opens a store at the
+// minimum and one unit under it to keep the two in step.
 uint64_t min_segment_grains(uint32_t grain) {
     const uint64_t md_bytes = sizeof(salsa::salsa_seg_md);
     const uint64_t md_grains = (md_bytes + grain - 1) / grain;
