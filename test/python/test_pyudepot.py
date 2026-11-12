@@ -245,6 +245,143 @@ class TestTableSize:
             self._open(tmp_path, table_size=table_size)
 
 
+_GRAINS = [512, 4096, 32768]
+
+
+class TestGrainSize:
+    """grain_size is the caller's: a power of two from 512 to 1 MiB, 4096 by
+    default. A larger grain stores larger values (a record is at most 2047
+    grains); a store is reopened with the grain it was created with."""
+
+    def _open(self, tmp_path, grain_size, **kwargs):
+        kwargs.setdefault("size", STORE_SIZE)
+        kwargs.setdefault("force_destroy", True)
+        return pyudepot.uDepot(file_name=str(tmp_path / "grains"),
+                               grain_size=grain_size, **kwargs)
+
+    def test_default_is_4096(self, tmp_path):
+        assert pyudepot.DEFAULT_GRAIN_SIZE == 4096
+        kv = pyudepot.uDepot(file_name=str(tmp_path / "grains"),
+                             size=STORE_SIZE, force_destroy=True)
+        assert kv._grain_size == 4096
+        kv._cleanup()
+
+    @pytest.mark.parametrize("grain", _GRAINS)
+    def test_each_grain_round_trips(self, tmp_path, grain):
+        kv = self._open(tmp_path, grain)
+        assert kv.put(_key("k"), _val("value"))
+        out = np.zeros(5, dtype=np.uint8)
+        assert kv.get(_key("k"), out)
+        assert out.tobytes() == b"value"
+        pb = kv.alloc_put_buffer(1, 100)
+        pb.value[:] = 9
+        assert kv.put_buffer(_key("z"), pb)
+        assert _zc_get(kv, _key("z"), 100).tobytes() == b"\x09" * 100
+        kv._cleanup()
+
+    @pytest.mark.parametrize("grain", [0, 1, 256, 511, 513, 3000, 65535,
+                                       2 * 1024 * 1024, 4 * 1024 * 1024])
+    def test_an_invalid_grain_fails_the_open_naming_it(self, tmp_path, capfd,
+                                                      grain):
+        path = tmp_path / "grains"
+        with pytest.raises((IOError, ValueError)) as e:
+            self._open(tmp_path, grain)
+        assert "grain_size={}".format(grain) in str(e.value) or \
+            "grain_size={!r}".format(grain) in str(e.value)
+        if grain != 0:  # 0 is refused before the C layer
+            err = capfd.readouterr().err
+            assert "grain size {} is not valid".format(grain) in err
+            assert "a power of two from 512 to 1048576 bytes" in err
+        assert not path.exists(), "a refused grain must not create the file"
+
+    @pytest.mark.parametrize("grain", [2**32 + 4096, -4096, 4096.0, "4096",
+                                       None])
+    def test_a_grain_ctypes_would_wrap_or_coerce_is_refused(self, tmp_path,
+                                                           grain):
+        # 2**32 + 4096 would reach the C layer as a valid 4096.
+        with pytest.raises(ValueError, match="grain_size="):
+            self._open(tmp_path, grain)
+
+    def test_the_largest_grain_opens_and_round_trips(self, tmp_path):
+        # 1 MiB: 2047 of them are one write below Linux's 2147479552-byte cap.
+        kv = self._open(tmp_path, 1 << 20, size=128 * 1024 * 1024 + 4096,
+                        table_size=1 << 20)
+        assert kv.put(_key("k"), _val("value"))
+        out = np.zeros(5, dtype=np.uint8)
+        assert kv.get(_key("k"), out)
+        assert out.tobytes() == b"value"
+        kv._cleanup()
+
+    def test_a_larger_grain_stores_a_larger_value(self, tmp_path, capfd):
+        # A record is at most 2047 grains: ~8 MiB at 4096, ~64 MiB at 32768.
+        # The record must also fit a segment, so the tables are 16 MiB and
+        # the device holds 32 of their segments: the grain is the only
+        # difference between the two stores (checked: the store did not
+        # shrink its segments).
+        table = 16 * 1024 * 1024
+        size = TestTableSize._fitting_size(table)
+        value = _bytes_of(2047 * 4096 + 5000, 3)
+        key = _key("big")
+        out = np.zeros(value.size, dtype=np.uint8)
+        small = self._open(tmp_path, 4096, size=size, table_size=table)
+        assert not small.put(key, value)
+        with pytest.raises(ValueError, match="2049 grains of 4096 bytes"):
+            small.alloc_put_buffer(3, value.size)
+        small._cleanup()
+        large = self._open(tmp_path, 32768, size=size, table_size=table)
+        assert large.put(key, value)
+        assert large.get(key, out)
+        np.testing.assert_array_equal(out, value)
+        pb = large.alloc_put_buffer(3, value.size)  # the sizes check follows
+        assert pb.value.size == value.size          # the grain, too
+        with pytest.raises(ValueError, match="grains of 32768 bytes"):
+            large.alloc_put_buffer(3, 2047 * 32768)
+        large._cleanup()
+        assert "do not fit" not in capfd.readouterr().err
+
+    @pytest.mark.parametrize("created,other", [
+        (c, o) for c in _GRAINS for o in _GRAINS + [8192] if o != c])
+    def test_reopening_with_another_grain_fails_and_harms_nothing(
+            self, tmp_path, capfd, created, other):
+        kv = self._open(tmp_path, created)
+        assert kv.put(_key("k"), _val("kept"))
+        kv._cleanup()
+        capfd.readouterr()
+        with pytest.raises(IOError) as e:
+            self._open(tmp_path, other, force_destroy=False)
+        # What the store does today: it does not find the store (the
+        # metadata's place depends on the grain), refuses to format over a
+        # file that is not new, and says so. The error names the grain asked.
+        assert "grain_size={}".format(other) in str(e.value)
+        assert "no store of" in capfd.readouterr().err
+        kv = self._open(tmp_path, created, force_destroy=False)
+        out = np.zeros(4, dtype=np.uint8)
+        assert kv.get(_key("k"), out)
+        assert out.tobytes() == b"kept"
+        kv._cleanup()
+
+    @pytest.mark.parametrize("grain", _GRAINS)
+    def test_reopening_with_the_same_grain_finds_the_data(self, tmp_path,
+                                                         grain):
+        kv = self._open(tmp_path, grain)
+        assert kv.put(_key("k"), _val("kept"))
+        kv._cleanup()
+        kv = self._open(tmp_path, grain, force_destroy=False)
+        out = np.zeros(4, dtype=np.uint8)
+        assert kv.get(_key("k"), out)
+        assert out.tobytes() == b"kept"
+        kv._cleanup()
+
+    def test_force_destroy_makes_a_new_store_of_the_new_grain(self, tmp_path):
+        kv = self._open(tmp_path, 4096)
+        assert kv.put(_key("k"), _val("old"))
+        kv._cleanup()
+        kv = self._open(tmp_path, 512)
+        out = np.zeros(3, dtype=np.uint8)
+        assert not kv.get(_key("k"), out)
+        kv._cleanup()
+
+
 # ---------------------------------------------------------------------------
 # Zero copy: PutBuffer / GetBuffer.
 

@@ -17,14 +17,15 @@ _lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 libudepot = ctypes.cdll.LoadLibrary(
     _lib_path if os.path.exists(_lib_path) else 'libpyudepot.so')
 
-pyopen = libudepot.uDepotOpenQueue
+pyopen = libudepot.uDepotOpenGrain
 pyclose = libudepot.uDepotClose
 pyget = libudepot.uDepotGet
 pyput = libudepot.uDepotPut
 pydel = libudepot.uDepotDel
 pyexists = libudepot.uDepotExists
 
-pyopen.argtypes = [c_char_p, c_ulonglong, c_int, c_ulonglong, c_uint]
+pyopen.argtypes = [c_char_p, c_ulonglong, c_int, c_ulonglong, c_uint,
+                   c_uint]
 pyopen.restype = c_void_p
 pyclose.argtypes = [c_void_p]
 pyget.argtypes = [c_void_p,
@@ -161,7 +162,7 @@ class PutBuffer:
     beyond the record layout: the buffer is 4096-aligned and the value starts
     sizeof(KvHeader) + key_size = 14 + key_size bytes into it, so its address
     is (14 + key_size) mod 4096 within a page. The record's checksum (2
-    bytes) follows the value, then zero padding to the 4096-byte grain; none
+    bytes) follows the value, then zero padding to the grain (grain_size); none
     of that is in `value`. An array outlives the PutBuffer: it keeps the
     buffer alive until it and every view of it are gone.
     """
@@ -239,6 +240,10 @@ class MultiGetError(IOError):
 # 4 KiB pages and directory grows are slower, which the store prints.
 DEFAULT_TABLE_SIZE = 2 * 1024 * 1024
 
+# The store's grain: its unit of allocation and I/O. A record holds at most
+# 2047 grains, so this is also what bounds a value (~8 MiB at 4096).
+DEFAULT_GRAIN_SIZE = 4096
+
 
 class uDepot:
     def __init__(self, **kwargs):
@@ -253,17 +258,40 @@ class uDepot:
         (the size of its AIO context; 0, the default, is 1024); multi_get_into
         keeps at most that many gets in flight on the calling thread, fewer
         if that thread's AIO context has less room.
+
+        grain_size is the store's grain in bytes (default 4096): a power of
+        two from 512 to 1 MiB, else IOError (ValueError if it is not a
+        positive 32-bit int); a grain below the O_DIRECT alignment of an
+        existing file or device is an IOError too. A record is at most 2047
+        grains, so a larger grain stores larger values (32768: ~64 MiB, with
+        table_size and size to match) at the price of a grain per small
+        record. A store is reopened with the grain it was created with: another
+        raises IOError (the store's message is on stderr), except that a file
+        that force_destroy once formatted at a smaller grain or size can
+        still open the older store left under it (see "Grain size" in
+        docs/architecture.md); use a new file to change it.
         """
         self._fname = kwargs.get('file_name', '/tmp/pyudepot-test')
         self._size = kwargs.get('size', 1024 * 1024 + 4096)
         self._force_destroy = 1 if kwargs.get('force_destroy', False) else 0
         self._table_size = kwargs.get('table_size', DEFAULT_TABLE_SIZE)
         self._queue_depth = kwargs.get('queue_depth', 0)
+        self._grain_size = kwargs.get('grain_size', DEFAULT_GRAIN_SIZE)
+        # ctypes would wrap a value past 32 bits into a valid-looking grain.
+        if (not isinstance(self._grain_size, int)
+                or not 0 < self._grain_size < 2**32):
+            raise ValueError(
+                'grain_size={!r} is not valid: it must be a power of two '
+                'from 512 to 1048576 bytes'.format(self._grain_size))
         self._kv = pyopen(
             self._fname.encode('utf-8'), self._size, self._force_destroy,
-            self._table_size, self._queue_depth)
+            self._table_size, self._queue_depth, self._grain_size)
         if not self._kv:
-            raise IOError('failed to open uDepot for {}'.format(self._fname))
+            raise IOError(
+                'failed to open uDepot for {} (size={}, grain_size={}, '
+                'force_destroy={}); the reason is on stderr'.format(
+                    self._fname, self._size, self._grain_size,
+                    bool(self._force_destroy)))
         atexit.register(self._cleanup)
 
     def _cleanup(self):
@@ -298,7 +326,7 @@ class uDepot:
 
         Raises ValueError if the sizes cannot be stored (key 1..65535
         bytes; the record, 14 + key_size + val_size + 2 bytes, at most 2047
-        grains of 4096 bytes) and MemoryError if the allocation fails.
+        grains of grain_size bytes) and MemoryError if the allocation fails.
         """
         handle = self._alloc(pyallocput, key_size, val_size, 'put')
         return PutBuffer(self, _Owned(handle, _free_put), key_size, val_size)
@@ -318,14 +346,16 @@ class uDepot:
                 'key_size must be 1..65535 and val_size below 2**32-1'
                 .format(what, key_size, val_size))
         # The store's check_sizes: a record is at most 2047 grains (11 bits
-        # of HashEntry's kv size); the binding's grain is 4096 bytes.
-        grains = (14 + key_size + val_size + 2 + 4095) // 4096
+        # of HashEntry's kv size).
+        grain = self._grain_size
+        grains = (14 + key_size + val_size + 2 + grain - 1) // grain
         if grains > 2047:
             raise ValueError(
                 'cannot allocate a {} buffer for key_size={} val_size={}: '
-                'the record needs {} grains of 4096 bytes, the store holds '
-                'at most 2047 per record'
-                .format(what, key_size, val_size, grains))
+                'the record needs {} grains of {} bytes, the store holds '
+                'at most 2047 per record (open it with a larger grain_size '
+                'for larger values)'
+                .format(what, key_size, val_size, grains, grain))
         handle = alloc(kv, key_size, val_size)
         if not handle:
             raise MemoryError(
