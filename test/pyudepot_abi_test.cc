@@ -26,6 +26,7 @@
 
 #include <gtest/gtest.h>
 
+#include "sto-ctlr/sto-capacity-mgr-parameters.h"
 #include "udepot/io/aio.h"
 #include "udepot/store.h"
 
@@ -538,6 +539,44 @@ TEST(PyudepotSegment, At512ByteGrainsThePageIsTheMinimum) {
     ASSERT_NE(kv, nullptr);
     EXPECT_EQ(uDepotSegmentBytes(kv), 4096u);
     uDepotClose(kv);
+}
+
+// Salsa takes at most SALSA_MAX_SEGMENT_SIZE grains (INT_MAX - 1); the binding
+// refuses more naming the limit, and one segment of exactly that many passes
+// the check (the open then goes on to the device, which halves it, said).
+TEST(PyudepotSegment, ASegmentAboveWhatSalsaTakesIsRefusedAndTheLimitPasses) {
+    TempPath p("seg_max");
+    const uint64_t max_grains = SALSA_MAX_SEGMENT_SIZE;
+    ASSERT_EQ(max_grains, 2147483646u);
+    struct Case { uint32_t grain; uint64_t at_limit; };
+    // At 512 the segment is a multiple of the 4096-byte page: the largest one
+    // is the limit rounded down.
+    for (Case c : {Case{4096, max_grains * 4096},
+                   Case{512, max_grains * 512 / 4096 * 4096},
+                   Case{32768, max_grains * 32768}}) {
+        SCOPED_TRACE(c.grain);
+        const uint64_t unit = pyudepot_internal::segment_unit_bytes(c.grain);
+        void* kv = nullptr;
+        std::string err = captured_open(p.path, 16 << 20, c.grain, c.at_limit,
+                                        &kv);
+        EXPECT_EQ(err.find("is too large"), std::string::npos) << err;
+        if (kv) {
+            EXPECT_LT(uDepotSegmentBytes(kv), c.at_limit);
+            uDepotClose(kv);
+        }
+        std::filesystem::remove(p.path);
+        err = captured_open(p.path, 16 << 20, c.grain, c.at_limit + unit,
+                            &kv);
+        EXPECT_EQ(kv, nullptr);
+        EXPECT_NE(err.find("segment size " +
+                           std::to_string(c.at_limit + unit) +
+                           " is too large for grains of " +
+                           std::to_string(c.grain) + " bytes: salsa takes at "
+                           "most 2147483646 grains (SALSA_MAX_SEGMENT_SIZE)"),
+                  std::string::npos) << err;
+        EXPECT_FALSE(std::filesystem::exists(p.path))
+            << "a refused segment must not touch the file";
+    }
 }
 
 // A store keeps the segment it was created with. On a reopen segment_bytes

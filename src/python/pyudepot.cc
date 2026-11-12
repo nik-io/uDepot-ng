@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "sto-ctlr/sto-capacity-mgr-parameters.h"
 #include "udepot/multi_get.h"
 #include "udepot/store.h"
 #include "udepot/io/aio.h"
@@ -180,6 +181,21 @@ void* uDepotOpenSegment(const char* fname, uint64_t size, int force_destroy,
         const uint64_t min_bytes =
             (pyudepot_internal::min_segment_grains(grain_bytes) *
                  grain_bytes + unit - 1) / unit * unit;
+        // Salsa refuses a segment of more than SALSA_MAX_SEGMENT_SIZE grains
+        // (INT_MAX - 1: extern/salsa/src/util/parse-storage-args.c, "Invalid
+        // parameter segment_size"), and the store would then halve it and
+        // blame the device, so it is refused here, naming the limit.
+        if (segment_bytes / grain_bytes > SALSA_MAX_SEGMENT_SIZE) {
+            fprintf(stderr, "uDepot-ng: segment size %llu is too large for "
+                    "grains of %u bytes: salsa takes at most %llu grains "
+                    "(SALSA_MAX_SEGMENT_SIZE), %llu bytes\n",
+                    static_cast<unsigned long long>(segment_bytes),
+                    grain_bytes,
+                    static_cast<unsigned long long>(SALSA_MAX_SEGMENT_SIZE),
+                    static_cast<unsigned long long>(
+                        uint64_t{SALSA_MAX_SEGMENT_SIZE} * grain_bytes));
+            return nullptr;
+        }
         if (segment_bytes < min_bytes) {
             fprintf(stderr, "uDepot-ng: segment size %llu is too small for "
                     "grains of %u bytes: it must hold the segment's "

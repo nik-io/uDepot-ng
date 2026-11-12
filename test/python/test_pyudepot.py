@@ -1353,6 +1353,20 @@ class TestSegmentSize:
         assert kv.get(_key("k"), out)
         kv.close()
 
+    @pytest.mark.parametrize("grain", [512, 4096, 32768])
+    def test_a_segment_above_what_salsa_takes_is_refused_naming_the_limit(
+            self, tmp_path, capfd, grain):
+        # SALSA_MAX_SEGMENT_SIZE = INT_MAX - 1 grains; at 512 the segment is
+        # also a whole page, so the first one above is the limit's page.
+        over = ((2**31 - 1) * grain // 4096 + 1) * 4096 if grain == 512 \
+            else (2**31 - 1) * grain
+        with pytest.raises(IOError):
+            self._open(tmp_path, over, grain, size=16 * 1024 * 1024)
+        err = capfd.readouterr().err
+        assert ("segment size {} is too large for grains of {} bytes: salsa "
+                "takes at most 2147483646 grains".format(over, grain)) in err
+        assert not (tmp_path / "segs").exists()
+
     def test_a_device_too_small_for_the_segment_halves_it_and_says_so(
             self, tmp_path, capfd):
         asked = 1100 * 4096

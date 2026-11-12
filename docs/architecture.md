@@ -837,7 +837,15 @@ check: with the table-room checks removed the store still refuses 2 grains of
 4096 (in salsa, after the device is set up), so the two floors coincide there;
 the test pins the binding's minimum to the store's, whichever binds. At
 512-byte grains the 4096-byte unit (8 grains) is above the table's 4 grains,
-so no multiple of the unit is under the minimum (`At512ByteGrainsThePageIsTheMinimum`).
+so no multiple of the unit is under the minimum (`At512ByteGrainsThePageIsTheMinimum`);
+- **too large**: salsa takes at most `SALSA_MAX_SEGMENT_SIZE` = `INT_MAX - 1` =
+  2147483646 grains (`extern/salsa/src/util/parse-storage-args.c`, "Invalid
+  parameter segment_size"); above it salsa returns `EINVAL` and the store would
+  halve the segment with a message that blames the device size. The binding
+  refuses it first, naming the limit (stderr, then `IOError`;
+  `ASegmentAboveWhatSalsaTakesIsRefusedAndTheLimitPasses` at 512, 4096 and
+  32768-byte grains). A segment of exactly the limit passes the check and
+  meets the device, which halves it, said.
 
 **Reopening.** The segment of a store comes from its device metadata
 (`dev_md.segment_size`, `uDepot::open`), so on a reopen `segment_size` is
