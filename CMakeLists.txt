@@ -287,6 +287,30 @@ if(UDEPOT_BUILD_TESTS)
                 uDepotJNITest
         )
         set_tests_properties(jni_test PROPERTIES TIMEOUT 60)
+        # What initWithSegment says on stderr (fd 2, past System.err), which
+        # the ctest passes only on seeing, with the right return code: a bad
+        # segment is refused with EINVAL and the reason; a segment reaches
+        # the store (it names the segments it was asked for when the device
+        # cannot hold them); 0 and init() are the store's default.
+        set(JNI_OPEN ${Java_JAVA_EXECUTABLE} -cp ${JNI_CLASSES_DIR}
+            -Djava.library.path=$<TARGET_FILE_DIR:uDepotJNI> uDepotJNITest open)
+        string(REPLACE ";" " " JNI_OPEN_CMD "${JNI_OPEN}")
+        foreach(case
+                "bad|3000|22|segment size 3000 is not valid"
+                "asked|1048576|0|the requested segments of 1024 KiB"
+                "default|0|0|the default segments of"
+                "init|init|0|the default segments of")
+            string(REPLACE "|" ";" parts "${case}")
+            list(GET parts 0 name)
+            list(GET parts 1 seg)
+            list(GET parts 2 rc)
+            list(GET parts 3 msg)
+            add_test(
+                NAME jni_segment_${name}_test
+                COMMAND bash -c "set -o pipefail; ${JNI_OPEN_CMD} ${CMAKE_CURRENT_BINARY_DIR}/jni-${name} ${seg} ${rc} 2>&1 | grep -q '${msg}'"
+            )
+            set_tests_properties(jni_segment_${name}_test PROPERTIES TIMEOUT 60)
+        endforeach()
     endif()
 
     if(UDEPOT_BUILD_SPDK)

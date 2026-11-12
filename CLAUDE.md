@@ -177,8 +177,12 @@ cited; change any of these only with explicit consent (rule 4).
   TSAN build is Debug), collision tests left searching for the old tag.
 - A test's device must be large enough for the geometry it tests, or the
   store shrinks the segment and the test measures something else.
-- The Python and JNI bindings' 2 MiB tables are a test-size default, not a
-  limit: the table size is the caller's (`table_size`, `initWithTables`).
+- The Python and JNI bindings have no table size, as uDepot has none: their
+  open parameters are the device size, the grain size and the segment size
+  (`segment_size`, `initWithSegment`), and the segment sets the tables.
+  Segment 0 is the store's own fitted default (a 2^29-byte table, halved to
+  fit the device); a test that needs a small table or many segments on a
+  small device passes a `segment_size`.
 
 ## Style Guide
 

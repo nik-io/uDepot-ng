@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 
@@ -27,19 +28,27 @@ static bool store_open() {
     return g_open.load(std::memory_order_acquire);
 }
 
-JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_initWithTables(
+JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_initWithSegment(
     JNIEnv* env, jobject, jstring fname, jlong size, jboolean force_destroy,
-    jlong table_size) {
+    jlong segment_size) {
     udepot::StoreConfig config;
     config.force_destroy = force_destroy == JNI_TRUE;
     config.grain_size = 512;
-    // The Java side defaults to small tables, for tests; see
-    // uDepotJNI.DEFAULT_TABLE_SIZE.
-    if (table_size < 0 ||
-        udepot::segment_size_for_table(static_cast<uint64_t>(table_size),
-                                       config.grain_size,
-                                       &config.segment_size) != 0)
+    // The segment sets the tables (each fills one segment); 0 is the
+    // store's own default. The store rounds a segment down to whole 4096-byte
+    // pages without a word (uDepot's sanitize_segment_size), so any other is
+    // refused here.
+    static constexpr jlong kPage = 4096;
+    if (segment_size < 0 || segment_size % kPage != 0) {
+        fprintf(stderr, "uDepot-ng: segment size %lld is not valid: it must "
+                "be 0 (the store's default) or a multiple of %lld bytes (the "
+                "store would round any other down)\n",
+                static_cast<long long>(segment_size),
+                static_cast<long long>(kPage));
         return EINVAL;
+    }
+    config.segment_size = static_cast<uint64_t>(segment_size) /
+                          config.grain_size;
 
     const char* path = env->GetStringUTFChars(fname, nullptr);
     if (!path) return ENOMEM;

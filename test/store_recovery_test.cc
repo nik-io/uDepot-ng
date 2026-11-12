@@ -737,31 +737,6 @@ TEST_P(StoreIndexTest, SegmentSizeIsWholePages) {
     store.close();
 }
 
-// The bindings size a store by its tables: 0 is the store's default
-// segment, a power of two of at least 4 KiB its fitted one, anything else
-// -EINVAL.
-TEST(FittedSegmentSize, SegmentSizeForTable) {
-    uint64_t seg = 1;
-    EXPECT_EQ(udepot::segment_size_for_table(0, 4096, &seg), 0);
-    EXPECT_EQ(seg, 0u);
-    EXPECT_EQ(udepot::segment_size_for_table(size_t{2} << 20, 4096, &seg), 0);
-    EXPECT_EQ(seg, udepot::fitted_segment_size(size_t{2} << 20, 4096));
-    EXPECT_EQ(udepot::segment_size_for_table(4096, 512, &seg), 0);
-    EXPECT_EQ(seg, udepot::fitted_segment_size(4096, 512));
-    seg = 7;
-    EXPECT_EQ(udepot::segment_size_for_table(2048, 512, &seg), -EINVAL);
-    EXPECT_EQ(udepot::segment_size_for_table(6 << 20, 512, &seg), -EINVAL);
-    EXPECT_EQ(udepot::segment_size_for_table(udepot::kMaxTableBytes * 2, 512,
-                                             &seg), -EINVAL);
-    EXPECT_EQ(udepot::segment_size_for_table(uint64_t{1} << 63, 512, &seg),
-              -EINVAL);
-    uint64_t largest = 0;
-    EXPECT_EQ(udepot::segment_size_for_table(udepot::kMaxTableBytes, 512,
-                                             &largest), 0);
-    EXPECT_GT(largest, 0u);
-    EXPECT_EQ(seg, 7u);  // untouched on failure
-}
-
 // A fitted segment's table holds exactly the buckets it was fitted for:
 // the next power of two does not fit, so the table fills more than half
 // of it, and all but the room it needs (header, footer, last neighborhood,

@@ -30,15 +30,15 @@ class uDepotJNITest {
 
     uDepotJNITest(String fname, long size) {
         KV = new uDepotJNI();
-        // A table size that is not a power of two of at least 4096 bytes
-        // (nor 0, the store's default) is refused before anything opens.
-        check(KV.initWithTables(fname, size, true, 3000) == 22,
-              "initWithTables rejects a bad table size with EINVAL");
-        check(KV.initWithTables(fname, size, true, 2048) == 22,
-              "initWithTables rejects a table under 4 KiB with EINVAL");
-        // An explicit table size, through the call that takes one (init()
-        // passes DEFAULT_TABLE_SIZE to it).
-        int rc = KV.initWithTables(fname, size, true, 1L << 20);
+        // A segment that is not whole 4096-byte pages is refused before
+        // anything opens (the store would round it down in silence).
+        check(KV.initWithSegment(fname, size, true, 3000) == 22,
+              "initWithSegment rejects a segment off the page size with EINVAL");
+        check(KV.initWithSegment(fname, size, true, -4096) == 22,
+              "initWithSegment rejects a negative segment with EINVAL");
+        // An explicit segment, through the call that takes one (init()
+        // passes 0, the store's default, to it).
+        int rc = KV.initWithSegment(fname, size, true, 1L << 20);
         if (rc != 0)
             throw new RuntimeException("init failed: " + rc);
     }
@@ -167,6 +167,26 @@ class uDepotJNITest {
         return bad;
     }
 
+    // init() is segment 0, the store's own default: on a 4 MiB device the
+    // store halves it until it fits, and the store works.
+    static int testDefaultSegment(String fname, long size) throws Exception {
+        int bad = 0;
+        byte[] key = "k".getBytes();
+        byte[] val = "v".getBytes();
+        byte[] buf = new byte[4];
+        Files.deleteIfExists(Path.of(fname));
+        try {
+            uDepotJNI kv = new uDepotJNI();
+            if (kv.init(fname, size, true) != 0) return 1;
+            if (kv.put(key, key.length, val, val.length) != 0) bad++;
+            if (kv.get(key, key.length, buf, buf.length) != val.length) bad++;
+            kv.shutdown();
+        } finally {
+            Files.deleteIfExists(Path.of(fname));
+        }
+        return bad;
+    }
+
     // force_destroy reaches the store: a reopen under another size finds no
     // store and fails unless asked to start a new one; under the size it
     // was created with, it restores the store. Returns the failures.
@@ -179,20 +199,20 @@ class uDepotJNITest {
         Files.deleteIfExists(Path.of(fname));
         try {
             uDepotJNI kv = new uDepotJNI();
-            if (kv.initWithTables(fname, size, true, 1L << 20) != 0) return 1;
+            if (kv.initWithSegment(fname, size, true, 1L << 20) != 0) return 1;
             if (kv.put(key, key.length, val, val.length) < 0) bad++;
             kv.shutdown();
             // Another size, no force_destroy: refused.
-            if (kv.initWithTables(fname, other, false, 1L << 20) == 0) {
+            if (kv.initWithSegment(fname, other, false, 1L << 20) == 0) {
                 bad++;
                 kv.shutdown();
             }
             // The size it was created with: the key is there.
-            if (kv.initWithTables(fname, size, false, 1L << 20) != 0) return bad + 1;
+            if (kv.initWithSegment(fname, size, false, 1L << 20) != 0) return bad + 1;
             if (kv.get(key, key.length, buf, buf.length) != val.length) bad++;
             kv.shutdown();
             // Another size, force_destroy: a new store, the key is gone.
-            if (kv.initWithTables(fname, other, true, 1L << 20) != 0) return bad + 1;
+            if (kv.initWithSegment(fname, other, true, 1L << 20) != 0) return bad + 1;
             if (kv.get(key, key.length, buf, buf.length) >= 0) bad++;
             kv.shutdown();
         } finally {
@@ -202,6 +222,19 @@ class uDepotJNITest {
     }
 
     public static void main(String[] argv) throws Exception {
+        // "open <file> <segment|init> <rc>": exit 0 iff initWithSegment (or
+        // init(), the default segment) returns rc. The native side explains on stderr (fd 2, which System.err
+        // does not see), so ctest greps that for the message.
+        if (argv.length == 4 && argv[0].equals("open")) {
+            uDepotJNI kv = new uDepotJNI();
+            int rc = argv[2].equals("init")
+                ? kv.init(argv[1], 4L << 20, true)
+                : kv.initWithSegment(argv[1], 4L << 20, true,
+                                     Long.parseLong(argv[2]));
+            if (rc == 0) kv.shutdown();
+            Files.deleteIfExists(Path.of(argv[1]));
+            System.exit(rc == Integer.parseInt(argv[3]) ? 0 : 1);
+        }
         String fname;
         if (argv.length > 0) {
             fname = argv[0];
@@ -230,6 +263,8 @@ class uDepotJNITest {
             Files.deleteIfExists(Path.of(fname));
         }
         test.check(testClosedStoreRejectsOps() == 0, "ops after shutdown fail");
+        test.check(testDefaultSegment(fname + ".default", size) == 0,
+                   "init() takes the store's default segment");
         test.check(testForceDestroy(fname + ".force", size) == 0,
                    "force_destroy reaches the store");
 

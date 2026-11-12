@@ -37,7 +37,14 @@ using Store = udepot::uDepot<udepot::AioIO>;
 constexpr int kUnset = INT_MIN;
 constexpr uint32_t kKeySize = 13;
 constexpr uint64_t kValSize = 100;
-constexpr uint64_t kTableBytes = uint64_t{2} << 20;
+
+// The segment of the tests that are not about geometry: the one that fits a
+// table of table_bytes, so a small device holds many of them. (The binding
+// has no table size: this is what a caller sets with a segment size.)
+uint64_t segment_for_table(uint64_t table_bytes, uint32_t grain = 4096) {
+    return udepot::fitted_segment_size(table_bytes, grain) * grain;
+}
+const uint64_t kTestSegment = segment_for_table(uint64_t{2} << 20);
 
 std::string key_of(int i) {
     char b[32];
@@ -52,7 +59,8 @@ struct TempStore {
         path = (std::filesystem::temp_directory_path() /
                 (std::string("udepot_abi_") + tag + "_" +
                  std::to_string(getpid()))).string();
-        kv = uDepotOpenQueue(path.c_str(), size, 1, kTableBytes, queue_depth);
+        kv = uDepotOpenSegment(path.c_str(), size, 1, queue_depth, 4096,
+                               kTestSegment);
     }
     ~TempStore() {
         if (kv) uDepotClose(kv);
@@ -173,8 +181,8 @@ namespace {
 uint32_t grain_of(void* kv) { return static_cast<Store*>(kv)->grain_size(); }
 
 void* open_grain(const std::string& path, uint32_t grain, int force) {
-    return uDepotOpenGrain(path.c_str(), 16 << 20, force, kTableBytes, 0,
-                           grain);
+    return uDepotOpenSegment(path.c_str(), 16 << 20, force, 0, grain,
+                             segment_for_table(uint64_t{2} << 20, grain));
 }
 
 struct TempPath {
@@ -206,16 +214,16 @@ TEST(PyudepotGrain, TheGrainReachesTheStore) {
     }
 }
 
-TEST(PyudepotGrain, TheOlderEntryPointsKeepTheDefaultGrain) {
+TEST(PyudepotGrain, TheShorterEntryPointsKeepTheDefaultGrain) {
     TempPath p("default");
+    testing::internal::CaptureStderr();  // the store halves its segment
     for (void* kv : {uDepotOpen(p.path.c_str(), 16 << 20, 1),
-                     uDepotOpenTables(p.path.c_str(), 16 << 20, 1, kTableBytes),
-                     uDepotOpenQueue(p.path.c_str(), 16 << 20, 1, kTableBytes,
-                                     0)}) {
+                     uDepotOpenQueue(p.path.c_str(), 16 << 20, 1, 0)}) {
         ASSERT_NE(kv, nullptr);
         EXPECT_EQ(grain_of(kv), 4096u);
         uDepotClose(kv);
     }
+    testing::internal::GetCapturedStderr();
 }
 
 TEST(PyudepotGrain, AnInvalidGrainFailsTheOpenAndNamesItself) {
@@ -303,9 +311,8 @@ uint64_t segment_unit_bytes(uint32_t grain);
 namespace {
 
 void* open_segment(const std::string& path, uint64_t size, uint32_t grain,
-                   uint64_t segment_bytes, int force = 1,
-                   uint64_t table_bytes = 0) {
-    return uDepotOpenSegment(path.c_str(), size, force, table_bytes, 0, grain,
+                   uint64_t segment_bytes, int force = 1) {
+    return uDepotOpenSegment(path.c_str(), size, force, 0, grain,
                              segment_bytes);
 }
 
@@ -335,9 +342,9 @@ uint32_t table_bits_of(void* kv) {
 
 std::string captured_open(const std::string& path, uint64_t size,
                           uint32_t grain, uint64_t segment_bytes, void** kv,
-                          int force = 1, uint64_t table_bytes = 0) {
+                          int force = 1) {
     testing::internal::CaptureStderr();
-    *kv = open_segment(path, size, grain, segment_bytes, force, table_bytes);
+    *kv = open_segment(path, size, grain, segment_bytes, force);
     return testing::internal::GetCapturedStderr();
 }
 
@@ -399,50 +406,65 @@ TEST(PyudepotSegment, ThePowerOfTwoTableBelowANonPowerOfTwoSegment) {
     ASSERT_NE(kv, nullptr);
     EXPECT_EQ(table_bits_of(kv), 19u);
     uDepotClose(kv);
-    // The same segment through the older entry point's table size.
-    kv = uDepotOpenGrain(p.path.c_str(), device_of(68, fitted * 4096, 4096), 1,
-                         uint64_t{8} << 19, 0, 4096);
-    ASSERT_NE(kv, nullptr);
-    EXPECT_EQ(uDepotSegmentBytes(kv), fitted * 4096);
-    uDepotClose(kv);
 }
 
-TEST(PyudepotSegment, ZeroIsTheTableDerivedSegmentAndTheOlderEntryPointsAreUnchanged) {
+// Segment 0 is the store's own default, which is a fitted segment (a power
+// of two table fills it), however the entry point is reached. A caller-set
+// segment on a device with no tail is instead searched for the least waste
+// (the legacy behaviour), which gives segments no power-of-two table fills:
+// the reason the binding has no table size, which asked for one.
+TEST(PyudepotSegment, ZeroIsTheStoresFittedDefaultAndAnExplicitSegmentIsAsGiven) {
     TempPath p("seg_zero");
-    const uint64_t dev = device_of(64, 2105344, 4096);
-    void* kv = uDepotOpenGrain(p.path.c_str(), dev, 1, kTableBytes, 0, 4096);
+    // An exact multiple of the 2 MiB-table segment: no tail for the device
+    // metadata, so a caller-set segment of this size is searched for the
+    // least waste, and the default is halved as a table instead.
+    const uint64_t dev = 64 * kTestSegment;
+    testing::internal::CaptureStderr();
+    void* kv = uDepotOpenGrain(p.path.c_str(), dev, 1, 0, 4096);
     ASSERT_NE(kv, nullptr);
     const uint64_t via_grain = uDepotSegmentBytes(kv);
     uDepotClose(kv);
-    kv = open_segment(p.path, dev, 4096, 0, 1, kTableBytes);
+    kv = open_segment(p.path, dev, 4096, 0);
     ASSERT_NE(kv, nullptr);
     EXPECT_EQ(uDepotSegmentBytes(kv), via_grain);
-    EXPECT_EQ(via_grain, udepot::fitted_segment_size(kTableBytes, 4096) * 4096);
     uDepotClose(kv);
+    testing::internal::GetCapturedStderr();
+    bool fitted = false;
+    for (uint64_t table = uint64_t{1} << 29; table >= 4096; table /= 2)
+        fitted |= via_grain == segment_for_table(table);
+    EXPECT_TRUE(fitted) << via_grain << " is not the segment of a "
+                           "power-of-two table";
+    // The same segment set by the caller: legacy's least-waste search, which
+    // lands on a segment no power-of-two table fills.
+    testing::internal::CaptureStderr();
+    kv = open_segment(p.path, dev, 4096, kTestSegment);
+    ASSERT_NE(kv, nullptr);
+    const uint64_t explicit_seg = uDepotSegmentBytes(kv);
+    uDepotClose(kv);
+    testing::internal::GetCapturedStderr();
+    EXPECT_NE(explicit_seg, via_grain);
+    for (uint64_t table = uint64_t{1} << 29; table >= 4096; table /= 2)
+        EXPECT_NE(explicit_seg, segment_for_table(table)) << table;
 }
 
 TEST(PyudepotSegment, AnInvalidSegmentFailsTheOpenAndSaysWhy) {
     TempPath p("seg_invalid");
-    struct Case { uint32_t grain; uint64_t segment; uint64_t table;
-                  const char* msg; };
+    struct Case { uint32_t grain; uint64_t segment; const char* msg; };
     for (Case c : {
              // not a multiple of the grain
-             Case{32768, 40000, 0, "is not a multiple of 32768 bytes"},
-             Case{4096, 4096 * 300 + 512, 0, "is not a multiple of 4096 bytes"},
+             Case{32768, 40000, "is not a multiple of 32768 bytes"},
+             Case{4096, 4096 * 300 + 512, "is not a multiple of 4096 bytes"},
              // whole grains, not whole pages (the store would round down)
-             Case{512, 512 * 33, 0, "is not a multiple of 4096 bytes"},
+             Case{512, 512 * 33, "is not a multiple of 4096 bytes"},
              // too small
-             Case{4096, 4096, 0, "is too small for grains of 4096 bytes"},
-             Case{4096, 2 * 4096, 0, "at least 12288 bytes"},
-             Case{32768, 2 * 32768, 0, "at least 98304 bytes"},
-             // both a segment and a table
-             Case{4096, 256 * 4096, kTableBytes,
-                  "both a segment size (1048576) and a table size"},
+             Case{4096, 4096, "is too small for grains of 4096 bytes"},
+             Case{4096, 2 * 4096, "at least 12288 bytes"},
+             Case{32768, 2 * 32768, "at least 98304 bytes"},
          }) {
         SCOPED_TRACE(std::string(c.msg));
         void* kv = nullptr;
         const std::string err = captured_open(p.path, 64 << 20, c.grain,
-                                              c.segment, &kv, 1, c.table);
+                                              c.segment, &kv);
         EXPECT_EQ(kv, nullptr);
         if (kv) uDepotClose(kv);
         EXPECT_NE(err.find(c.msg), std::string::npos) << err;
@@ -580,7 +602,7 @@ TEST(PyudepotSegment, ASegmentAboveWhatSalsaTakesIsRefusedAndTheLimitPasses) {
 }
 
 // A store keeps the segment it was created with. On a reopen segment_bytes
-// is checked, then ignored, as table_bytes is.
+// is checked, then ignored.
 TEST(PyudepotSegment, ReopeningKeepsTheCreatedSegmentWhateverIsAsked) {
     TempPath p("seg_reopen");
     const uint64_t created = 256 * 4096;
@@ -595,8 +617,7 @@ TEST(PyudepotSegment, ReopeningKeepsTheCreatedSegmentWhateverIsAsked) {
     for (uint64_t asked : {created, uint64_t{512 * 4096}, uint64_t{64 * 4096},
                            uint64_t{0}}) {
         SCOPED_TRACE(asked);
-        kv = open_segment(p.path, dev, 4096, asked, 0,
-                          asked == 0 ? kTableBytes : 0);
+        kv = open_segment(p.path, dev, 4096, asked, 0);
         ASSERT_NE(kv, nullptr);
         EXPECT_EQ(uDepotSegmentBytes(kv), created);
         uint8_t out[3] = {};
@@ -739,8 +760,8 @@ TEST(PyudepotGrainLoop, AGrainBelowTheSectorSizeIsRefusedOn4KnAndOneAtItOpens) {
     ASSERT_EQ(sector, 4096) << dev << " is not 4Kn";
 
     testing::internal::CaptureStderr();
-    void* bad = uDepotOpenGrain(dev.c_str(), kBytes, 1, uint64_t{1} << 20, 0,
-                                512);
+    void* bad = uDepotOpenSegment(dev.c_str(), kBytes, 1, 0, 512,
+                                  segment_for_table(uint64_t{1} << 20, 512));
     const std::string err = testing::internal::GetCapturedStderr();
     if (bad) uDepotClose(bad);
     EXPECT_EQ(bad, nullptr);
@@ -748,8 +769,8 @@ TEST(PyudepotGrainLoop, AGrainBelowTheSectorSizeIsRefusedOn4KnAndOneAtItOpens) {
               std::string::npos) << err;
     EXPECT_NE(err.find(dev), std::string::npos) << err;
 
-    void* kv = uDepotOpenGrain(dev.c_str(), kBytes, 1, uint64_t{1} << 20, 0,
-                               4096);
+    void* kv = uDepotOpenSegment(dev.c_str(), kBytes, 1, 0, 4096,
+                                 segment_for_table(uint64_t{1} << 20));
     ASSERT_NE(kv, nullptr);
     const std::string k = key_of(7);
     const auto* key = reinterpret_cast<const uint8_t*>(k.data());

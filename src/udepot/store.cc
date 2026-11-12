@@ -453,19 +453,6 @@ uint64_t fitted_segment_size(uint64_t table_bytes, uint32_t grain_size) {
     return align_up(table_bytes + room, page) / grain_size;
 }
 
-int segment_size_for_table(uint64_t table_bytes, uint32_t grain_size,
-                           uint64_t* segment_size) {
-    if (table_bytes == 0) {
-        *segment_size = 0;
-        return 0;
-    }
-    if (!std::has_single_bit(table_bytes) || table_bytes < 4096 ||
-        table_bytes > kMaxTableBytes)
-        return -EINVAL;
-    *segment_size = fitted_segment_size(table_bytes, grain_size);
-    return 0;
-}
-
 namespace {
 
 constexpr size_t kIndexMdBytes = TableRegion::kMdBytes;
@@ -1478,8 +1465,8 @@ int uDepot<IO>::open(const StoreConfig& config) {
             "%llu KiB, whose tables hold %llu KiB (%llu%% of the segment). "
             "Smaller tables fill sooner, so the directory grows sooner and "
             "more often. Give the store a larger device, or ask for smaller "
-            "tables (StoreConfig::segment_size, fitted_segment_size; the "
-            "Python and JNI bindings' table size).\n",
+            "tables, with a smaller segment (StoreConfig::segment_size; the "
+            "Python and JNI bindings' segment_size).\n",
             wanted_default ? "the default" : "the requested",
             static_cast<unsigned long long>(wanted_segment * grain_size_ >> 10),
             static_cast<unsigned long long>(table_bytes(wanted_segment) >> 10),

@@ -102,13 +102,6 @@ uint64_t segment_unit_bytes(uint32_t grain) {
 
 extern "C" {
 
-// Small tables for tests, nothing inherent to the bindings: a store sized
-// for real use passes its own (uDepotOpenTables). Each directory table
-// fills one segment and all of its memory is touched when it is created
-// (clear()), so the store's default would be up to 512 MiB per table. A
-// segment this small maps on 4 KiB pages, and open() says so.
-static constexpr uint64_t kDefaultTableBytes = uint64_t{2} << 20;
-
 static constexpr uint32_t kDefaultGrainBytes = 4096;
 
 // The StoreConfig::grain_size values the AIO store works with, which the
@@ -137,8 +130,8 @@ static bool grain_is_valid(uint32_t grain) {
 }
 
 void* uDepotOpenSegment(const char* fname, uint64_t size, int force_destroy,
-                        uint64_t table_bytes, uint32_t queue_depth,
-                        uint32_t grain_bytes, uint64_t segment_bytes) {
+                        uint32_t queue_depth, uint32_t grain_bytes,
+                        uint64_t segment_bytes) {
     if (!grain_is_valid(grain_bytes)) {
         fprintf(stderr, "uDepot-ng: grain size %u is not valid: it must be "
                 "a power of two from %u to %u bytes (O_DIRECT needs at least "
@@ -156,17 +149,6 @@ void* uDepotOpenSegment(const char* fname, uint64_t size, int force_destroy,
             return nullptr;
     }
     if (segment_bytes != 0) {
-        // The segment and the table size set the same thing (a table fills
-        // its segment): the caller says one, never both.
-        if (table_bytes != 0) {
-            fprintf(stderr, "uDepot-ng: both a segment size (%llu) and a "
-                    "table size (%llu) were given: they set the same thing "
-                    "(a table fills one segment), so give one; table size 0 "
-                    "with a segment size\n",
-                    static_cast<unsigned long long>(segment_bytes),
-                    static_cast<unsigned long long>(table_bytes));
-            return nullptr;
-        }
         const uint64_t unit =
             pyudepot_internal::segment_unit_bytes(grain_bytes);
         if (segment_bytes % unit != 0) {
@@ -213,16 +195,9 @@ void* uDepotOpenSegment(const char* fname, uint64_t size, int force_destroy,
     config.path = fname;
     config.size = static_cast<size_t>(size);
     config.grain_size = grain_bytes;
-    if (segment_bytes != 0) {
-        config.segment_size = segment_bytes / grain_bytes;
-    } else if (int rc = udepot::segment_size_for_table(
-                   table_bytes, config.grain_size, &config.segment_size);
-               rc != 0) {
-        fprintf(stderr, "uDepot-ng: table size %llu is not a power of two "
-                "of at least 4096 bytes, nor 0 (the default)\n",
-                static_cast<unsigned long long>(table_bytes));
-        return nullptr;
-    }
+    // 0 is the store's own default segment (fitted to a power-of-two table
+    // and halved to fit the device).
+    config.segment_size = segment_bytes / grain_bytes;
 
     auto* store = new (std::nothrow) Store();
     if (!store) return nullptr;
@@ -236,25 +211,19 @@ void* uDepotOpenSegment(const char* fname, uint64_t size, int force_destroy,
 }
 
 void* uDepotOpenGrain(const char* fname, uint64_t size, int force_destroy,
-                      uint64_t table_bytes, uint32_t queue_depth,
-                      uint32_t grain_bytes) {
-    return uDepotOpenSegment(fname, size, force_destroy, table_bytes,
-                             queue_depth, grain_bytes, 0);
+                      uint32_t queue_depth, uint32_t grain_bytes) {
+    return uDepotOpenSegment(fname, size, force_destroy, queue_depth,
+                             grain_bytes, 0);
 }
 
 void* uDepotOpenQueue(const char* fname, uint64_t size, int force_destroy,
-                      uint64_t table_bytes, uint32_t queue_depth) {
-    return uDepotOpenGrain(fname, size, force_destroy, table_bytes,
-                           queue_depth, kDefaultGrainBytes);
-}
-
-void* uDepotOpenTables(const char* fname, uint64_t size, int force_destroy,
-                       uint64_t table_bytes) {
-    return uDepotOpenQueue(fname, size, force_destroy, table_bytes, 0);
+                      uint32_t queue_depth) {
+    return uDepotOpenGrain(fname, size, force_destroy, queue_depth,
+                           kDefaultGrainBytes);
 }
 
 void* uDepotOpen(const char* fname, uint64_t size, int force_destroy) {
-    return uDepotOpenTables(fname, size, force_destroy, kDefaultTableBytes);
+    return uDepotOpenQueue(fname, size, force_destroy, 0);
 }
 
 // As uDepot's uDepotClose: shut the store down and free it. The caller

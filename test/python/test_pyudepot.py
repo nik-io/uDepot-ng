@@ -331,85 +331,123 @@ class TestForceDestroy:
         kv.close()
 
 
-class TestTableSize:
-    """The index table size is the caller's: 2 MiB by default, for tests;
-    any power of two of at least 4096 bytes, or 0 for the store's default.
-    A table too small for huge pages makes the store say so at open."""
+def _segment_for_table(table, grain=4096):
+    """The segment, in bytes, whose index table is `table` bytes of buckets
+    and fills it: the table, its header and footer (2 x 512), the last
+    neighborhood (32 slots of 8 bytes) and the segment's metadata grain,
+    rounded up to a page (fitted_segment_size, src/udepot/store.cc). The
+    binding has no table size; this is what a caller who thinks in tables
+    passes as segment_size. Tests check the store did not shrink it."""
+    md = -(-53 // grain) * grain  # salsa_seg_md is 53 bytes
+    page = max(4096, grain)
+    return -(-(table + 2 * 512 + 32 * 8 + md) // page) * page
+
+
+def _fitting_size(segment):
+    """A device of 32 segments and the tail the device metadata needs."""
+    return 32 * segment + 4096
+
+
+class TestNoTableSize:
+    """The store's parameters are the device size, the grain size and the
+    segment size, as uDepot's. There is no table size: a table fills one
+    segment, so the segment sets the tables. segment_size None is the
+    store's own default, a segment for a 2^29-byte table halved until it
+    fits the device."""
 
     def _open(self, tmp_path, **kwargs):
+        kwargs.setdefault("size", STORE_SIZE)
         return pyudepot.uDepot(file_name=str(tmp_path / "tables"),
-                               size=STORE_SIZE, force_destroy=True, **kwargs)
+                               force_destroy=True, **kwargs)
 
-    def test_default_is_2_mib_and_says_so(self, tmp_path, capfd):
-        assert pyudepot.DEFAULT_TABLE_SIZE == 2 * 1024 * 1024
-        # Room for 32 segments of a 2 MiB table (2 MiB + 8 KiB each), and
-        # the device metadata's tail; a smaller device halves the segment.
-        kv = pyudepot.uDepot(file_name=str(tmp_path / "tables"),
-                             size=32 * (2 * 1024 * 1024 + 8192) + 4096,
-                             force_destroy=True)
+    @pytest.mark.parametrize("kwargs", [
+        {"table_size": 0},
+        {"table_size": 2 * 1024 * 1024},
+        {"table_size": 1 << 20, "segment_size": 256 * 4096},
+    ])
+    def test_table_size_is_refused_naming_the_replacement(self, tmp_path,
+                                                          kwargs):
+        with pytest.raises(TypeError) as e:
+            self._open(tmp_path, **kwargs)
+        assert "table_size is gone" in str(e.value)
+        assert "a table fills one segment" in str(e.value)
+        assert "Pass segment_size" in str(e.value)
+        assert not (tmp_path / "tables").exists(), \
+            "a refused open must not create the file"
+
+    def test_the_default_table_size_is_gone(self):
+        assert not hasattr(pyudepot, "DEFAULT_TABLE_SIZE")
+        assert not hasattr(binding, "DEFAULT_TABLE_SIZE")
+
+    def test_the_default_segment_is_the_stores_own_halved_to_fit(
+            self, tmp_path, capfd):
+        # 4 MiB holds nothing like the 2^29-byte table of the default: the
+        # store halves the table (and the segment with it) and says so.
+        kv = self._open(tmp_path)
         assert kv.put(_key("k"), _val("v"))
+        seg = kv.segment_size()
+        kv.close()
+        err = capfd.readouterr().err
+        assert "the default segments of" in err
+        assert "do not fit" in err
+        # Halved as a table, so a fitted segment: a power-of-two table
+        # fills it (not the least-waste size of a caller-set segment).
+        assert seg in [_segment_for_table(1 << b) for b in range(12, 30)]
+
+    def test_the_default_on_a_device_with_no_tail_is_still_fitted(
+            self, tmp_path):
+        # The case that a table size asked for through the binding turned
+        # into a caller-set segment on: a device of an exact multiple of the
+        # segment has no tail for the device metadata. The default halves
+        # as a table; a caller-set segment gets legacy's least-waste search.
+        seg = _segment_for_table(2 * 1024 * 1024)
+        dev = 64 * seg
+        d = self._open(tmp_path, size=dev)
+        default_seg = d.segment_size()
+        d.close()
+        c = self._open(tmp_path, size=dev, segment_size=seg)
+        explicit_seg = c.segment_size()
+        c.close()
+        assert default_seg in [_segment_for_table(1 << b)
+                               for b in range(12, 30)]
+        assert explicit_seg not in [_segment_for_table(1 << b)
+                                    for b in range(12, 30)]
+
+    @pytest.mark.parametrize("table,named", [
+        (1024 * 1024, "the requested segments of 1032 KiB (index tables of 1024 KiB)"),
+        (2 * 1024 * 1024, "the requested segments of 2056 KiB (index tables of 2048 KiB)"),
+    ])
+    def test_the_segment_size_reaches_the_store(self, tmp_path, capfd, table,
+                                                named):
+        # On a device too small for them the store names the segments it
+        # was asked for, and the tables they give.
+        kv = self._open(tmp_path, segment_size=_segment_for_table(table))
+        kv.close()
+        assert named in capfd.readouterr().err
+
+    def test_a_2_mib_table_says_it_maps_on_small_pages(self, tmp_path,
+                                                       capfd):
+        seg = _segment_for_table(2 * 1024 * 1024)
+        kv = self._open(tmp_path, segment_size=seg, size=_fitting_size(seg))
+        assert kv.put(_key("k"), _val("v"))
+        assert kv.segment_size() == seg
         kv.close()
         err = capfd.readouterr().err
         assert "index tables map on 4 KiB pages" in err
         assert "directory grows to be slower" in err
         assert "do not fit" not in err  # the device has room for them
 
-    def test_a_device_too_small_for_the_tables_says_so(self, tmp_path, capfd):
-        # 4 MiB holds too few 2 MiB-table segments: the store makes them
-        # smaller, and with them the tables, and says so.
-        kv = self._open(tmp_path)
-        assert kv.put(_key("k"), _val("v"))
-        kv.close()
-        err = capfd.readouterr().err
-        assert "the requested segments of" in err
-        assert "do not fit" in err
-
-    @pytest.mark.parametrize("table_size,named", [
-        (1024 * 1024, "the requested segments of 1032 KiB (index tables of 1024 KiB)"),
-        (2 * 1024 * 1024, "the requested segments of 2056 KiB (index tables of 2048 KiB)"),
-        (0, "the default segments of"),
-    ])
-    def test_the_table_size_reaches_the_store(self, tmp_path, capfd,
-                                              table_size, named):
-        # On a device too small for them the store names the tables it was
-        # asked for: the size given here, not the binding's default.
-        kv = self._open(tmp_path, table_size=table_size)
-        kv.close()
-        assert named in capfd.readouterr().err
-
-    @staticmethod
-    def _fitting_size(table_size):
-        # Room for 32 segments of the table and the device metadata's tail.
-        page = 4096
-        seg = (table_size + 2 * 512 + 32 * 8 + page + page - 1) // page * page
-        return 32 * seg + 4096
-
-    @pytest.mark.parametrize("table_size", [4096, 1024 * 1024])
-    def test_configured_table_size_round_trips(self, tmp_path, capfd,
-                                               table_size):
-        kv = pyudepot.uDepot(file_name=str(tmp_path / "tables"),
-                             size=self._fitting_size(table_size),
-                             force_destroy=True, table_size=table_size)
+    @pytest.mark.parametrize("table", [4096, 1024 * 1024])
+    def test_a_configured_segment_round_trips(self, tmp_path, capfd, table):
+        seg = _segment_for_table(table)
+        kv = self._open(tmp_path, size=_fitting_size(seg), segment_size=seg)
+        assert kv.segment_size() == seg
         assert kv.put(_key("k"), _val("v"))
         out = np.zeros(1, dtype=np.uint8)
         assert kv.get(_key("k"), out)
         assert out.tobytes() == b"v"
         kv.close()
         assert "do not fit" not in capfd.readouterr().err
-
-    def test_the_default_table_size_round_trips(self, tmp_path):
-        kv = self._open(tmp_path, table_size=0)
-        assert kv.put(_key("k"), _val("v"))
-        out = np.zeros(1, dtype=np.uint8)
-        assert kv.get(_key("k"), out)
-        assert out.tobytes() == b"v"
-        kv.close()
-
-    @pytest.mark.parametrize("table_size",
-                             [3000, 2048, 6 * 1024 * 1024, 1 << 41, 1 << 63])
-    def test_invalid_table_size_fails_open(self, tmp_path, table_size):
-        with pytest.raises(IOError):
-            self._open(tmp_path, table_size=table_size)
 
 
 _GRAINS = [512, 4096, 32768]
@@ -472,7 +510,7 @@ class TestGrainSize:
     def test_the_largest_grain_opens_and_round_trips(self, tmp_path):
         # 1 MiB: 2047 of them are one write below Linux's 2147479552-byte cap.
         kv = self._open(tmp_path, 1 << 20, size=128 * 1024 * 1024 + 4096,
-                        table_size=1 << 20)
+                        segment_size=_segment_for_table(1 << 20, 1 << 20))
         assert kv.put(_key("k"), _val("value"))
         out = np.zeros(5, dtype=np.uint8)
         assert kv.get(_key("k"), out)
@@ -486,16 +524,18 @@ class TestGrainSize:
         # difference between the two stores (checked: the store did not
         # shrink its segments).
         table = 16 * 1024 * 1024
-        size = TestTableSize._fitting_size(table)
+        size = _fitting_size(_segment_for_table(table))
         value = _bytes_of(2047 * 4096 + 5000, 3)
         key = _key("big")
         out = np.zeros(value.size, dtype=np.uint8)
-        small = self._open(tmp_path, 4096, size=size, table_size=table)
+        small = self._open(tmp_path, 4096, size=size,
+                           segment_size=_segment_for_table(table, 4096))
         assert not small.put(key, value)
         with pytest.raises(ValueError, match="2049 grains of 4096 bytes"):
             small.alloc_put_buffer(3, value.size)
         small.close()
-        large = self._open(tmp_path, 32768, size=size, table_size=table)
+        large = self._open(tmp_path, 32768, size=size,
+                           segment_size=_segment_for_table(table, 32768))
         assert large.put(key, value)
         assert large.get(key, out)
         np.testing.assert_array_equal(out, value)
@@ -589,7 +629,8 @@ def big_store(tmp_path):
     # (8 MiB) needs tables of 16 MiB and a device that holds several of them.
     path = str(tmp_path / "pyudepot_big")
     kv = pyudepot.uDepot(file_name=path, size=256 * 1024 * 1024,
-                         force_destroy=True, table_size=16 * 1024 * 1024)
+                         force_destroy=True,
+                         segment_size=_segment_for_table(16 * 1024 * 1024))
     yield kv
     kv.close()
 
@@ -1256,7 +1297,7 @@ class TestSegmentSize:
         kv.alloc_put_buffer(8, n)  # the buffer path agrees
         kv.close()
 
-    def test_none_is_the_segment_of_the_table(self, tmp_path):
+    def test_none_is_the_stores_default_segment(self, tmp_path):
         a = pyudepot.uDepot(file_name=str(tmp_path / "a"), size=STORE_SIZE,
                             force_destroy=True)
         b = pyudepot.uDepot(file_name=str(tmp_path / "b"), size=STORE_SIZE,
@@ -1271,22 +1312,6 @@ class TestSegmentSize:
             self, tmp_path, segment):
         with pytest.raises(ValueError, match="segment_size="):
             self._open(tmp_path, segment, size=STORE_SIZE)
-        assert not (tmp_path / "segs").exists()
-
-    @pytest.mark.parametrize("table_size", [0, 4096, 1 << 20, 1 << 29])
-    def test_a_segment_and_a_table_size_is_a_ValueError(self, tmp_path,
-                                                        table_size):
-        with pytest.raises(ValueError, match="both segment_size=1048576 and "
-                                            "table_size={}".format(table_size)):
-            self._open(tmp_path, 256 * 4096, table_size=table_size)
-        assert not (tmp_path / "segs").exists()
-
-    def test_the_default_table_size_passed_with_a_segment_is_a_conflict(
-            self, tmp_path):
-        # Passing table_size at all is the conflict, whatever its value.
-        with pytest.raises(ValueError, match="both segment_size="):
-            self._open(tmp_path, 256 * 4096,
-                       table_size=pyudepot.DEFAULT_TABLE_SIZE)
         assert not (tmp_path / "segs").exists()
 
     @pytest.mark.parametrize("grain,segment,msg", [
@@ -1338,11 +1363,6 @@ class TestSegmentSize:
             assert kv.get(_key("k"), out)
             assert out.tobytes() == b"kept"
             kv.close()
-        # A table size does not reopen a store to another segment either.
-        kv = pyudepot.uDepot(file_name=str(tmp_path / "segs"), size=size,
-                             table_size=1 << 20)
-        assert kv.segment_size() == created
-        kv.close()
         # The argument is checked on a reopen too.
         with pytest.raises(IOError):
             self._open(tmp_path, 4096 * 300 + 512, size=size,
@@ -1417,14 +1437,15 @@ class TestMaxValue:
         # Segment 514 grains: 513 of data, the segment is the limit.
         (2 * 1024 * 1024, 64 * 1024 * 1024, 514, 513, "the segment"),
         # Segment 2050 grains: the entry's 2047 grains are the limit.
-        (8 * 1024 * 1024, TestTableSize._fitting_size(8 * 1024 * 1024),
+        (8 * 1024 * 1024, _fitting_size(_segment_for_table(8 * 1024 * 1024)),
          2050, 2047, "a hash entry"),
     ])
     @pytest.mark.parametrize("key_size", [1, 8, 100])
     def test_boundary(self, tmp_path, capfd, table_size, size, seg_grains,
                       grains, limit, key_size):
         kv = pyudepot.uDepot(file_name=str(tmp_path / "max"), size=size,
-                             force_destroy=True, table_size=table_size)
+                             force_destroy=True,
+                             segment_size=_segment_for_table(table_size))
         err = capfd.readouterr().err
         assert kv.grain_size() == 4096
         # The segment is what the comments above say, and one grain of it
@@ -1468,8 +1489,9 @@ class TestMaxValue:
         # 32 segments of the table plus room for the per-segment metadata.
         kv = pyudepot.uDepot(file_name=str(tmp_path / "g8k"),
                              size=33 * (table_size + 64 * 1024),
-                             force_destroy=True, table_size=table_size,
-                             grain_size=grain)
+                             force_destroy=True, grain_size=grain,
+                             segment_size=_segment_for_table(table_size,
+                                                             grain))
         assert kv.grain_size() == grain
         # seg_md_grains_ (src/udepot/store.cc:1193) is
         # align_up(sizeof(salsa_seg_md), grain) / grain; salsa_seg_md is 53
