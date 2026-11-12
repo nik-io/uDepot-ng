@@ -1367,6 +1367,28 @@ class TestSegmentSize:
                 "takes at most 2147483646 grains".format(over, grain)) in err
         assert not (tmp_path / "segs").exists()
 
+    def test_a_halved_segment_is_not_always_a_valid_argument_on_reopen(
+            self, tmp_path, capfd):
+        # 512-byte grains: the store halves a segment without sanitizing it,
+        # so 12288 on a device of 16 such segments opens as 6144.
+        size = 16 * 12288 + 1024
+        kv = self._open(tmp_path, 12288, 512, size=size)
+        got = kv.segment_size()
+        assert got == 6144 and got % 4096 != 0
+        assert kv.put(_key("k"), _val("kept"))
+        kv.close()
+        capfd.readouterr()
+        with pytest.raises(IOError):
+            self._open(tmp_path, got, 512, size=size, force_destroy=False)
+        assert "is not a multiple of 4096 bytes" in capfd.readouterr().err
+        for asked in (None, 12288):
+            kv = self._open(tmp_path, asked, 512, size=size,
+                            force_destroy=False)
+            assert kv.segment_size() == got
+            out = np.zeros(4, dtype=np.uint8)
+            assert kv.get(_key("k"), out)
+            kv.close()
+
     def test_a_device_too_small_for_the_segment_halves_it_and_says_so(
             self, tmp_path, capfd):
         asked = 1100 * 4096

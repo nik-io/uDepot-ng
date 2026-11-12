@@ -855,6 +855,16 @@ was created with and its data (`ReopeningKeepsTheCreatedSegmentWhateverIsAsked`,
 `test_reopening_keeps_the_created_segment_...`). It is not refused. An invalid
 `segment_size` fails the reopen like any open, the store untouched.
 
+One consequence: `segment_size()` is not always a valid `segment_size`. On a
+device too small for the segment the store halves it with `segment_size /= 2`
+and no `sanitize` (`uDepot::open`, the Scm init retry), so at grains below 4096
+the result can be a non-multiple of 4096: asking for 12288 bytes at 512-byte
+grains on a device of 16 such segments gives 6144 (3072 on 8). Reopening with
+`segment_size=kv.segment_size()` is then refused as not a multiple of 4096,
+while `segment_size=None` (or the original 12288) opens the store as it is
+(`test_a_halved_segment_is_not_always_a_valid_argument_on_reopen`). The store is
+unchanged.
+
 **A small device shrinks it.** The store still halves a segment the device
 cannot hold: too few segments (measured: a 32 MiB device asked for
 segments of 1 MiB opened with segments of 936 KiB, 35 of them), or no tail for the device metadata past the
