@@ -782,6 +782,24 @@ should invalidate the earlier metadata. It is a follow-up PR of its own; until
 it lands, change a store's grain (or size) on a new file. No test asserts the
 current behaviour.
 
+### Closing
+
+`kv.close()` is `uDepotClose` now: the store writes its index back, shuts
+down and is freed, and the same file can be opened again in this process (the
+data comes back; `test_data_survives_a_close_and_a_reopen_in_this_process`).
+It is idempotent, and `with pyudepot.uDepot(...) as kv:` closes on exit, also
+on an exception. Every other method then raises `ValueError("uDepot store is
+closed")` (all of them go through `_handle()`; `test_every_method_raises_closed_after_close`
+lists them, `multi_get_into` and the buffer calls included), rather than passing
+the freed pointer to C. As in uDepot, no call on the store may be in progress
+on another thread, or follow, when it is closed: `close()` is not a lock.
+
+A store nobody closes is closed at interpreter exit by an `atexit` hook
+(`atexit.register(self.close)`). `close()` takes the hook back, so the exit
+does not close it a second time and the hook does not keep a closed store
+alive until exit. PutBuffers, GetBuffers and the arrays taken from them stay
+valid after the store is closed (see Zero-copy values below).
+
 ### multi_get_into: N gets, one thread, one call
 
 ```c

@@ -292,14 +292,27 @@ class uDepot:
                 'force_destroy={}); the reason is on stderr'.format(
                     self._fname, self._size, self._grain_size,
                     bool(self._force_destroy)))
-        atexit.register(self._cleanup)
+        atexit.register(self.close)
 
-    def _cleanup(self):
-        # As uDepot's close: shut down and free the store. The caller must
-        # ensure no call on this object is in progress or follows.
-        if self._kv:
-            pyclose(self._kv)
-            self._kv = None
+    def close(self):
+        """Closes the store now: its index is written back and the handle
+        freed, so the file can be opened again in this process. Idempotent.
+        Every other call on this store then raises ValueError, but the
+        PutBuffers, GetBuffers and arrays taken from it stay valid (their
+        memory is the buffer's own). As uDepot's close, no call on this store
+        may be in progress, or follow, on another thread. A store that is
+        never closed is closed at interpreter exit.
+        """
+        kv, self._kv = self._kv, None
+        if kv:
+            atexit.unregister(self.close)
+            pyclose(kv)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
 
     def _handle(self):
         # Calls after close would pass a freed pointer to C.
