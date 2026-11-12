@@ -647,7 +647,7 @@ uDepot-ng/
 │   └── memcache.cc              # memcache protocol server
 ├── python/
 │   ├── wrapper/
-│   │   ├── pyudepot.h           # C ABI (23 functions)
+│   │   ├── pyudepot.h           # C ABI (24 functions)
 │   │   └── pyudepot.cc          # bridges C ABI to uDepot via run_sync()
 │   └── pyudepot/
 │       ├── __init__.py
@@ -692,13 +692,13 @@ ccache is picked up automatically when present (same as the original).
 the overhead this rewrite eliminates. All I/O concurrency comes from the
 eager-start coroutine model: one thread, zero thread creation.
 
-The C ABI is `src/python/pyudepot.h` (23 functions, `extern "C"`, over
+The C ABI is `src/python/pyudepot.h` (24 functions, `extern "C"`, over
 `uDepot<AioIO>`; the binding is AIO-only), each call a `run_sync()` on the
 calling thread except the batch below:
 
 | group | functions |
 |---|---|
-| open/close | `uDepotOpen`, `uDepotOpenTables` (+ table size), `uDepotOpenQueue` (+ `queue_depth`), `uDepotOpenGrain` (+ `grain_bytes`), `uDepotClose` |
+| open/close | `uDepotOpen`, `uDepotOpenTables` (+ table size), `uDepotOpenQueue` (+ `queue_depth`), `uDepotOpenGrain` (+ `grain_bytes`), `uDepotOpenSegment` (+ `segment_bytes`), `uDepotClose` |
 | copying | `uDepotGet`, `uDepotPut`, `uDepotDel`, `uDepotExists` |
 | zero copy | `uDepotAllocPutBuffer`, `uDepotPutBufferValue`, `uDepotPutBuf`, `uDepotFreePutBuffer`, `uDepotAllocGetBuffer`, `uDepotNewGetBuffer`, `uDepotGetBuf`, `uDepotGetBufferValue`, `uDepotFreeGetBuffer`, `uDepotThreadValueCopies` |
 | batch | `uDepotMultiGetBuf` |
@@ -786,6 +786,70 @@ after a `force_destroy` at a different size and the same grain): `force_destroy`
 should invalidate the earlier metadata. It is a follow-up PR of its own; until
 it lands, change a store's grain (or size) on a new file. No test asserts the
 current behaviour.
+
+### Segment size
+
+`uDepot(..., segment_size=None)` is `uDepotOpenSegment(..., grain_bytes,
+segment_bytes)`: `StoreConfig::segment_size`, in bytes here (grains in the
+store). Each directory table fills one index segment, so it is also the other
+way to size the tables: `table_size` asks for a fitted segment (a power-of-two
+table plus its room, `segment_size_for_table`), `segment_size` asks for the
+segment itself, of any size. The store takes it: a table is the largest power
+of two that fits the segment's data grains (`HashTable::index_bits_for`), and
+"its table may fill only part of it" (`uDepot::open`, where a caller-set
+segment is halved as a size, not refitted). A segment of 1100 grains of 4096
+has a table of 2^19 buckets (4 MiB), 93% of the segment
+(`ThePowerOfTwoTableBelowANonPowerOfTwoSegment`). `uDepotOpenGrain` and the
+older entry points are unchanged (`uDepotOpenGrain` is `uDepotOpenSegment` with
+0); 0 here means the segment of `table_bytes`, as before. The binding changes
+the open parameters only: not the store, the on-disk format, or how tables
+relate to segments.
+
+The segment also bounds a value: a record lives whole in one segment, so
+`max_value_bytes(key_size)` is `min(2047, segment / grain - 1)` grains (one
+grain of each segment is its metadata, `seg_md_grains_`) less 14 + `key_size` +
+2 bytes (`max_record_grains`). A value of exactly that fits and one more byte
+fails (tested for 4096-, 512- and 32768-byte grains and a segment that is not a
+power of two).
+
+Each of these fails the open, never a fallback or a precedence:
+
+- **a `segment_size` together with a non-default `table_size`** (any but
+  `DEFAULT_TABLE_SIZE`, 0 included): `ValueError` in Python, which otherwise
+  passes `table_size` 0; `uDepotOpenSegment` refuses a non-zero `segment_bytes`
+  with a non-zero `table_bytes`. They set the same thing;
+- **not an int in `1 .. 2**64 - 1`** (a `bool`, a float, 0, negative): `ValueError`
+  (ctypes would wrap `2**64 + 4096`);
+- **not a multiple of the grain and of 4096 bytes**: `uDepot::open`'s
+  `sanitize` rounds a caller's segment down to whole 4096-byte pages (by
+  `4096 / grain` grains below a 4096 grain), and a value the store would
+  change is refused rather than rounded. That is a multiple of
+  `max(grain, 4096)`. Message on stderr, then `IOError`;
+- **too small**: the least is the segment's metadata grain plus the grains a
+  directory table needs (`create_directory`, `restore_index`:
+  `index_bits_for(net) != 0` and at least two `align_up(512, grain)` bytes of
+  net), rounded up to the unit above: 3 grains of 4096 (12288 bytes), 3 of
+  32768 (98304), one 4096-byte page at 512-byte grains
+  (`min_segment_grains`). `TheMinimumIsTheStoresMinimum` opens a store at it
+  and checks the store itself refuses one unit under it, so the two checks
+  cannot drift apart.
+
+**Reopening.** The segment of a store comes from its device metadata
+(`dev_md.segment_size`, `uDepot::open`), so on a reopen `segment_size` is
+checked as above and then ignored, as `table_size` is: a store created with
+one segment, reopened asking for another or for none, opens with the one it
+was created with and its data (`ReopeningKeepsTheCreatedSegmentWhateverIsAsked`,
+`test_reopening_keeps_the_created_segment_...`). It is not refused. An invalid
+`segment_size` fails the reopen like any open, the store untouched.
+
+**A small device shrinks it.** The store still halves a segment the device
+cannot hold: too few segments (measured: a 32 MiB device asked for
+segments of 1 MiB opened with segments of 936 KiB, 35 of them), or no tail for the device metadata past the
+last whole segment (a device that is an exact multiple of the segment has
+none). It prints `the requested segments of N KiB ... Using segments of M KiB`
+with the table it got, and `segment_size()` is the result, so check it
+(`ASegmentTheDeviceCannotHoldIsHalvedAndSaid`). The tests give the device 64
+segments and a two-grain tail for that reason.
 
 ### Closing
 
