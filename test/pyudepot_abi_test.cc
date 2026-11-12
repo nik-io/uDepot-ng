@@ -27,6 +27,7 @@
 #include <gtest/gtest.h>
 
 #include "sto-ctlr/sto-capacity-mgr-parameters.h"
+#include "bindings/segment_check.h"
 #include "udepot/io/aio.h"
 #include "udepot/store.h"
 
@@ -307,10 +308,6 @@ TEST(PyudepotGrain, ReopeningWithAnotherGrainFailsAndHarmsNothing) {
 // uDepotOpenSegment: the segment is the caller's, in bytes. What reaches the
 // store is read back from the store (segment, longest record, table width),
 // not echoed from the argument.
-namespace pyudepot_internal {
-uint64_t min_segment_grains(uint32_t grain);
-uint64_t segment_unit_bytes(uint32_t grain);
-}  // namespace pyudepot_internal
 
 namespace {
 
@@ -510,9 +507,9 @@ TEST(PyudepotSegment, TheMinimumIsTheStoresMinimum) {
     TempPath p("seg_min");
     for (uint32_t grain : {4096u, 32768u}) {
         SCOPED_TRACE(grain);
-        const uint64_t unit = pyudepot_internal::segment_unit_bytes(grain);
+        const uint64_t unit = udepot_binding::segment_unit_bytes(grain);
         const uint64_t min_bytes =
-            (pyudepot_internal::min_segment_grains(grain) * grain + unit - 1) /
+            (udepot_binding::min_segment_grains(grain) * grain + unit - 1) /
             unit * unit;
         ASSERT_GT(min_bytes, unit);
         void* kv = open_segment(p.path, device_of(2000, min_bytes, grain), grain,
@@ -552,7 +549,7 @@ TEST(PyudepotSegment, TheMinimumIsTheStoresMinimum) {
 // 4096 rather than let it be rounded.
 TEST(PyudepotSegment, At512ByteGrainsThePageIsTheMinimum) {
     TempPath p("seg_min512");
-    EXPECT_EQ(pyudepot_internal::min_segment_grains(512), 4u);
+    EXPECT_EQ(udepot_binding::min_segment_grains(512), 4u);
     EXPECT_EQ(bare_open(p.path, device_of(2000, 4096, 512), 512, 8), 0);
     EXPECT_NE(bare_open(p.path, device_of(2000, 3584, 512), 512, 7), 0);
     void* kv = nullptr;
@@ -581,7 +578,7 @@ TEST(PyudepotSegment, ASegmentAboveWhatSalsaTakesIsRefusedAndTheLimitPasses) {
                    Case{512, max_grains * 512 / 4096 * 4096},
                    Case{32768, max_grains * 32768}}) {
         SCOPED_TRACE(c.grain);
-        const uint64_t unit = pyudepot_internal::segment_unit_bytes(c.grain);
+        const uint64_t unit = udepot_binding::segment_unit_bytes(c.grain);
         void* kv = nullptr;
         std::string err = captured_open(p.path, 16 << 20, c.grain, c.at_limit,
                                         &kv);

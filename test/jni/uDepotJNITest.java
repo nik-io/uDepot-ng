@@ -34,6 +34,8 @@ class uDepotJNITest {
         // anything opens (the store would round it down in silence).
         check(KV.initWithSegment(fname, size, true, 3000) == 22,
               "initWithSegment rejects a segment off the page size with EINVAL");
+        check(KV.initWithSegment(fname, size, true, 1L << 41) == 22,
+              "initWithSegment rejects a segment above salsa's limit with EINVAL");
         check(KV.initWithSegment(fname, size, true, -4096) == 22,
               "initWithSegment rejects a negative segment with EINVAL");
         // An explicit segment, through the call that takes one (init()
@@ -222,14 +224,16 @@ class uDepotJNITest {
     }
 
     public static void main(String[] argv) throws Exception {
-        // "open <file> <segment|init> <rc>": exit 0 iff initWithSegment (or
-        // init(), the default segment) returns rc. The native side explains on stderr (fd 2, which System.err
+        // "open <file> <segment|init> <rc> <size>": exit 0 iff initWithSegment
+        // (or init(), the default segment) on a device of size bytes returns
+        // rc. The native side explains on stderr (fd 2, which System.err
         // does not see), so ctest greps that for the message.
-        if (argv.length == 4 && argv[0].equals("open")) {
+        if (argv.length == 5 && argv[0].equals("open")) {
             uDepotJNI kv = new uDepotJNI();
+            long size = Long.parseLong(argv[4]);
             int rc = argv[2].equals("init")
-                ? kv.init(argv[1], 4L << 20, true)
-                : kv.initWithSegment(argv[1], 4L << 20, true,
+                ? kv.init(argv[1], size, true)
+                : kv.initWithSegment(argv[1], size, true,
                                      Long.parseLong(argv[2]));
             if (rc == 0) kv.shutdown();
             Files.deleteIfExists(Path.of(argv[1]));

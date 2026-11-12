@@ -1005,7 +1005,7 @@ class TestZeroCopyErrors:
 
     def test_the_largest_record_allocates(self, big_store):
         # big_store: the 2047-grain record needs a segment that holds it; the
-        # 4 MiB store's 514-grain segment (max_value_bytes) does not.
+        # 4 MiB store's segments (halved to fit that device) do not.
         big_store.alloc_put_buffer(8, _max_value(8))
         big_store.alloc_get_buffer(8, _max_value(8))
 

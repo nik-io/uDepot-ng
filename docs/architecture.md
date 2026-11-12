@@ -1139,9 +1139,7 @@ persistent source of truth is the log"*.
   (`segment_size`, `initWithSegment`, YCSB's `udepot.segment-size`; 0 is the
   store's default segment), and the table follows the segment. A table
   maps on 4 KiB pages where huge pages would leave over 1/8 of the mapping
-  unused (a 2 MiB table, say), and the store says so.
-  (`segment_size_for_table`, which turned a table size into a segment for the
-  bindings, is removed.) A
+  unused (a 2 MiB table, say), and the store says so. A
   device too small for the segment asked for (or the default) makes it
   smaller, as uDepot does, and `open()` says so too, with both sizes and
   how much of the smaller segment its table fills: a caller's size is
@@ -1161,12 +1159,12 @@ persistent source of truth is the log"*.
   half full.) A fitted segment is a power of two plus a page or two, so
   rounding costs nearly 2 MiB per table and nothing on the device: under
   1/8 from a 16 MiB table up (the default's is 512 MiB, 0.4%), but half
-  of the bindings' 2 MiB one, which would take 4 MiB of huge pages each,
+  of a 2 MiB one, which would take 4 MiB of huge pages each,
   out of the pool SPDK's DMA buffers also come from, up to 512 MiB over a
-  grown directory's 256 tables. So the bindings' tables, and any segment
-  under 2 MiB, map on 4 KiB pages, the segment exactly; so does any table
-  when no huge page is free. The main cost is in grows: a grow faults each
-  new table in 4 KiB at a time (512 times the faults), and the puts
+  grown directory's 256 tables. So a small table (a 2 MiB one, say), and
+  any segment under 2 MiB, map on 4 KiB pages, the segment exactly; so
+  does any table when no huge page is free. The main cost is in grows: a
+  grow faults each new table in 4 KiB at a time (512 times the faults), and the puts
   waiting on a full table wait for the whole grow; the copy and lookups
   also miss the TLB more, a second-order cost. Neither fallback is silent:
   `open()` prints a message whenever a segment of 2 MiB or more maps on
