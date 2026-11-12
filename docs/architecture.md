@@ -814,8 +814,8 @@ power of two).
 
 Each of these fails the open, never a fallback or a precedence:
 
-- **a `segment_size` together with a non-default `table_size`** (any but
-  `DEFAULT_TABLE_SIZE`, 0 included): `ValueError` in Python, which otherwise
+- **a `segment_size` together with a `table_size`** (any value passed,
+  `DEFAULT_TABLE_SIZE` and 0 included): `ValueError` in Python, which otherwise
   passes `table_size` 0; `uDepotOpenSegment` refuses a non-zero `segment_bytes`
   with a non-zero `table_bytes`. They set the same thing;
 - **not an int in `1 .. 2**64 - 1`** (a `bool`, a float, 0, negative): `ValueError`

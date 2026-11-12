@@ -282,8 +282,9 @@ class uDepot:
 
         segment_size is the store's segment in bytes (default None: the one
         that fits table_size). Each index table fills one segment, so it is
-        the other way to size the tables, and giving both a non-default
-        table_size and a segment_size raises ValueError (as does a
+        the other way to size the tables, and giving both a
+        table_size (any value, the default's and 0 included) and a
+        segment_size raises ValueError (as does a
         segment_size that is not an int in 1 .. 2**64 - 1). It must be a
         multiple of grain_size and of 4096, and large enough for the
         segment's metadata grain and an index table, else IOError (the
@@ -317,7 +318,7 @@ class uDepot:
                 raise ValueError(
                     'segment_size={!r} is not valid: it must be an int of '
                     'bytes, a multiple of grain_size and of 4096'.format(seg))
-            if table_size != DEFAULT_TABLE_SIZE:
+            if 'table_size' in kwargs:
                 raise ValueError(
                     'both segment_size={} and table_size={} were given: they '
                     'set the same thing (a table fills one segment), so '

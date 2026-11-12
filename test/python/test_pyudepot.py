@@ -1281,12 +1281,13 @@ class TestSegmentSize:
             self._open(tmp_path, 256 * 4096, table_size=table_size)
         assert not (tmp_path / "segs").exists()
 
-    def test_the_default_table_size_with_a_segment_is_not_a_conflict(
+    def test_the_default_table_size_passed_with_a_segment_is_a_conflict(
             self, tmp_path):
-        kv = self._open(tmp_path, 256 * 4096,
-                        table_size=pyudepot.DEFAULT_TABLE_SIZE)
-        assert kv.segment_size() == 256 * 4096
-        kv.close()
+        # Passing table_size at all is the conflict, whatever its value.
+        with pytest.raises(ValueError, match="both segment_size="):
+            self._open(tmp_path, 256 * 4096,
+                       table_size=pyudepot.DEFAULT_TABLE_SIZE)
+        assert not (tmp_path / "segs").exists()
 
     @pytest.mark.parametrize("grain,segment,msg", [
         (4096, 4096 * 300 + 512, "segment size {} is not a multiple of "
