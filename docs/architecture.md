@@ -692,13 +692,13 @@ ccache is picked up automatically when present (same as the original).
 the overhead this rewrite eliminates. All I/O concurrency comes from the
 eager-start coroutine model: one thread, zero thread creation.
 
-The C ABI is `src/python/pyudepot.h` (19 functions, `extern "C"`, over
+The C ABI is `src/python/pyudepot.h` (20 functions, `extern "C"`, over
 `uDepot<AioIO>`; the binding is AIO-only), each call a `run_sync()` on the
 calling thread except the batch below:
 
 | group | functions |
 |---|---|
-| open/close | `uDepotOpen`, `uDepotOpenTables` (+ table size), `uDepotOpenQueue` (+ `queue_depth`), `uDepotClose` |
+| open/close | `uDepotOpen`, `uDepotOpenTables` (+ table size), `uDepotOpenQueue` (+ `queue_depth`), `uDepotOpenGrain` (+ `grain_bytes`), `uDepotClose` |
 | copying | `uDepotGet`, `uDepotPut`, `uDepotDel`, `uDepotExists` |
 | zero copy | `uDepotAllocPutBuffer`, `uDepotPutBufferValue`, `uDepotPutBuf`, `uDepotFreePutBuffer`, `uDepotAllocGetBuffer`, `uDepotNewGetBuffer`, `uDepotGetBuf`, `uDepotGetBufferValue`, `uDepotFreeGetBuffer`, `uDepotThreadValueCopies` |
 | batch | `uDepotMultiGetBuf` |
@@ -706,6 +706,81 @@ calling thread except the batch below:
 The Python `uDepot` class (`python/pyudepot/uDepot.py`) exposes `get`, `put`,
 `delete`, `exists`, the zero-copy calls below, and `multi_get_into`. Keys are
 C-contiguous `uint8` numpy arrays.
+
+### Grain size
+
+`uDepot(..., grain_size=4096)` is `uDepotOpenGrain(..., grain_bytes)`:
+`StoreConfig::grain_size`, the unit of allocation and I/O. `uDepotOpen`,
+`uDepotOpenTables` and `uDepotOpenQueue` are unchanged and open with 4096
+(`kDefaultGrainBytes`). A record is at most 2047 grains
+(`HashEntry::kKvSizeMask`), so the grain bounds the value: ~8 MiB at 4096,
+~64 MiB at 32768, in one I/O (flywheel raises the grain to store larger
+tensors rather than split them). The cost is a grain per record: a small value
+occupies a whole grain, and the segment must hold a record, so larger values
+need larger tables (`table_size`) and a device that holds several segments.
+
+The store (`uDepot::open`) checks nothing about the grain, so the binding does
+(`grain_is_valid`, `pyudepot.cc`); anything else fails the open with a message
+on stderr naming the value and the rule, never a fallback to 4096:
+
+- **a power of two**: below 4096, `sanitize` in `uDepot::open` rounds a segment
+  to whole 4096-byte pages by `4096 / grain`, which needs a divisor of 4096.
+  At and above 4096 no requirement of the store was found; only powers of two
+  (uDepot's grains) have ever been run, so nothing else is let in;
+- **at least 512**: the file is opened O_DIRECT (`open_direct`), whose offsets
+  and lengths are multiples of the device's logical block size, 512 at the
+  smallest, and every record, segment and metadata I/O is a multiple of the
+  grain. Where the backing says more, the grain is checked against it before
+  the open (`direct_io_alignment`): a block device's logical sector size
+  (`BLKSSZGET`), an existing regular file's `dio_offset_align` (`statx`
+  `STATX_DIOALIGN`, Linux 6.1+, where the filesystem reports it). A grain that
+  is not a multiple fails with a message naming both numbers (otherwise the
+  open fails with only `Input/output error`, a 512 grain on a 4Kn device).
+  The filesystem's block size is not used as a fallback: ext4 takes 512-byte
+  O_DIRECT I/O on 4096-byte blocks, so it would refuse grains that work. What
+  cannot be told is not checked: a file that does not exist yet, a kernel or
+  filesystem without `STATX_DIOALIGN`. The store's open then reports what the
+  device refuses;
+- **at most 1 MiB**: a record is at most 2047 grains (`HashEntry::kKvSizeMask`)
+  and is written with one `pwrite`, which Linux caps at `MAX_RW_COUNT` =
+  `INT_MAX & PAGE_MASK` = 2147479552 bytes. 2047 grains of 1 MiB are
+  2146435072 bytes; of 2 MiB they would be twice that, and the put would fail
+  with `-EIO` and no message (`put_record`, `written != total`). 1 MiB was
+  checked to open and round-trip a small value; a value near 2 GiB was not.
+
+The Python wrapper also refuses (ValueError) a `grain_size` that is not an
+int in `1 .. 2**32 - 1`, since ctypes would wrap `2**32 + 4096` to a valid
+4096.
+
+**Reopening.** A store must be reopened with the grain it was created with.
+On a file that has only ever held a store of that grain, another grain fails
+the open (`IOError`; `-EEXIST` from the store): the device metadata sits in the
+last `align_up(sizeof(salsa_dev_md), grain)` bytes of the whole grains
+(`dev_md_grain_offset`), so a different grain looks where there is none, finds
+no store, and `uDepot::open` will not format a file that is not new
+(`no store of N bytes found ...`). Nothing is read as another grain and nothing
+written then (`ReopeningWithAnotherGrainFailsAndHarmsNothing`,
+`test_reopening_with_another_grain_...`, every pair of 512, 4096, 32768 and
+8192, each on a new file). The store's own grain-mismatch message
+(`validate_dev_md`, "created with grains of %u bytes") is reached only if the
+metadata is found, and the message the caller sees names the size, not the
+grain, so the Python `IOError` names the `grain_size` it was given.
+
+**`force_destroy` does not clear the old store, and this is not safe across
+grains.** `force_destroy` keeps the file's data (`size_direct_file`) and
+writes the new store's metadata at the new grain's offset, zero padded to one
+grain. When the new grain is smaller than the old (or the size differs at the
+same grain), that write does not cover the old store's metadata, which stays
+valid where it is: a reopen at the old grain, without `force_destroy`, then
+opens the old store, with its old data, and writes over the new one (seen:
+4096 then 512, the new store cannot be opened any more; 32768 then 4096 or
+512, and 8192 then 4096, the new store opens with its keys gone). A smaller
+grain after a larger one is the dangerous direction; a larger one is not.
+This is the store's, not the binding's, and not new here (the same happens
+after a `force_destroy` at a different size and the same grain): `force_destroy`
+should invalidate the earlier metadata. It is a follow-up PR of its own; until
+it lands, change a store's grain (or size) on a new file. No test asserts the
+current behaviour.
 
 ### multi_get_into: N gets, one thread, one call
 
