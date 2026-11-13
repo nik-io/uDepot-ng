@@ -146,6 +146,18 @@ void* uDepotOpenSegment(const char* fname, uint64_t size, int force_destroy,
     return static_cast<void*>(store);
 }
 
+uint64_t uDepotSegmentForRecords(uint32_t grain_bytes,
+                                 uint32_t record_grains) {
+    if (!grain_is_valid(grain_bytes)) {
+        fprintf(stderr, "uDepot-ng: grain size %u is not valid: it must be "
+                "a power of two from %u to %u bytes\n", grain_bytes,
+                kMinGrainBytes, kMaxGrainBytes);
+        return 0;
+    }
+    return udepot_binding::segment_bytes_for_records(grain_bytes,
+                                                     record_grains);
+}
+
 void* uDepotOpenGrain(const char* fname, uint64_t size, int force_destroy,
                       uint32_t queue_depth, uint32_t grain_bytes) {
     return uDepotOpenSegment(fname, size, force_destroy, queue_depth,

@@ -821,6 +821,29 @@ grain of each segment is its metadata, `seg_md_grains_`) less 14 + `key_size` +
 fails (tested for 4096-, 512- and 32768-byte grains and a segment that is not a
 power of two).
 
+A caller that sizes a store for its largest record asks for the segment, not
+the table: `pyudepot.segment_size_for(grain_size, record_grains=2047)`
+(`uDepotSegmentForRecords(grain_bytes, record_grains)`, in bytes; 0 with a
+message on stderr, and `ValueError` in Python, for a grain `uDepotOpenGrain`
+would refuse or a `record_grains` outside 1 .. 2047). It is the smallest
+*fitted* segment (rule 10) whose data grains, the segment less
+`seg_md_grains_`, hold the record: the segment of the smallest power-of-two
+table, from 4096 bytes, for which `fitted_segment_size(table, grain)` less the
+metadata grain is at least `record_grains`
+(`segment_bytes_for_records`, `src/bindings/segment_check.h`, which calls the
+store's `fitted_segment_size`: no constant is copied). It is not a power of
+two of bytes, because that leaves the table half the segment: at grain 4096 a
+segment of 2048 grains gets a 4 MiB table (`index_bits` 19, in 8 MiB), the
+fitted one of 2050 grains a full 8 MiB table. For the default 2047 grains the
+segments are 2056 grains at 512, 2050 at 4096, 32768, 65536 and 1 MiB: 1028
+KiB, 8200 KiB, 64.06 MiB, 128.1 MiB and 2050 MiB (a table of 2048 grains:
+2 GiB at 1 MiB grains).
+Whole pages and `check_segment_size` hold for it by construction and are
+checked. The helper adds no setting and no table size: it is the segment size
+a caller would otherwise compute with `fitted_segment_size`'s constants
+(`TheDefaultRecordIsFittedAtEveryGrain`, `TheStoreOpensItUnshrunkWithTheRecord`
+and `TestSegmentSizeFor`). The JNI binding has no such helper.
+
 Each of these fails the open, never a fallback or a precedence:
 
 - **a `table_size`** (any value, with or without a `segment_size`): `TypeError`
