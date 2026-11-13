@@ -1422,10 +1422,10 @@ class TestSegmentSize:
         kv.close()
 
 
-class TestSegmentSizeFor:
-    """segment_size_for(grain, record_grains): the smallest fitted segment
-    that holds a record, so a caller sizing a store for its largest record
-    does not re-implement the store's fitting (rule 10)."""
+class TestSegmentSizeForRecords:
+    """segment_size_for_records(grain, record_grains): the smallest fitted
+    segment that holds a record, so a caller sizing a store for its largest
+    record does not re-implement the store's fitting (rule 10)."""
 
     # The default record, 2047 grains, in grains of segment: the table
     # (a power of two) that gives the data grains, its header, footer and
@@ -1435,11 +1435,11 @@ class TestSegmentSizeFor:
 
     @pytest.mark.parametrize("grain", sorted(GRAINS))
     def test_the_default_record_is_fitted(self, grain):
-        seg = pyudepot.segment_size_for(grain)
+        seg = pyudepot.segment_size_for_records(grain)
         assert seg == self.GRAINS[grain] * grain
-        assert seg == pyudepot.segment_size_for(grain, 2047)
+        assert seg == pyudepot.segment_size_for_records(grain, 2047)
         # The default is the most a record holds (2046 gives the same size).
-        sig = inspect.signature(pyudepot.segment_size_for)
+        sig = inspect.signature(pyudepot.segment_size_for_records)
         assert sig.parameters["record_grains"].default == 2047
         assert pyudepot.MAX_RECORD_GRAINS == 2047
         # Not a power of two of bytes: that one halves the table.
@@ -1447,16 +1447,16 @@ class TestSegmentSizeFor:
 
     def test_a_record_is_net_of_the_metadata_grain(self):
         # 1026 grains of 4096 hold 1025 data grains (a 4 MiB table).
-        assert pyudepot.segment_size_for(4096, 1025) == 1026 * 4096
-        assert pyudepot.segment_size_for(4096, 1026) == 2050 * 4096
-        assert pyudepot.segment_size_for(4096, 1) == 3 * 4096
+        assert pyudepot.segment_size_for_records(4096, 1025) == 1026 * 4096
+        assert pyudepot.segment_size_for_records(4096, 1026) == 2050 * 4096
+        assert pyudepot.segment_size_for_records(4096, 1) == 3 * 4096
 
     @pytest.mark.parametrize("grain,record", [(512, 2047), (4096, 2047),
                                              (4096, 1025), (4096, 1)])
     def test_the_store_takes_it_with_exactly_the_record(self, tmp_path,
                                                         capfd, grain,
                                                         record):
-        seg = pyudepot.segment_size_for(grain, record)
+        seg = pyudepot.segment_size_for_records(grain, record)
         kv = pyudepot.uDepot(file_name=str(tmp_path / "fit"),
                              grain_size=grain, segment_size=seg,
                              size=_device_for(32, seg, grain),
@@ -1478,8 +1478,8 @@ class TestSegmentSizeFor:
 
     def test_one_segment_smaller_cannot_hold_it(self, tmp_path, capfd):
         # The previous fitted size, the table half the size.
-        seg = pyudepot.segment_size_for(4096, 1026)
-        smaller = pyudepot.segment_size_for(4096, 1025)
+        seg = pyudepot.segment_size_for_records(4096, 1026)
+        smaller = pyudepot.segment_size_for_records(4096, 1025)
         assert smaller < seg
         kv = pyudepot.uDepot(file_name=str(tmp_path / "fit"),
                              segment_size=smaller,
@@ -1503,7 +1503,7 @@ class TestSegmentSizeFor:
     def test_python_refuses_a_bad_type_or_range_without_asking_c(
             self, capfd, grain, record, said):
         with pytest.raises(ValueError) as e:
-            pyudepot.segment_size_for(grain, record)
+            pyudepot.segment_size_for_records(grain, record)
         assert said in str(e.value)
         assert capfd.readouterr().err == ""  # never reached the C layer
 
@@ -1516,26 +1516,26 @@ class TestSegmentSizeFor:
     def test_c_refuses_a_bad_value_and_says_why_on_stderr(
             self, capfd, grain, record, said):
         with pytest.raises(ValueError) as e:
-            pyudepot.segment_size_for(grain, record)
+            pyudepot.segment_size_for_records(grain, record)
         assert str(e.value).startswith("no segment for grain_size=")
         assert "(the reason is on stderr)" in str(e.value)
         assert said in capfd.readouterr().err
 
     def test_numpy_integers_are_accepted(self):
-        want = pyudepot.segment_size_for(4096, 1025)
-        assert pyudepot.segment_size_for(np.int64(4096), np.uint32(1025)) \
-            == want
-        assert pyudepot.segment_size_for(np.int32(512)) \
-            == pyudepot.segment_size_for(512)
+        want = pyudepot.segment_size_for_records(4096, 1025)
+        assert pyudepot.segment_size_for_records(
+            np.int64(4096), np.uint32(1025)) == want
+        assert pyudepot.segment_size_for_records(np.int32(512)) \
+            == pyudepot.segment_size_for_records(512)
         with pytest.raises(ValueError):
-            pyudepot.segment_size_for(np.float64(4096))
+            pyudepot.segment_size_for_records(np.float64(4096))
         with pytest.raises(ValueError):
-            pyudepot.segment_size_for(np.bool_(True))
+            pyudepot.segment_size_for_records(np.bool_(True))
 
     @pytest.mark.parametrize("grain", [8192, 32768, 65536, 1048576])
     def test_a_one_grain_record_at_a_large_grain(self, grain):
         # 4096-byte table's segment is 2 grains, under the 3 the store takes.
-        assert pyudepot.segment_size_for(grain, 1) == 3 * grain
+        assert pyudepot.segment_size_for_records(grain, 1) == 3 * grain
 
 
 class TestMaxValue:

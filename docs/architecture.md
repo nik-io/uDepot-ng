@@ -822,7 +822,7 @@ fails (tested for 4096-, 512- and 32768-byte grains and a segment that is not a
 power of two).
 
 A caller that sizes a store for its largest record asks for the segment, not
-the table: `pyudepot.segment_size_for(grain_size, record_grains=2047)`
+the table: `pyudepot.segment_size_for_records(grain_size, record_grains=2047)`
 (`uDepotSegmentForRecords(grain_bytes, record_grains)`, in bytes; 0 with a
 message on stderr, and `ValueError` in Python, for a grain `uDepotOpenGrain`
 would refuse or a `record_grains` outside 1 .. 2047). It is the smallest
@@ -845,7 +845,7 @@ Whole pages and `check_segment_size` hold for it by construction and are
 checked. The helper adds no setting and no table size: it is the segment size
 a caller would otherwise compute with `fitted_segment_size`'s constants
 (`TheDefaultRecordIsFittedAtEveryGrain`, `TheStoreOpensItUnshrunkWithTheRecord`
-and `TestSegmentSizeFor`). The JNI binding has no such helper.
+and `TestSegmentSizeForRecords`). The JNI binding has no such helper.
 
 Each of these fails the open, never a fallback or a precedence:
 

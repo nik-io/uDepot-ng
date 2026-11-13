@@ -256,7 +256,7 @@ DEFAULT_GRAIN_SIZE = 4096
 MAX_RECORD_GRAINS = 2047
 
 
-def segment_size_for(grain_size, record_grains=MAX_RECORD_GRAINS):
+def segment_size_for_records(grain_size, record_grains=MAX_RECORD_GRAINS):
     """The smallest segment, in bytes, that holds a record of record_grains
     grains at grain_size, and is fitted: pass it as segment_size.
 
