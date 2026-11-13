@@ -10,14 +10,7 @@ package com.ibm.udepot;
  */
 public class uDepotJNI {
   /**
-   * Index table size init() uses: 2 MiB, small, for tests. A store sized
-   * for real use passes its own to initWithTables; tables this small map
-   * on 4 KiB pages and directory grows are slower, which the store prints.
-   */
-  public static final long DEFAULT_TABLE_SIZE = 2L * 1024 * 1024;
-
-  /**
-   * Initialize the Key Value provider, with DEFAULT_TABLE_SIZE tables.
+   * Initialize the Key Value provider, with the store's default segment.
    * @param fname    Path to file/device for backend storage.
    * @param size     Desired capacity in bytes. 0 for full capacity.
    * @param force_destroy If true, start a new store over whatever is there.
@@ -26,22 +19,29 @@ public class uDepotJNI {
    * @return 0 on success, errno on failure.
    */
   public int init(String fname, long size, boolean force_destroy) {
-    return initWithTables(fname, size, force_destroy, DEFAULT_TABLE_SIZE);
+    return initWithSegment(fname, size, force_destroy, 0);
   }
 
   /**
-   * Initialize the Key Value provider.
+   * Initialize the Key Value provider. The store's parameters are the device
+   * size, the grain size (fixed at 512 bytes here) and the segment size;
+   * there is no table size: each index table fills one segment, so the
+   * segment sets the tables (the largest power of two that fits it).
    * @param fname    Path to file/device for backend storage.
    * @param size     Desired capacity in bytes. 0 for full capacity.
    * @param force_destroy If true, start a new store over whatever is there.
    *     If false, a store is restored, and a backing with no store on it is
    *     refused (a nonzero return) unless it is a new or empty file.
-   * @param table_size Bytes of each index table: a power of two of at least
-   *                 4096, or 0 for the store's default (512 MiB tables).
-   * @return 0 on success, errno on failure (EINVAL for a bad table_size).
+   * @param segment_size Bytes of each segment: a multiple of 4096, or 0 for
+   *     the store's default (a segment for a 2^29-byte table, halved until it
+   *     fits the device, which the store says). A device too small for it
+   *     makes the store halve it and say so. A reopen takes the segment the
+   *     store was created with.
+   * @return 0 on success, errno on failure (EINVAL for a bad segment_size,
+   *     with the reason on stderr).
    */
-  public native int initWithTables(String fname, long size,
-                                   boolean force_destroy, long table_size);
+  public native int initWithSegment(String fname, long size,
+                                    boolean force_destroy, long segment_size);
 
   /**
    * Gracefully shutdown the Key Value provider.

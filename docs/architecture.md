@@ -698,7 +698,7 @@ calling thread except the batch below:
 
 | group | functions |
 |---|---|
-| open/close | `uDepotOpen`, `uDepotOpenTables` (+ table size), `uDepotOpenQueue` (+ `queue_depth`), `uDepotOpenGrain` (+ `grain_bytes`), `uDepotOpenSegment` (+ `segment_bytes`), `uDepotClose` |
+| open/close | `uDepotOpen`, `uDepotOpenQueue` (+ `queue_depth`), `uDepotOpenGrain` (+ `grain_bytes`), `uDepotOpenSegment` (+ `segment_bytes`), `uDepotClose` |
 | copying | `uDepotGet`, `uDepotPut`, `uDepotDel`, `uDepotExists` |
 | zero copy | `uDepotAllocPutBuffer`, `uDepotPutBufferValue`, `uDepotPutBuf`, `uDepotFreePutBuffer`, `uDepotAllocGetBuffer`, `uDepotNewGetBuffer`, `uDepotGetBuf`, `uDepotGetBufferValue`, `uDepotFreeGetBuffer`, `uDepotThreadValueCopies` |
 | batch | `uDepotMultiGetBuf` |
@@ -715,14 +715,13 @@ refused. Keys are C-contiguous `uint8` numpy arrays.
 ### Grain size
 
 `uDepot(..., grain_size=4096)` is `uDepotOpenGrain(..., grain_bytes)`:
-`StoreConfig::grain_size`, the unit of allocation and I/O. `uDepotOpen`,
-`uDepotOpenTables` and `uDepotOpenQueue` are unchanged and open with 4096
-(`kDefaultGrainBytes`). A record is at most 2047 grains
+`StoreConfig::grain_size`, the unit of allocation and I/O. `uDepotOpen`
+and `uDepotOpenQueue` open with 4096 (`kDefaultGrainBytes`). A record is at most 2047 grains
 (`HashEntry::kKvSizeMask`), so the grain bounds the value: ~8 MiB at 4096,
 ~64 MiB at 32768, in one I/O (flywheel raises the grain to store larger
 tensors rather than split them). The cost is a grain per record: a small value
 occupies a whole grain, and the segment must hold a record, so larger values
-need larger tables (`table_size`) and a device that holds several segments.
+need larger segments (`segment_size`, which sets the tables) and a device that holds several segments.
 
 The store (`uDepot::open`) checks nothing about the grain, so the binding does
 (`grain_is_valid`, `pyudepot.cc`); anything else fails the open with a message
@@ -791,19 +790,29 @@ current behaviour.
 
 `uDepot(..., segment_size=None)` is `uDepotOpenSegment(..., grain_bytes,
 segment_bytes)`: `StoreConfig::segment_size`, in bytes here (grains in the
-store). Each directory table fills one index segment, so it is also the other
-way to size the tables: `table_size` asks for a fitted segment (a power-of-two
-table plus its room, `segment_size_for_table`), `segment_size` asks for the
-segment itself, of any size. The store takes it: a table is the largest power
+store). The binding's open parameters are the device size, the grain size and
+the segment size, as uDepot's (legacy's `python/wrapper/pyudepot.cc:23-51` takes fname, size,
+force_destroy): there is no table size. Each directory table fills one index
+segment, so the segment sets the tables (CLAUDE.md, rule 10: smaller tables
+come from a smaller segment size, never from a separate setting). `segment_size`
+0 or `None` is the store's own default, a segment for a 2^29-byte table halved
+as a table until it fits the device (`fitted_segment_size`); any other is a
+caller-set segment, used as given, of any size (legacy's behaviour, including
+its least-waste search on a device with no tail). The binding used to take a
+`table_size` and turn it into a caller-set segment, which on a device that is
+an exact multiple of the segment took that search and gave arbitrary segments
+whose power-of-two tables filled only part of them
+(`ZeroIsTheStoresFittedDefaultAndAnExplicitSegmentIsAsGiven`). It is gone, and `table_size=` raises `TypeError`
+naming `segment_size` (`test_table_size_is_refused_naming_the_replacement`).
+The store takes the segment: a table is the largest power
 of two that fits the segment's data grains (`HashTable::index_bits_for`), and
 "its table may fill only part of it" (`uDepot::open`, where a caller-set
 segment is halved as a size, not refitted). A segment of 1100 grains of 4096
 has a table of 2^19 buckets (4 MiB), 93% of the segment
-(`ThePowerOfTwoTableBelowANonPowerOfTwoSegment`). `uDepotOpenGrain` and the
-older entry points are unchanged (`uDepotOpenGrain` is `uDepotOpenSegment` with
-0); 0 here means the segment of `table_bytes`, as before. The binding changes
-the open parameters only: not the store, the on-disk format, or how tables
-relate to segments.
+(`ThePowerOfTwoTableBelowANonPowerOfTwoSegment`). `uDepotOpenGrain`, `uDepotOpenQueue`
+and `uDepotOpen` are `uDepotOpenSegment` with 0 and the defaults. The binding
+changes the open parameters only: not the store, the on-disk format, or how
+tables relate to segments.
 
 The segment also bounds a value: a record lives whole in one segment, so
 `max_value_bytes(key_size)` is `min(2047, segment / grain - 1)` grains (one
@@ -814,10 +823,8 @@ power of two).
 
 Each of these fails the open, never a fallback or a precedence:
 
-- **a `segment_size` together with a `table_size`** (any value passed,
-  `DEFAULT_TABLE_SIZE` and 0 included): `ValueError` in Python, which otherwise
-  passes `table_size` 0; `uDepotOpenSegment` refuses a non-zero `segment_bytes`
-  with a non-zero `table_bytes`. They set the same thing;
+- **a `table_size`** (any value, with or without a `segment_size`): `TypeError`
+  in Python naming `segment_size`; there is no table size;
 - **not an int in `1 .. 2**64 - 1`** (a `bool`, a float, 0, negative): `ValueError`
   (ctypes would wrap `2**64 + 4096`);
 - **not a multiple of the grain and of 4096 bytes**: `uDepot::open`'s
@@ -849,7 +856,7 @@ so no multiple of the unit is under the minimum (`At512ByteGrainsThePageIsTheMin
 
 **Reopening.** The segment of a store comes from its device metadata
 (`dev_md.segment_size`, `uDepot::open`), so on a reopen `segment_size` is
-checked as above and then ignored, as `table_size` is: a store created with
+checked as above and then ignored: a store created with
 one segment, reopened asking for another or for none, opens with the one it
 was created with and its data (`ReopeningKeepsTheCreatedSegmentWhateverIsAsked`,
 `test_reopening_keeps_the_created_segment_...`). It is not refused. An invalid
@@ -1127,11 +1134,12 @@ persistent source of truth is the log"*.
   including where a fitted size leaves no tail for the device metadata. A
   segment size the caller sets is used as given. A table's memory is all
   touched at open, so the default means up to 512 MiB per table. The
-  Python and JNI bindings take the table size from the caller
-  (`table_size`, `initWithTables`, YCSB's `udepot.table-size`; a power of
-  two of at least 4 KiB, or 0 for the store's default,
-  `segment_size_for_table`); they default to 2 MiB tables (2^18 buckets),
-  small, for tests, which map on 4 KiB pages, and the store says so. A
+  Python and JNI bindings take no table size: their open parameters
+  are the device size, the grain size and the segment size
+  (`segment_size`, `initWithSegment`, YCSB's `udepot.segment-size`; 0 is the
+  store's default segment), and the table follows the segment. A table
+  maps on 4 KiB pages where huge pages would leave over 1/8 of the mapping
+  unused (a 2 MiB table, say), and the store says so. A
   device too small for the segment asked for (or the default) makes it
   smaller, as uDepot does, and `open()` says so too, with both sizes and
   how much of the smaller segment its table fills: a caller's size is
@@ -1151,12 +1159,12 @@ persistent source of truth is the log"*.
   half full.) A fitted segment is a power of two plus a page or two, so
   rounding costs nearly 2 MiB per table and nothing on the device: under
   1/8 from a 16 MiB table up (the default's is 512 MiB, 0.4%), but half
-  of the bindings' 2 MiB one, which would take 4 MiB of huge pages each,
+  of a 2 MiB one, which would take 4 MiB of huge pages each,
   out of the pool SPDK's DMA buffers also come from, up to 512 MiB over a
-  grown directory's 256 tables. So the bindings' tables, and any segment
-  under 2 MiB, map on 4 KiB pages, the segment exactly; so does any table
-  when no huge page is free. The main cost is in grows: a grow faults each
-  new table in 4 KiB at a time (512 times the faults), and the puts
+  grown directory's 256 tables. So a small table (a 2 MiB one, say), and
+  any segment under 2 MiB, map on 4 KiB pages, the segment exactly; so
+  does any table when no huge page is free. The main cost is in grows: a
+  grow faults each new table in 4 KiB at a time (512 times the faults), and the puts
   waiting on a full table wait for the whole grow; the copy and lookups
   also miss the TLB more, a second-order cost. Neither fallback is silent:
   `open()` prints a message whenever a segment of 2 MiB or more maps on

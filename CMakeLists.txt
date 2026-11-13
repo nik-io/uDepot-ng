@@ -287,6 +287,41 @@ if(UDEPOT_BUILD_TESTS)
                 uDepotJNITest
         )
         set_tests_properties(jni_test PROPERTIES TIMEOUT 60)
+        # What initWithSegment says on stderr (fd 2, past System.err), which
+        # the ctest passes only on seeing, with the right return code, on a
+        # device of the given size ("min" has a tail past its 1024 segments
+        # of 4096). Refused with EINVAL and the reason: a segment off the
+        # page size, a negative one, one above salsa's limit. (Too small has
+        # no case: at 512-byte grains the 4096-byte page is above the least a
+        # table needs, so no multiple of it is under; pyudepot_abi_test covers
+        # the minimum.) An open the store refuses, here a minimal segment on a
+        # device with no tail, says "failed to init" with the errno ("exact").
+        # A segment reaches the store ("asked", "min"); 0 and
+        # init() are the store's default.
+        set(JNI_OPEN ${Java_JAVA_EXECUTABLE} -cp ${JNI_CLASSES_DIR}
+            -Djava.library.path=$<TARGET_FILE_DIR:uDepotJNI> uDepotJNITest open)
+        string(REPLACE ";" " " JNI_OPEN_CMD "${JNI_OPEN}")
+        foreach(case
+                "bad|3000|22|4194304|segment size 3000 is not a multiple of 4096 bytes"
+                "negative|-4096|22|4194304|segment size -4096 is negative"
+                "large|2199023255552|22|4194304|segment size 2199023255552 is too large for grains of 512 bytes"
+                "min|4096|0|4195328|segments of 4 KiB (512-byte grains"
+                "exact|4096|-22|4194304|failed to init uDepot-ng err=Invalid argument"
+                "asked|1048576|0|4194304|the requested segments of 1024 KiB"
+                "default|0|0|4194304|the default segments of"
+                "init|init|0|4194304|the default segments of")
+            string(REPLACE "|" ";" parts "${case}")
+            list(GET parts 0 name)
+            list(GET parts 1 seg)
+            list(GET parts 2 rc)
+            list(GET parts 3 devsize)
+            list(GET parts 4 msg)
+            add_test(
+                NAME jni_segment_${name}_test
+                COMMAND bash -c "set -o pipefail; ${JNI_OPEN_CMD} ${CMAKE_CURRENT_BINARY_DIR}/jni-${name} ${seg} ${rc} ${devsize} 2>&1 | grep -q '${msg}'"
+            )
+            set_tests_properties(jni_segment_${name}_test PROPERTIES TIMEOUT 60)
+        endforeach()
     endif()
 
     if(UDEPOT_BUILD_SPDK)

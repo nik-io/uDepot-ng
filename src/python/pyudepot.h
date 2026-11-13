@@ -9,21 +9,18 @@
 
 extern "C" {
 
-// Index tables of 2 MiB (kDefaultTableBytes): small, for tests. A store
-// sized for real use passes its own to uDepotOpenTables.
+// A store with the default grain (4096) and segment (the store's own), the
+// default queue depth. The open parameters are the device size, the grain
+// size and the segment size, as uDepot's; there is no table size (a table
+// fills one segment: size the tables with the segment, uDepotOpenSegment).
 DLLOUT void* uDepotOpen(const char* fname, uint64_t size, int force_destroy);
-// As uDepotOpen, with index tables of table_bytes: a power of two of at
-// least 4 KiB, or 0 for the store's default (512 MiB tables).
-DLLOUT void* uDepotOpenTables(const char* fname, uint64_t size,
-                              int force_destroy, uint64_t table_bytes);
-// As uDepotOpenTables, with queue_depth I/Os in flight at once per thread
+// As uDepotOpen, with queue_depth I/Os in flight at once per thread
 // (StoreConfig::queue_depth: the size of each thread's AIO context), or 0
 // for the default (1024). uDepotMultiGetBuf keeps at most that many gets in
 // flight, fewer if the calling thread's AIO context has less room
 // (AioIO::thread_queue_room()).
 DLLOUT void* uDepotOpenQueue(const char* fname, uint64_t size,
-                             int force_destroy, uint64_t table_bytes,
-                             uint32_t queue_depth);
+                             int force_destroy, uint32_t queue_depth);
 // As uDepotOpenQueue, with grains of grain_bytes (StoreConfig::grain_size:
 // the unit of allocation and I/O; a record of up to 2047 grains is stored,
 // so 4096, uDepotOpenQueue's, holds values up to ~8 MiB and 32768 ~64 MiB):
@@ -36,23 +33,21 @@ DLLOUT void* uDepotOpenQueue(const char* fname, uint64_t size,
 // was not formatted by force_destroy at a smaller grain or size since: see
 // "Grain size" in docs/architecture.md.
 DLLOUT void* uDepotOpenGrain(const char* fname, uint64_t size,
-                             int force_destroy, uint64_t table_bytes,
-                             uint32_t queue_depth, uint32_t grain_bytes);
-// As uDepotOpenGrain, with segments of segment_bytes instead of a segment
-// fitted to table_bytes (StoreConfig::segment_size; each directory table
-// fills one segment, so it also sets the table: the largest power of two
-// that fits the segment). segment_bytes 0 is uDepotOpenGrain's. Otherwise
-// table_bytes must be 0 (the two set the same thing; both is refused), and
-// segment_bytes a multiple of the grain and of 4096 (the store rounds
-// any other down), and at least a metadata grain plus the room a table
-// needs; else NULL with a message on stderr. A device too small for the
-// segment gets it halved by the store, which says so (the result is
-// uDepotSegmentBytes). A store keeps the segment it was created with: on a
-// reopen segment_bytes is checked as above, then ignored, as table_bytes is.
+                             int force_destroy, uint32_t queue_depth,
+                             uint32_t grain_bytes);
+// As uDepotOpenGrain, with segments of segment_bytes
+// (StoreConfig::segment_size; each directory table fills one segment, so it
+// also sets the table: the largest power of two that fits the segment). segment_bytes 0 is the
+// store's own default, a segment for a 2^29-byte table, halved until it fits
+// the device (uDepotOpenGrain's); otherwise it is a multiple of the grain
+// and of 4096 (the store rounds any other down), and at least a metadata
+// grain plus the room a table needs; else NULL with a message on stderr. A
+// device too small for the segment gets it halved by the store, which says so
+// (the result is uDepotSegmentBytes). A store keeps the segment it was
+// created with: on a reopen segment_bytes is checked as above, then ignored.
 DLLOUT void* uDepotOpenSegment(const char* fname, uint64_t size,
-                               int force_destroy, uint64_t table_bytes,
-                               uint32_t queue_depth, uint32_t grain_bytes,
-                               uint64_t segment_bytes);
+                               int force_destroy, uint32_t queue_depth,
+                               uint32_t grain_bytes, uint64_t segment_bytes);
 DLLOUT void  uDepotClose(void* kv);
 DLLOUT int   uDepotGet(void* kv, const uint8_t key[], uint32_t key_size,
                         uint8_t val_buf[], uint64_t val_buf_size);

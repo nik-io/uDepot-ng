@@ -6,9 +6,11 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 
+#include "bindings/segment_check.h"
 #include "udepot/store.h"
 #include "udepot/io/aio.h"
 
@@ -27,19 +29,28 @@ static bool store_open() {
     return g_open.load(std::memory_order_acquire);
 }
 
-JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_initWithTables(
+JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_initWithSegment(
     JNIEnv* env, jobject, jstring fname, jlong size, jboolean force_destroy,
-    jlong table_size) {
+    jlong segment_size) {
     udepot::StoreConfig config;
     config.force_destroy = force_destroy == JNI_TRUE;
     config.grain_size = 512;
-    // The Java side defaults to small tables, for tests; see
-    // uDepotJNI.DEFAULT_TABLE_SIZE.
-    if (table_size < 0 ||
-        udepot::segment_size_for_table(static_cast<uint64_t>(table_size),
-                                       config.grain_size,
-                                       &config.segment_size) != 0)
+    // The segment sets the tables (each fills one segment); 0 is the
+    // store's own default. Anything else is checked as the Python binding
+    // checks it (bindings/segment_check.h): the store would round it down
+    // or fail without a word.
+    if (segment_size < 0) {
+        fprintf(stderr, "uDepot-ng: segment size %lld is negative: it must "
+                "be 0 (the store's default) or a multiple of 4096 bytes\n",
+                static_cast<long long>(segment_size));
         return EINVAL;
+    }
+    if (segment_size != 0 &&
+        !udepot_binding::check_segment_size(
+            static_cast<uint64_t>(segment_size), config.grain_size))
+        return EINVAL;
+    config.segment_size = static_cast<uint64_t>(segment_size) /
+                          config.grain_size;
 
     const char* path = env->GetStringUTFChars(fname, nullptr);
     if (!path) return ENOMEM;
@@ -55,6 +66,11 @@ JNIEXPORT jint JNICALL Java_com_ibm_udepot_uDepotJNI_initWithTables(
 
     int rc = g_store.open(config);
     env->ReleaseStringUTFChars(fname, path);
+    // As the Python binding says: the store's own reason, when it has one,
+    // is above this line.
+    if (rc != 0)
+        fprintf(stderr, "failed to init uDepot-ng err=%s\n",
+                strerror(rc < 0 ? -rc : rc));
     g_open.store(rc == 0, std::memory_order_release);
     return rc;
 }

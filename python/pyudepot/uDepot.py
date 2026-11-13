@@ -27,8 +27,8 @@ pymaxvalue = libudepot.uDepotMaxValueBytes
 pygrain = libudepot.uDepotGrainBytes
 pysegment = libudepot.uDepotSegmentBytes
 
-pyopen.argtypes = [c_char_p, c_ulonglong, c_int, c_ulonglong, c_uint,
-                   c_uint, c_ulonglong]
+pyopen.argtypes = [c_char_p, c_ulonglong, c_int, c_uint, c_uint,
+                   c_ulonglong]
 pyopen.restype = c_void_p
 pyclose.argtypes = [c_void_p]
 pyget.argtypes = [c_void_p,
@@ -243,12 +243,6 @@ class MultiGetError(IOError):
         self.failed = failed
 
 
-# Index tables of 2 MiB: small, for tests. A store sized for real use
-# passes its own table_size (a power of two of at least 4096 bytes, or 0
-# for the store's default, 512 MiB tables); tables this small map on
-# 4 KiB pages and directory grows are slower, which the store prints.
-DEFAULT_TABLE_SIZE = 2 * 1024 * 1024
-
 # The store's grain: its unit of allocation and I/O. A record holds at most
 # 2047 grains, so this is also what bounds a value (~8 MiB at 4096).
 DEFAULT_GRAIN_SIZE = 4096
@@ -273,33 +267,40 @@ class uDepot:
         positive 32-bit int); a grain below the O_DIRECT alignment of an
         existing file or device is an IOError too. A record is at most 2047
         grains, so a larger grain stores larger values (32768: ~64 MiB, with
-        table_size and size to match) at the price of a grain per small
+        segment_size and size to match) at the price of a grain per small
         record. A store is reopened with the grain it was created with: another
         raises IOError (the store's message is on stderr), except that a file
         that force_destroy once formatted at a smaller grain or size can
         still open the older store left under it (see "Grain size" in
         docs/architecture.md); use a new file to change it.
 
-        segment_size is the store's segment in bytes (default None: the one
-        that fits table_size). Each index table fills one segment, so it is
-        the other way to size the tables, and giving both a
-        table_size (any value, the default's and 0 included) and a
-        segment_size raises ValueError (as does a
-        segment_size that is not an int in 1 .. 2**64 - 1). It must be a
+        segment_size is the store's segment in bytes (default None: the
+        store's own, a segment for a 2^29-byte table, halved until it fits the
+        device; the store says so when it halves it). The store's open
+        parameters are the device size, the grain size and the segment size;
+        there is no table size, and passing table_size raises TypeError.
+        Each index table fills one segment, so the segment sets the tables:
+        the largest power of two that fits it. A segment_size that is not an
+        int in 1 .. 2**64 - 1 raises ValueError. It must be a
         multiple of grain_size and of 4096, and large enough for the
         segment's metadata grain and an index table, else IOError (the
         reason is on stderr); the longest value is the segment less its
         metadata grain, in grains, capped at 2047 (max_value_bytes). A
         device too small for it makes the store halve it and say so:
         segment_size() is what it ended up as. A reopen takes the segment
-        the store was created with and ignores segment_size (as it does
-        table_size), after checking it as above (see "Segment size" in
-        docs/architecture.md).
+        the store was created with and ignores segment_size, after checking
+        it as above (see "Segment size" in docs/architecture.md).
         """
+        if 'table_size' in kwargs:
+            raise TypeError(
+                'table_size is gone: a table fills one segment, so the '
+                'segment size sets the tables. Pass segment_size (bytes, a '
+                'multiple of grain_size and of 4096; the tables are the '
+                'largest power of two that fits it), or omit it for the '
+                "store's own default segment")
         self._fname = kwargs.get('file_name', '/tmp/pyudepot-test')
         self._size = kwargs.get('size', 1024 * 1024 + 4096)
         self._force_destroy = 1 if kwargs.get('force_destroy', False) else 0
-        self._table_size = kwargs.get('table_size', DEFAULT_TABLE_SIZE)
         self._queue_depth = kwargs.get('queue_depth', 0)
         self._segment_size = kwargs.get('segment_size', None)
         self._grain_size = kwargs.get('grain_size', DEFAULT_GRAIN_SIZE)
@@ -309,7 +310,6 @@ class uDepot:
             raise ValueError(
                 'grain_size={!r} is not valid: it must be a power of two '
                 'from 512 to 1048576 bytes'.format(self._grain_size))
-        table_size = self._table_size
         if self._segment_size is not None:
             seg = self._segment_size
             # bool is an int; ctypes would wrap 2**64 + 4096 to a valid one.
@@ -318,15 +318,9 @@ class uDepot:
                 raise ValueError(
                     'segment_size={!r} is not valid: it must be an int of '
                     'bytes, a multiple of grain_size and of 4096'.format(seg))
-            if 'table_size' in kwargs:
-                raise ValueError(
-                    'both segment_size={} and table_size={} were given: they '
-                    'set the same thing (a table fills one segment), so '
-                    'give one'.format(seg, table_size))
-            table_size = 0  # the segment sets the tables
         self._kv = pyopen(
             self._fname.encode('utf-8'), self._size, self._force_destroy,
-            table_size, self._queue_depth, self._grain_size,
+            self._queue_depth, self._grain_size,
             self._segment_size or 0)
         if not self._kv:
             raise IOError(

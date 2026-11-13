@@ -29,9 +29,10 @@ import com.ibm.udepot.uDepotJNI;
  *                  default /dev/shm one, has none and cannot be opened with
  *                  0: give a size)
  *   udepot.force-destroy - skip restore (default: true)
- *   udepot.table-size - bytes per index table, a power of two of at least
- *                  4096, or 0 for the store's default (default: 2 MiB,
- *                  uDepotJNI.DEFAULT_TABLE_SIZE)
+ *   udepot.segment-size - bytes per segment, a multiple of 4096, or 0 for
+ *                  the store's default (default: 0). Each index table fills
+ *                  one segment, so this sets the tables. There is no table
+ *                  size: udepot.table-size is refused.
  */
 public class uDepotClient extends DB {
 
@@ -40,14 +41,16 @@ public class uDepotClient extends DB {
   public static final String SIZE_PROPERTY = "udepot.size";
   public static final String DEV_PROPERTY = "udepot.dev";
   public static final String FORCE_PROPERTY = "udepot.force-destroy";
+  public static final String SEGMENT_SIZE_PROPERTY = "udepot.segment-size";
+  // Removed: a table fills one segment, so the segment sets the tables.
   public static final String TABLE_SIZE_PROPERTY = "udepot.table-size";
 
   private static synchronized void syncInit(String devname, long size,
                                              boolean force_destroy,
-                                             long table_size) throws DBException {
+                                             long segment_size) throws DBException {
     if (KV != null) return;
     KV = new uDepotJNI();
-    int err = KV.initWithTables(devname, size, force_destroy, table_size);
+    int err = KV.initWithSegment(devname, size, force_destroy, segment_size);
     if (err != 0)
       throw new RuntimeException("uDepot init failed: " + err);
   }
@@ -63,9 +66,15 @@ public class uDepotClient extends DB {
     String devname = props.getProperty(DEV_PROPERTY, "/dev/shm/udepot_test");
     boolean force_destroy = Boolean.valueOf(
         props.getProperty(FORCE_PROPERTY, "true"));
-    long table_size = Long.valueOf(props.getProperty(
-        TABLE_SIZE_PROPERTY, String.valueOf(uDepotJNI.DEFAULT_TABLE_SIZE)));
-    syncInit(devname, size, force_destroy, table_size);
+    if (props.getProperty(TABLE_SIZE_PROPERTY) != null) {
+      throw new DBException(TABLE_SIZE_PROPERTY + " is gone: a table fills "
+          + "one segment, so the segment size sets the tables. Set "
+          + SEGMENT_SIZE_PROPERTY + " (bytes, a multiple of 4096; 0 is the "
+          + "store's default) instead");
+    }
+    long segment_size = Long.valueOf(props.getProperty(
+        SEGMENT_SIZE_PROPERTY, "0"));
+    syncInit(devname, size, force_destroy, segment_size);
   }
 
   public void cleanup() throws DBException {
