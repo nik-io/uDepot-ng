@@ -6,6 +6,7 @@ from ctypes import c_char_p, c_int, c_ubyte, c_uint, c_ulonglong, c_void_p, byre
 import errno
 import os
 import logging
+import operator
 import atexit
 import weakref
 
@@ -26,6 +27,7 @@ pyexists = libudepot.uDepotExists
 pymaxvalue = libudepot.uDepotMaxValueBytes
 pygrain = libudepot.uDepotGrainBytes
 pysegment = libudepot.uDepotSegmentBytes
+pysegmentfor = libudepot.uDepotSegmentForRecords
 
 pyopen.argtypes = [c_char_p, c_ulonglong, c_int, c_uint, c_uint,
                    c_ulonglong]
@@ -49,6 +51,8 @@ pygrain.argtypes = [c_void_p]
 pygrain.restype = c_uint
 pysegment.argtypes = [c_void_p]
 pysegment.restype = c_ulonglong
+pysegmentfor.argtypes = [c_uint, c_uint]
+pysegmentfor.restype = c_ulonglong
 
 pyallocput = libudepot.uDepotAllocPutBuffer
 pyputvalue = libudepot.uDepotPutBufferValue
@@ -246,6 +250,56 @@ class MultiGetError(IOError):
 # The store's grain: its unit of allocation and I/O. A record holds at most
 # 2047 grains, so this is also what bounds a value (~8 MiB at 4096).
 DEFAULT_GRAIN_SIZE = 4096
+
+
+# The most grains a record holds (a hash entry's 11-bit size field).
+MAX_RECORD_GRAINS = 2047
+
+
+def segment_size_for_records(grain_size, record_grains=MAX_RECORD_GRAINS):
+    """The smallest segment, in bytes, that holds a record of record_grains
+    grains at grain_size, and is fitted: pass it as segment_size.
+
+    A record lives whole in one segment, so a store sized for its largest
+    record needs a segment of at least record_grains + 1 grains (one is the
+    segment's metadata), and the store takes none under 3 grains. The answer is the segment of the smallest
+    power-of-two index table that gives that (the store's fitted_segment_size,
+    CLAUDE.md rule 10), not a power of two of bytes: a table fills a fitted
+    segment, and half of a power-of-two one. At grain 4096 and the default
+    2047 grains it is 2050 grains (8.01 MiB, a full 8 MiB table); a segment
+    of 2048 grains would get a 4 MiB table. The default record_grains makes
+    max_value_bytes the 2047-grain maximum.
+
+    grain_size and record_grains may be any integer type but not a bool.
+    Raises ValueError for a grain_size that is not a power of two from 512
+    to 1 MiB or a record_grains outside 1 .. 2047.
+    """
+    args = []
+    for name, orig in (('grain_size', grain_size),
+                       ('record_grains', record_grains)):
+        # Any integer type (numpy's too), but not bool; ctypes would wrap
+        # 2**32 + 4096 to a valid grain.
+        v = None
+        if not isinstance(orig, bool):
+            try:
+                v = operator.index(orig)
+            except TypeError:
+                pass
+        if v is None or not 0 < v < 2**32:
+            raise ValueError(
+                '{}={!r} is not valid: it must be a positive int (grain_size '
+                'a power of two from 512 to 1048576, record_grains 1 to '
+                '{})'.format(name, orig, MAX_RECORD_GRAINS))
+        args.append(v)
+    grain_size, record_grains = args
+    seg = pysegmentfor(grain_size, record_grains)
+    if not seg:
+        raise ValueError(
+            'no segment for grain_size={} and record_grains={}: grain_size '
+            'must be a power of two from 512 to 1048576 and record_grains '
+            '1 to {} (the reason is on stderr)'.format(
+                grain_size, record_grains, MAX_RECORD_GRAINS))
+    return seg
 
 
 class uDepot:

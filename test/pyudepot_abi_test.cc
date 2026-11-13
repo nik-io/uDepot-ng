@@ -782,3 +782,248 @@ TEST(PyudepotGrainLoop, AGrainBelowTheSectorSizeIsRefusedOn4KnAndOneAtItOpens) {
     EXPECT_EQ(std::memcmp(val, out, sizeof(val)), 0);
     uDepotClose(kv);
 }
+
+// uDepotSegmentForRecords: the smallest fitted segment that holds a record of
+// N grains. Checked against the store, not against the formula: what the
+// store opens, how wide its table is, and the longest record it takes.
+
+namespace {
+
+constexpr uint32_t kMaxRecord = 2047;
+// Segments on the devices of these tests: salsa's spare segments and GC
+// watermarks halve the segment of a device with fewer (measured: 20 halved
+// the 512-byte grains' segment, 32 did not).
+constexpr int kSegmentsForRecord = 32;
+
+uint64_t md_grains_of(uint32_t grain) {
+    return udepot_binding::seg_md_grains(grain);
+}
+
+// The table, in bytes of 8-byte buckets, the segment of `grains` was fitted
+// for: index_bits_for says what table its net bytes hold.
+uint64_t table_of_segment(uint64_t grains, uint32_t grain) {
+    const uint32_t bits = udepot::HashTable::index_bits_for(
+        static_cast<size_t>((grains - md_grains_of(grain)) * grain));
+    return bits == 0 ? 0 : uint64_t{8} << bits;
+}
+
+// What a record of N grains needs, and no more, of a fitted segment: it
+// holds the record, it is whole pages, a power-of-two table fills it (what is
+// left over is under a page), and the fitted segment of half that table, one
+// size smaller, cannot hold the record.
+void expect_fitted_for(uint32_t grain, uint32_t record,
+                       uint64_t expected_grains) {
+    SCOPED_TRACE("grain " + std::to_string(grain) + ", record " +
+                 std::to_string(record));
+    const uint64_t seg = uDepotSegmentForRecords(grain, record);
+    ASSERT_NE(seg, 0u);
+    ASSERT_EQ(seg % grain, 0u);
+    EXPECT_EQ(seg % udepot_binding::segment_unit_bytes(grain), 0u);
+    const uint64_t grains = seg / grain;
+    EXPECT_EQ(grains, expected_grains);
+    EXPECT_GE(grains - md_grains_of(grain), record);
+    const uint64_t table = table_of_segment(grains, grain);
+    ASSERT_NE(table, 0u);
+    // The table is the one the segment was fitted for, and fills it.
+    EXPECT_EQ(udepot::fitted_segment_size(table, grain), grains);
+    const uint64_t net = (grains - md_grains_of(grain)) * grain;
+    const uint64_t used = table + 2 * 512 + 32 * 8;  // header, footer, hop
+    ASSERT_GE(net, used);
+    EXPECT_LT(net - used, std::max<uint64_t>(4096, grain));
+    // One fitted segment smaller cannot hold the record.
+    // (Or it is a segment under the least the store takes: a 4096-byte
+    // table in a grain of 8192 or more is 2 grains.)
+    if (table > 4096) {
+        const uint64_t smaller = udepot::fitted_segment_size(table / 2, grain);
+        EXPECT_TRUE(smaller - md_grains_of(grain) < record ||
+                    smaller < udepot_binding::min_segment_grains(grain))
+            << smaller;
+    }
+}
+
+}  // namespace
+
+TEST(PyudepotSegmentFor, TheDefaultRecordIsFittedAtEveryGrain) {
+    // The segment is 2050 grains at 4096 (a full 8 MiB table, where 2048
+    // grains would get 4 MiB); 2056 at 512, whose pages are 8 grains.
+    expect_fitted_for(512, kMaxRecord, 2056);
+    expect_fitted_for(4096, kMaxRecord, 2050);
+    expect_fitted_for(32768, kMaxRecord, 2050);
+    expect_fitted_for(65536, kMaxRecord, 2050);
+    expect_fitted_for(1u << 20, kMaxRecord, 2050);
+    EXPECT_EQ(uDepotSegmentForRecords(4096, kMaxRecord), 2050u * 4096);
+}
+
+// A segment of 2048 grains is what a power of two of bytes gives: its table
+// is half the size.
+TEST(PyudepotSegmentFor, AThePowerOfTwoSegmentWouldHalveTheTable) {
+    EXPECT_EQ(table_of_segment(2048, 4096), uint64_t{4} << 20);
+    EXPECT_EQ(table_of_segment(2050, 4096), uint64_t{8} << 20);
+}
+
+// The record count is net of the segment's metadata grain: a table of 4 MiB
+// gives 1026 grains at 4096 (the table, its header, footer and last
+// neighborhood, and the metadata grain, rounded up to a page), 1025 of them
+// data, so a record of 1026 needs the next table.
+TEST(PyudepotSegmentFor, TheMetadataGrainIsNotDataGrains) {
+    expect_fitted_for(4096, 1, 3);  // the least table: 4 KiB
+    expect_fitted_for(4096, 1024, 1026);
+    expect_fitted_for(4096, 1025, 1026);
+    expect_fitted_for(4096, 1026, 2050);
+    expect_fitted_for(512, 1, 16);
+}
+
+// A one-grain record at a grain of 8192 or more: the 4096-byte table's
+// segment is 2 grains (4096 + 1280 bytes of table room + the metadata grain
+// is under 2 grains, rounded up to whole pages), one short of the 3 the store
+// takes, so the next table gives it. By hand, per grain:
+//  8192:  table 8192: 8192 + 1280 + 8192 = 17664 -> 3 pages of 8192 = 3
+//  32768: table 32768: 32768 + 1280 + 32768 = 66816 -> 3 pages = 3
+//         (tables 8192 and 16384 give 2 pages)
+//  65536: table 65536: 65536 + 1280 + 65536 = 132352 -> 3 pages = 3
+//  1 MiB: table 1 MiB: 1048576 + 1280 + 1048576 = 2098432 -> 3 MiB = 3
+//         (tables up to 512 KiB give 2 MiB)
+TEST(PyudepotSegmentFor, AOneGrainRecordAtALargeGrainIsTheLeastTheStoreTakes) {
+    expect_fitted_for(8192, 1, 3);
+    expect_fitted_for(32768, 1, 3);
+    expect_fitted_for(65536, 1, 3);
+    expect_fitted_for(1u << 20, 1, 3);
+    expect_fitted_for(8192, 2, 3);  // net 2
+    EXPECT_EQ(uDepotSegmentForRecords(8192, 1), 3u * 8192);
+    EXPECT_EQ(uDepotSegmentForRecords(32768, 1), 3u * 32768);
+    EXPECT_EQ(uDepotSegmentForRecords(1u << 20, 1), 3u << 20);
+    // A third data grain takes the next table: 8192 + 1280 + 8192 gives 3
+    // pages, 16384 + 1280 + 8192 gives 4 (3 data).
+    expect_fitted_for(8192, 3, 4);
+}
+
+// The bindings' helper guards its own grain (JNI will call it directly), not
+// only the C wrapper: a grain of 0 would divide by zero.
+TEST(PyudepotSegmentFor, TheHelperRefusesAnInvalidGrainItself) {
+    for (uint32_t g : {0u, 1u, 100u, 511u, 513u, 3u << 20}) {
+        testing::internal::CaptureStderr();
+        const uint64_t seg = udepot_binding::segment_bytes_for_records(g, 2047);
+        const std::string err = testing::internal::GetCapturedStderr();
+        EXPECT_EQ(seg, 0u) << g;
+        EXPECT_NE(err.find("grain size " + std::to_string(g) + " is not valid"),
+                  std::string::npos) << err;
+    }
+}
+
+namespace {
+
+// Opens a store on the segment for `record` grains, on a device of enough
+// segments and a tail, and checks the store took it as given.
+void expect_store_takes(const std::string& path, uint32_t grain,
+                        uint32_t record, int segments) {
+    SCOPED_TRACE("grain " + std::to_string(grain) + ", record " +
+                 std::to_string(record));
+    const uint64_t seg = uDepotSegmentForRecords(grain, record);
+    ASSERT_NE(seg, 0u);
+    void* kv = nullptr;
+    const std::string err = captured_open(
+        path, device_of(segments, seg, grain), grain, seg, &kv);
+    ASSERT_NE(kv, nullptr) << err;
+    EXPECT_EQ(err.find("do not fit"), std::string::npos) << err;
+    ASSERT_EQ(uDepotSegmentBytes(kv), seg) << "the store shrank it: " << err;
+    // The table fills it: the width the segment was fitted for.
+    EXPECT_EQ(uint64_t{8} << table_bits_of(kv),
+              table_of_segment(seg / grain, grain));
+    // The longest record is the record asked for (the cap, 2047, when the
+    // segment is more).
+    const uint64_t net = seg / grain - md_grains_of(grain);
+    const uint64_t longest = std::min<uint64_t>(kMaxRecord, net);
+    EXPECT_GE(longest, record);
+    if (record == kMaxRecord) {
+        EXPECT_EQ(longest, record);
+    }
+    const uint64_t n = longest * grain - 16 - kKeySize;
+    EXPECT_EQ(uDepotMaxValueBytes(kv, kKeySize), n);
+    // A value of that size round-trips; one more byte is refused.
+    std::vector<uint8_t> val(n + 1), out(n);
+    for (size_t i = 0; i < val.size(); ++i) val[i] = uint8_t(i * 7 + 1);
+    const std::string k = key_of(1), k2 = key_of(2);
+    const auto* key = reinterpret_cast<const uint8_t*>(k.data());
+    const auto* key2 = reinterpret_cast<const uint8_t*>(k2.data());
+    ASSERT_EQ(uDepotPut(kv, key, kKeySize, val.data(), n), 0);
+    ASSERT_EQ(uDepotGet(kv, key, kKeySize, out.data(), n), 0);
+    EXPECT_EQ(std::memcmp(val.data(), out.data(), n), 0);
+    EXPECT_NE(uDepotPut(kv, key2, kKeySize, val.data(), n + 1), 0);
+    uDepotClose(kv);
+}
+
+// The segment one fitted size smaller: opens, and refuses the record.
+void expect_smaller_refuses(const std::string& path, uint32_t grain,
+                            uint32_t record, int segments) {
+    SCOPED_TRACE("grain " + std::to_string(grain) + ", record " +
+                 std::to_string(record));
+    const uint64_t seg = uDepotSegmentForRecords(grain, record);
+    ASSERT_NE(seg, 0u);
+    const uint64_t smaller =
+        udepot::fitted_segment_size(table_of_segment(seg / grain, grain) / 2,
+                                    grain) * grain;
+    void* kv = nullptr;
+    const std::string err = captured_open(
+        path, device_of(segments, smaller, grain), grain, smaller, &kv);
+    ASSERT_NE(kv, nullptr) << err;
+    ASSERT_EQ(uDepotSegmentBytes(kv), smaller) << err;
+    const uint64_t need = uint64_t{record} * grain - 16 - kKeySize;
+    EXPECT_LT(uDepotMaxValueBytes(kv, kKeySize), need);
+    std::vector<uint8_t> val(need, 1);
+    const std::string k = key_of(1);
+    EXPECT_NE(uDepotPut(kv, reinterpret_cast<const uint8_t*>(k.data()),
+                        kKeySize, val.data(), need), 0);
+    uDepotClose(kv);
+}
+
+}  // namespace
+
+TEST(PyudepotSegmentFor, TheStoreOpensItUnshrunkWithTheRecord) {
+    TempPath p("segfor");
+    // 512 and 4096 at the default 2047 grains (1 MiB and 8 MiB segments).
+    for (uint32_t g : {512u, 4096u}) {
+        expect_store_takes(p.path, g, kMaxRecord, kSegmentsForRecord);
+        expect_smaller_refuses(p.path, g, kMaxRecord, kSegmentsForRecord);
+    }
+    // 32768, 65536 and 1 MiB grains: the segments for 2047 grains are 64
+    // MiB, 128 MiB and 2 GiB, and a device of 32 of each is 2 GiB and more
+    // to preallocate; their sizes are checked above, and the store is opened
+    // on the fitted segments of smaller records. The largest device is the
+    // 4096 one, 32 x 8200 KiB = 257 MiB.
+    expect_store_takes(p.path, 32768, 127, kSegmentsForRecord);
+    expect_smaller_refuses(p.path, 32768, 127, kSegmentsForRecord);
+    expect_store_takes(p.path, 65536, 31, kSegmentsForRecord);
+    expect_smaller_refuses(p.path, 65536, 31, kSegmentsForRecord);
+    expect_store_takes(p.path, 1u << 20, 4, kSegmentsForRecord);
+    expect_smaller_refuses(p.path, 1u << 20, 4, kSegmentsForRecord);
+}
+
+TEST(PyudepotSegmentFor, ABadGrainOrRecordIsRefusedWithAMessage) {
+    struct Bad { uint32_t grain, record; const char* said; };
+    for (Bad b : {Bad{0, 2047, "grain size 0 is not valid"},
+                  Bad{100, 2047, "grain size 100 is not valid"},
+                  Bad{513, 2047, "grain size 513 is not valid"},
+                  Bad{256, 2047, "grain size 256 is not valid"},
+                  Bad{2u << 20, 2047, "grain size 2097152 is not valid"},
+                  Bad{4096, 0, "a record of 0 grains is not possible"},
+                  Bad{4096, 2048, "a record of 2048 grains is not possible"},
+                  Bad{4096, UINT32_MAX,
+                      "a record of 4294967295 grains is not possible"}}) {
+        testing::internal::CaptureStderr();
+        const uint64_t seg = uDepotSegmentForRecords(b.grain, b.record);
+        const std::string err = testing::internal::GetCapturedStderr();
+        EXPECT_EQ(seg, 0u) << b.grain << " " << b.record;
+        EXPECT_NE(err.find(b.said), std::string::npos)
+            << b.grain << " " << b.record << ": " << err;
+        // A refused grain says what is valid.
+        if (std::string(b.said).find("grain size") == 0) {
+            EXPECT_NE(err.find("a power of two from 512 to 1048576 bytes"),
+                      std::string::npos) << err;
+        }
+    }
+    // The valid ends are not refused, and say nothing.
+    testing::internal::CaptureStderr();
+    EXPECT_NE(uDepotSegmentForRecords(512, 1), 0u);
+    EXPECT_NE(uDepotSegmentForRecords(1u << 20, 2047), 0u);
+    EXPECT_EQ(testing::internal::GetCapturedStderr(), "");
+}
