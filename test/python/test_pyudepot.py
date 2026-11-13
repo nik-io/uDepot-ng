@@ -1491,23 +1491,51 @@ class TestSegmentSizeFor:
 
     @pytest.mark.parametrize("grain,record,said", [
         (0, 2047, "grain_size=0 is not valid"),
-        (100, 2047, "grain size 100 is not valid"),
-        (513, 2047, "grain size 513 is not valid"),
-        (2 * 1048576, 2047, "grain size 2097152 is not valid"),
         (4096, 0, "record_grains=0 is not valid"),
-        (4096, 2048, "a record of 2048 grains is not possible"),
         (4096, -1, "record_grains=-1 is not valid"),
         (4096, 2**32, "record_grains=4294967296 is not valid"),
         (True, 2047, "grain_size=True is not valid"),
+        (4096, False, "record_grains=False is not valid"),
         (4096.0, 2047, "grain_size=4096.0 is not valid"),
         (4096, None, "record_grains=None is not valid"),
+        ("4096", 2047, "grain_size='4096' is not valid"),
     ])
-    def test_bad_input_raises_value_error(self, capfd, grain, record, said):
+    def test_python_refuses_a_bad_type_or_range_without_asking_c(
+            self, capfd, grain, record, said):
         with pytest.raises(ValueError) as e:
             pyudepot.segment_size_for(grain, record)
-        assert "grain_size" in str(e.value) and "record_grains" in str(e.value)
-        err = capfd.readouterr().err
-        assert said in str(e.value) + err, (str(e.value), err)
+        assert said in str(e.value)
+        assert capfd.readouterr().err == ""  # never reached the C layer
+
+    @pytest.mark.parametrize("grain,record,said", [
+        (100, 2047, "grain size 100 is not valid"),
+        (513, 2047, "grain size 513 is not valid"),
+        (2 * 1048576, 2047, "grain size 2097152 is not valid"),
+        (4096, 2048, "a record of 2048 grains is not possible"),
+    ])
+    def test_c_refuses_a_bad_value_and_says_why_on_stderr(
+            self, capfd, grain, record, said):
+        with pytest.raises(ValueError) as e:
+            pyudepot.segment_size_for(grain, record)
+        assert str(e.value).startswith("no segment for grain_size=")
+        assert "(the reason is on stderr)" in str(e.value)
+        assert said in capfd.readouterr().err
+
+    def test_numpy_integers_are_accepted(self):
+        want = pyudepot.segment_size_for(4096, 1025)
+        assert pyudepot.segment_size_for(np.int64(4096), np.uint32(1025)) \
+            == want
+        assert pyudepot.segment_size_for(np.int32(512)) \
+            == pyudepot.segment_size_for(512)
+        with pytest.raises(ValueError):
+            pyudepot.segment_size_for(np.float64(4096))
+        with pytest.raises(ValueError):
+            pyudepot.segment_size_for(np.bool_(True))
+
+    @pytest.mark.parametrize("grain", [8192, 32768, 65536, 1048576])
+    def test_a_one_grain_record_at_a_large_grain(self, grain):
+        # 4096-byte table's segment is 2 grains, under the 3 the store takes.
+        assert pyudepot.segment_size_for(grain, 1) == 3 * grain
 
 
 class TestMaxValue:

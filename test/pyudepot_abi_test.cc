@@ -831,9 +831,13 @@ void expect_fitted_for(uint32_t grain, uint32_t record,
     ASSERT_GE(net, used);
     EXPECT_LT(net - used, std::max<uint64_t>(4096, grain));
     // One fitted segment smaller cannot hold the record.
+    // (Or it is a segment under the least the store takes: a 4096-byte
+    // table in a grain of 8192 or more is 2 grains.)
     if (table > 4096) {
         const uint64_t smaller = udepot::fitted_segment_size(table / 2, grain);
-        EXPECT_LT(smaller - md_grains_of(grain), record);
+        EXPECT_TRUE(smaller - md_grains_of(grain) < record ||
+                    smaller < udepot_binding::min_segment_grains(grain))
+            << smaller;
     }
 }
 
@@ -867,6 +871,43 @@ TEST(PyudepotSegmentFor, TheMetadataGrainIsNotDataGrains) {
     expect_fitted_for(4096, 1025, 1026);
     expect_fitted_for(4096, 1026, 2050);
     expect_fitted_for(512, 1, 16);
+}
+
+// A one-grain record at a grain of 8192 or more: the 4096-byte table's
+// segment is 2 grains (4096 + 1280 bytes of table room + the metadata grain
+// is under 2 grains, rounded up to whole pages), one short of the 3 the store
+// takes, so the next table gives it. By hand, per grain:
+//  8192:  table 8192: 8192 + 1280 + 8192 = 17664 -> 3 pages of 8192 = 3
+//  32768: table 32768: 32768 + 1280 + 32768 = 66816 -> 3 pages = 3
+//         (tables 8192 and 16384 give 2 pages)
+//  65536: table 65536: 65536 + 1280 + 65536 = 132352 -> 3 pages = 3
+//  1 MiB: table 1 MiB: 1048576 + 1280 + 1048576 = 2098432 -> 3 MiB = 3
+//         (tables up to 512 KiB give 2 MiB)
+TEST(PyudepotSegmentFor, AOneGrainRecordAtALargeGrainIsTheLeastTheStoreTakes) {
+    expect_fitted_for(8192, 1, 3);
+    expect_fitted_for(32768, 1, 3);
+    expect_fitted_for(65536, 1, 3);
+    expect_fitted_for(1u << 20, 1, 3);
+    expect_fitted_for(8192, 2, 3);  // net 2
+    EXPECT_EQ(uDepotSegmentForRecords(8192, 1), 3u * 8192);
+    EXPECT_EQ(uDepotSegmentForRecords(32768, 1), 3u * 32768);
+    EXPECT_EQ(uDepotSegmentForRecords(1u << 20, 1), 3u << 20);
+    // A third data grain takes the next table: 8192 + 1280 + 8192 gives 3
+    // pages, 16384 + 1280 + 8192 gives 4 (3 data).
+    expect_fitted_for(8192, 3, 4);
+}
+
+// The bindings' helper guards its own grain (JNI will call it directly), not
+// only the C wrapper: a grain of 0 would divide by zero.
+TEST(PyudepotSegmentFor, TheHelperRefusesAnInvalidGrainItself) {
+    for (uint32_t g : {0u, 1u, 100u, 511u, 513u, 3u << 20}) {
+        testing::internal::CaptureStderr();
+        const uint64_t seg = udepot_binding::segment_bytes_for_records(g, 2047);
+        const std::string err = testing::internal::GetCapturedStderr();
+        EXPECT_EQ(seg, 0u) << g;
+        EXPECT_NE(err.find("grain size " + std::to_string(g) + " is not valid"),
+                  std::string::npos) << err;
+    }
 }
 
 namespace {
@@ -939,19 +980,22 @@ void expect_smaller_refuses(const std::string& path, uint32_t grain,
 
 TEST(PyudepotSegmentFor, TheStoreOpensItUnshrunkWithTheRecord) {
     TempPath p("segfor");
-    // 512 and 4096 at the default 2047 grains; 32768 too (a 64 MiB segment).
-    for (uint32_t g : {512u, 4096u, 32768u}) {
+    // 512 and 4096 at the default 2047 grains (1 MiB and 8 MiB segments).
+    for (uint32_t g : {512u, 4096u}) {
         expect_store_takes(p.path, g, kMaxRecord, kSegmentsForRecord);
         expect_smaller_refuses(p.path, g, kMaxRecord, kSegmentsForRecord);
     }
-    // 65536 and 1 MiB grains: the segments for 2047 grains are 128 MiB and
-    // 2 GiB, too much to preallocate a device of here; their sizes are
-    // checked above, and the store is opened on the fitted segments of
-    // smaller records.
+    // 32768, 65536 and 1 MiB grains: the segments for 2047 grains are 64
+    // MiB, 128 MiB and 2 GiB, and a device of 32 of each is 2 GiB and more
+    // to preallocate; their sizes are checked above, and the store is opened
+    // on the fitted segments of smaller records. The largest device is the
+    // 4096 one, 32 x 8200 KiB = 257 MiB.
+    expect_store_takes(p.path, 32768, 127, kSegmentsForRecord);
+    expect_smaller_refuses(p.path, 32768, 127, kSegmentsForRecord);
     expect_store_takes(p.path, 65536, 31, kSegmentsForRecord);
     expect_smaller_refuses(p.path, 65536, 31, kSegmentsForRecord);
-    expect_store_takes(p.path, 1u << 20, 8, kSegmentsForRecord);
-    expect_smaller_refuses(p.path, 1u << 20, 8, kSegmentsForRecord);
+    expect_store_takes(p.path, 1u << 20, 4, kSegmentsForRecord);
+    expect_smaller_refuses(p.path, 1u << 20, 4, kSegmentsForRecord);
 }
 
 TEST(PyudepotSegmentFor, ABadGrainOrRecordIsRefusedWithAMessage) {

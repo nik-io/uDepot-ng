@@ -77,30 +77,11 @@ extern "C" {
 
 static constexpr uint32_t kDefaultGrainBytes = 4096;
 
-// The StoreConfig::grain_size values the AIO store works with, which the
-// store itself does not check (uDepot::open takes any):
-//  - a power of two: below 4096, `sanitize` in uDepot::open rounds a segment
-//    to whole 4096-byte pages by 4096 / grain, which needs a divisor of
-//    4096. At and above 4096 the store needs no such thing that anyone has
-//    found, but only powers of two (uDepot's grains) are ever run, so
-//    nothing else is let in;
-//  - at least 512: the store file is opened O_DIRECT (open_direct), whose
-//    offsets and lengths must be a multiple of the device's logical block
-//    size, 512 at the smallest (a larger one is checked against the
-//    backing, direct_io_alignment); every record, segment and metadata I/O
-//    is a multiple of the grain;
-//  - at most 1 MiB: a record is at most HashEntry::kKvSizeMask = 2047 grains
-//    and is written with one pwrite, which Linux caps at MAX_RW_COUNT =
-//    INT_MAX & PAGE_MASK = 2147479552 bytes. 2047 grains of 1 MiB are
-//    2146435072; of 2 MiB they are twice that, and put would fail with -EIO
-//    (store.cc, put_record: written != total) with no message.
-static constexpr uint32_t kMinGrainBytes = 512;
-static constexpr uint32_t kMaxGrainBytes = uint32_t{1} << 20;
-
-static bool grain_is_valid(uint32_t grain) {
-    return grain >= kMinGrainBytes && grain <= kMaxGrainBytes &&
-           (grain & (grain - 1)) == 0;
-}
+// The grains the store works with (kMinGrainBytes .. kMaxGrainBytes, powers
+// of two): src/bindings/segment_check.h, which says why.
+using udepot_binding::grain_is_valid;
+using udepot_binding::kMaxGrainBytes;
+using udepot_binding::kMinGrainBytes;
 
 void* uDepotOpenSegment(const char* fname, uint64_t size, int force_destroy,
                         uint32_t queue_depth, uint32_t grain_bytes,
@@ -148,12 +129,6 @@ void* uDepotOpenSegment(const char* fname, uint64_t size, int force_destroy,
 
 uint64_t uDepotSegmentForRecords(uint32_t grain_bytes,
                                  uint32_t record_grains) {
-    if (!grain_is_valid(grain_bytes)) {
-        fprintf(stderr, "uDepot-ng: grain size %u is not valid: it must be "
-                "a power of two from %u to %u bytes\n", grain_bytes,
-                kMinGrainBytes, kMaxGrainBytes);
-        return 0;
-    }
     return udepot_binding::segment_bytes_for_records(grain_bytes,
                                                      record_grains);
 }

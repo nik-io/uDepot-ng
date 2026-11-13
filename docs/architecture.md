@@ -829,7 +829,10 @@ would refuse or a `record_grains` outside 1 .. 2047). It is the smallest
 *fitted* segment (rule 10) whose data grains, the segment less
 `seg_md_grains_`, hold the record: the segment of the smallest power-of-two
 table, from 4096 bytes, for which `fitted_segment_size(table, grain)` less the
-metadata grain is at least `record_grains`
+metadata grain is at least `record_grains` and the segment is at least
+`min_segment_grains` (3 grains from 4096 up: a 4096-byte table at grain 8192 or
+more is a segment of 2 grains, which the store does not take, so a one-grain
+record there gets 3 grains: 24 KiB at 8192, 96 KiB at 32768, 3 MiB at 1 MiB)
 (`segment_bytes_for_records`, `src/bindings/segment_check.h`, which calls the
 store's `fitted_segment_size`: no constant is copied). It is not a power of
 two of bytes, because that leaves the table half the segment: at grain 4096 a

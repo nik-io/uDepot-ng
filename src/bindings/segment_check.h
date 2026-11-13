@@ -16,6 +16,31 @@
 
 namespace udepot_binding {
 
+// The StoreConfig::grain_size values the AIO store works with, which the
+// store itself does not check (uDepot::open takes any):
+//  - a power of two: below 4096, `sanitize` in uDepot::open rounds a segment
+//    to whole 4096-byte pages by 4096 / grain, which needs a divisor of
+//    4096. At and above 4096 the store needs no such thing that anyone has
+//    found, but only powers of two (uDepot's grains) are ever run, so
+//    nothing else is let in;
+//  - at least 512: the store file is opened O_DIRECT (open_direct), whose
+//    offsets and lengths must be a multiple of the device's logical block
+//    size, 512 at the smallest (a larger one is checked against the
+//    backing, direct_io_alignment); every record, segment and metadata I/O
+//    is a multiple of the grain;
+//  - at most 1 MiB: a record is at most HashEntry::kKvSizeMask = 2047 grains
+//    and is written with one pwrite, which Linux caps at MAX_RW_COUNT =
+//    INT_MAX & PAGE_MASK = 2147479552 bytes. 2047 grains of 1 MiB are
+//    2146435072; of 2 MiB they are twice that, and put would fail with -EIO
+//    (store.cc, put_record: written != total) with no message.
+constexpr uint32_t kMinGrainBytes = 512;
+constexpr uint32_t kMaxGrainBytes = uint32_t{1} << 20;
+
+inline bool grain_is_valid(uint32_t grain) {
+    return grain >= kMinGrainBytes && grain <= kMaxGrainBytes &&
+           (grain & (grain - 1)) == 0;
+}
+
 // The grains of a segment that are its salsa metadata, not data
 // (seg_md_grains_, uDepot::open: align_up(sizeof(salsa_seg_md), grain) /
 // grain).
@@ -99,20 +124,29 @@ inline bool check_segment_size(uint64_t segment_bytes, uint32_t grain_bytes) {
 
 // The smallest segment, in bytes, that holds a record of record_grains
 // grains and is fitted: the segment of the smallest power-of-two table (from
-// 4096 bytes) whose data grains (the segment less seg_md_grains) are at
-// least record_grains. A record lives whole in one segment's data grains
+// 4096 bytes) whose segment has at least record_grains data grains (the
+// segment less seg_md_grains) and at least min_segment_grains, the least the
+// store takes (a table of 4096 bytes in a grain of 8192 or more is a segment
+// of 2 grains, one short of it, so a one-grain record at those grains takes
+// the next table). A record lives whole in one segment's data grains
 // (uDepot::max_record_grains), so a caller sizing a store for its largest
 // record needs this, and the fitted size rather than a power of two of
 // bytes: the table fills a fitted segment, and half of a power-of-two one
 // (CLAUDE.md, rule 10; fitted_segment_size). At grain 4096 a segment of 2048
 // grains gets a 4 MiB table in its 8 MiB, the fitted one of 2050 a full 8
-// MiB table. grain must be a valid grain (the caller checks). Returns 0,
-// with a message on stderr, for record_grains outside 1 .. 2047 (a hash
-// entry's size field, HashEntry::kKvSizeMask, bounds a record) or for a
-// result the store would not take (never, but check_segment_size is the
-// bindings' one authority on that).
+// MiB table. Returns 0, with a message on stderr, for a grain that is not a
+// valid one (grain_is_valid), record_grains outside 1 .. 2047 (a hash
+// entry's size field, HashEntry::kKvSizeMask, bounds a record) or a result
+// the store would not take (never, but check_segment_size is the bindings'
+// one authority on that).
 inline uint64_t segment_bytes_for_records(uint32_t grain_bytes,
                                           uint32_t record_grains) {
+    if (!grain_is_valid(grain_bytes)) {
+        fprintf(stderr, "uDepot-ng: grain size %u is not valid: it must be "
+                "a power of two from %u to %u bytes\n", grain_bytes,
+                kMinGrainBytes, kMaxGrainBytes);
+        return 0;
+    }
     if (record_grains < 1 || record_grains > udepot::HashEntry::kKvSizeMask) {
         fprintf(stderr, "uDepot-ng: a record of %u grains is not possible: "
                 "a record is 1 to %u grains (a hash entry's size field)\n",
@@ -121,11 +155,12 @@ inline uint64_t segment_bytes_for_records(uint32_t grain_bytes,
         return 0;
     }
     const uint64_t md = seg_md_grains(grain_bytes);
+    const uint64_t least = min_segment_grains(grain_bytes);
     uint64_t table = 4096;
     uint64_t grains = udepot::fitted_segment_size(table, grain_bytes);
     // Terminates: record_grains <= 2047, so a table of 2047 grains of the
     // largest grain (2^31 bytes) is enough.
-    while (grains - md < record_grains) {
+    while (grains - md < record_grains || grains < least) {
         table <<= 1;
         grains = udepot::fitted_segment_size(table, grain_bytes);
     }

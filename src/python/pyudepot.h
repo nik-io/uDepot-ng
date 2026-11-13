@@ -51,7 +51,10 @@ DLLOUT void* uDepotOpenSegment(const char* fname, uint64_t size,
 // The smallest segment, in bytes, that holds a record of record_grains grains
 // (1 to 2047; a record is at most min(2047, segment grains less the
 // segment's metadata grain)) and is fitted: the segment of the smallest
-// power-of-two table (fitted_segment_size), so that the table fills it. Pass
+// power-of-two table (fitted_segment_size) that holds the record and is at
+// least the least segment the store takes (3 grains at grain 4096 or more, so
+// a one-grain record at 8192 or more gets a table of 8 KiB or more, not the
+// 4 KiB one of 2 grains), so that the table fills it. Pass
 // it as segment_bytes. 0, with a message on stderr, for a grain uDepotOpenGrain
 // would refuse or a record_grains outside 1 .. 2047.
 DLLOUT uint64_t uDepotSegmentForRecords(uint32_t grain_bytes,
