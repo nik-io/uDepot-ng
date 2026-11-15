@@ -1,7 +1,8 @@
 // Copyright (c) 2024-2026 Nikolas Ioannou
 // SPDX-License-Identifier: BSD-3-Clause
 
-// uDepotMultiGetBuf, the C ABI under pyudepot's multi_get_into, called as
+// uDepotMultiGetBuf and uDepotMultiPutBuf, the C ABI under pyudepot's
+// multi_get_into and multi_put_buffers, called as
 // the binding calls it. pyudepot.cc is compiled into this test (not loaded
 // from libpyudepot.so) so that the store's test hooks are the same objects.
 
@@ -173,6 +174,91 @@ TEST(PyudepotMultiGet, TheWindowFollowsTheThreadNotTheStore) {
         for (int r : c.results) EXPECT_EQ(r, 0);
         EXPECT_EQ(udepot::AioIO::thread_queue_room(), 8u);
     }).join();
+}
+
+// uDepotMultiPutBuf, as the binding calls it: n puts from PutBuffers, one
+// call, one result per key. The window is the one uDepotMultiGetBuf takes
+// (the thread's AIO context, not the store's queue depth), and a put that
+// fails is reported at its index without stopping the others.
+namespace {
+
+struct PutBatch {
+    void* kv;
+    std::vector<std::string> keys;
+    std::vector<const uint8_t*> key_ptrs;
+    std::vector<uint32_t> key_sizes;
+    std::vector<void*> bufs;
+    std::vector<int> results;
+    PutBatch(void* store, int n) : kv(store), results(n, kUnset) {
+        keys.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            keys.push_back(key_of(i));
+            void* pb = uDepotAllocPutBuffer(kv, kKeySize, kValSize);
+            bufs.push_back(pb);
+            uint64_t size = 0;
+            uint8_t* v = uDepotPutBufferValue(pb, &size);
+            std::memset(v, 1 + i % 200, size);
+        }
+        for (int i = 0; i < n; ++i) {
+            key_ptrs.push_back(
+                reinterpret_cast<const uint8_t*>(keys[i].data()));
+            key_sizes.push_back(kKeySize);
+        }
+    }
+    ~PutBatch() {
+        for (void* b : bufs) uDepotFreePutBuffer(b);
+    }
+    int run() {
+        return uDepotMultiPutBuf(kv, static_cast<uint32_t>(keys.size()),
+                                 key_ptrs.data(), key_sizes.data(),
+                                 bufs.data(), results.data());
+    }
+};
+
+// The value uDepotGet reads back for key i, or its rc if that is not 0.
+int get_value(void* kv, int i, std::vector<uint8_t>* out) {
+    const std::string k = key_of(i);
+    out->assign(kValSize + 8, 0);
+    return uDepotGet(kv, reinterpret_cast<const uint8_t*>(k.data()), kKeySize,
+                     out->data(), out->size());
+}
+
+}  // namespace
+
+TEST(PyudepotMultiPut, TheAbiStoresEveryKeyAndReportsAFailureAtItsIndex) {
+    TempStore s("mput", 64 << 20, 8);
+    ASSERT_NE(s.kv, nullptr);
+    PutBatch b(s.kv, 50);
+    uDepotFreePutBuffer(b.bufs[20]);
+    b.bufs[20] = uDepotAllocPutBuffer(s.kv, kKeySize + 1, kValSize);
+    ASSERT_EQ(b.run(), 0);
+    for (int i = 0; i < 50; ++i) {
+        std::vector<uint8_t> v;
+        if (i == 20) {
+            EXPECT_EQ(b.results[i], -EINVAL);
+            EXPECT_NE(get_value(s.kv, i, &v), 0);
+            continue;
+        }
+        EXPECT_EQ(b.results[i], 0) << i;
+        ASSERT_EQ(get_value(s.kv, i, &v), 0) << i;
+        EXPECT_EQ(v[0], 1 + i % 200) << i;
+        EXPECT_EQ(v[kValSize - 1], 1 + i % 200) << i;
+    }
+}
+
+TEST(PyudepotMultiPut, TheWindowFollowsTheThreadNotTheStore) {
+    const int n = std::max(4096, 16 * get_nprocs_conf() + 1024);
+    TempStore deep("mput_deep", 128 << 20, 0);  // the default depth, 1024
+    ASSERT_NE(deep.kv, nullptr);
+    TempStore shallow("mput_shallow", 8 << 20, 8);  // resizes this thread's context
+    ASSERT_NE(shallow.kv, nullptr);
+    ASSERT_EQ(udepot::AioIO::thread_queue_room(), 8u);
+
+    PutBatch b(deep.kv, n);
+    ASSERT_EQ(b.run(), 0);
+    int bad = 0;
+    for (int r : b.results) bad += r != 0;
+    EXPECT_EQ(bad, 0) << "puts failed (-EAGAIN) past the thread's context";
 }
 
 // uDepotOpenGrain: the grain is the caller's, and an invalid one fails the

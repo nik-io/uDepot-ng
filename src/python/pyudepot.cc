@@ -17,6 +17,7 @@
 
 #include "sto-ctlr/sto-capacity-mgr-parameters.h"
 #include "udepot/multi_get.h"
+#include "udepot/multi_put.h"
 #include "bindings/segment_check.h"
 #include "udepot/store.h"
 #include "udepot/io/aio.h"
@@ -222,6 +223,19 @@ int uDepotPutBuf(void* kv, const uint8_t key[], uint32_t key_size,
     auto key_span = std::span<const uint8_t>(key, key_size);
     return store->put(key_span, *static_cast<udepot::PutBuffer*>(put_buf))
         .run_sync();
+}
+
+int uDepotMultiPutBuf(void* kv, uint32_t n, const uint8_t* const keys[],
+                      const uint32_t key_sizes[], void* const put_bufs[],
+                      int results[]) {
+    auto* store = static_cast<Store*>(kv);
+    // The window of uDepotMultiGetBuf: a put holds one queue entry at a time.
+    const unsigned window =
+        std::min(store->io().queue_depth(), udepot::AioIO::thread_queue_room());
+    return udepot::multi_put(
+        *store, n, keys, key_sizes,
+        reinterpret_cast<udepot::PutBuffer* const*>(put_bufs), results,
+        window);
 }
 
 void uDepotFreePutBuffer(void* put_buf) {

@@ -630,6 +630,7 @@ uDepot-ng/
 │   ├── buffer.h                 # IoBuffer, allocator tags
 │   ├── coro.h                   # CoroTask (eager start, symmetric transfer)
 │   ├── multi_get.h              # N gets on one thread, windowed by queue depth
+│   ├── multi_put.h              # N puts on one thread, same window
 │   └── io/
 │       ├── backend.h            # IoBackend concept
 │       ├── posix.h              # pread/pwrite (sync)
@@ -701,11 +702,12 @@ calling thread except the batch below:
 | open/close | `uDepotOpen`, `uDepotOpenQueue` (+ `queue_depth`), `uDepotOpenGrain` (+ `grain_bytes`), `uDepotOpenSegment` (+ `segment_bytes`), `uDepotClose` |
 | copying | `uDepotGet`, `uDepotPut`, `uDepotDel`, `uDepotExists` |
 | zero copy | `uDepotAllocPutBuffer`, `uDepotPutBufferValue`, `uDepotPutBuf`, `uDepotFreePutBuffer`, `uDepotAllocGetBuffer`, `uDepotNewGetBuffer`, `uDepotGetBuf`, `uDepotGetBufferValue`, `uDepotFreeGetBuffer`, `uDepotThreadValueCopies` |
-| batch | `uDepotMultiGetBuf` |
+| batch | `uDepotMultiGetBuf`, `uDepotMultiPutBuf` |
 | geometry | `uDepotMaxValueBytes`, `uDepotGrainBytes`, `uDepotSegmentBytes` |
 
 The Python `uDepot` class (`python/pyudepot/uDepot.py`) exposes `get`, `put`,
-`delete`, `exists`, the zero-copy calls below, `multi_get_into`, and the
+`delete`, `exists`, the zero-copy calls below, `multi_get_into`,
+`multi_put_buffers`, and the
 store's geometry as `open()` ended up with it: `max_value_bytes(key_size)` (the
 longest value a put under such a key can store, see "Largest record"),
 `grain_size()` and `segment_size()` in bytes, read from the open store in C++
@@ -915,7 +917,7 @@ data comes back; `test_data_survives_a_close_and_a_reopen_in_this_process`).
 It is idempotent, and `with pyudepot.uDepot(...) as kv:` closes on exit, also
 on an exception. Every other method then raises `ValueError("uDepot store is
 closed")` (all of them go through `_handle()`; `test_every_method_raises_closed_after_close`
-lists them, `multi_get_into` and the buffer calls included), rather than passing
+lists them, `multi_get_into`, `multi_put_buffers` and the buffer calls included), rather than passing
 the freed pointer to C. As in uDepot, no call on the store may be in progress
 on another thread, or follow, when it is closed: `close()` is not a lock.
 
@@ -974,6 +976,50 @@ and uses no threads and no locks.
   starts, so a batch is serial gets: correct, not concurrent.
 - **Shared arrays.** The arrays from `.value` are writable, and one shared
   between threads is the caller's to synchronise.
+
+### multi_put_buffers: N puts, one thread, one call
+
+```c
+int uDepotMultiPutBuf(void* kv, uint32_t n, const uint8_t* const keys[],
+                      const uint32_t key_sizes[], void* const put_bufs[],
+                      int results[]);
+```
+
+`kv.multi_put_buffers(keys, bufs)` is `put_buffer(keys[i], bufs[i])` for every
+`i` (`PutBuffer`s of this store), as one ctypes call. `udepot::multi_put`
+(`src/udepot/multi_put.h`) is `multi_get`'s slot loop for the write side: the
+same eager-start coroutines, the same window (a put holds one queue entry at a
+time: its record's write, then its key's probe reads), no threads, no locks.
+Each put writes from its `PutBuffer`, so no value is copied. Legacy uDepot has
+no batched put: its memcache front end batches gets (`cmd::handle_multiget`,
+`src/uDepot/net/mc-helpers.cc:245`) but serves each set with one `kv.put`
+(`mc-helpers.cc:533`).
+
+- **Order.** Puts of equal keys in one batch run one after another, in list
+  order, so the last one holds the key afterwards, as serial puts would; a
+  failed one does not stop the later ones. Puts of different keys overlap.
+  Concurrent puts of one key would otherwise end with whichever committed
+  last (`commit_put` sends the older record back to be rewritten, `kRewrite`),
+  not with the last in the list. The batch finds equal keys by
+  sorting the indices, before anything starts.
+- **Errors.** Returns `None` when every put succeeded. Any failure (`-EAGAIN`,
+  `-EINVAL`, an I/O error, no space) raises `pyudepot.MultiPutError` (an
+  `IOError`, `errno`/`strerror` of the first failure) after every other put has
+  been processed. Its `failed` attribute is the list of `(index, rc)` of every
+  failed put, as `MultiGetError`'s; the keys not listed were stored. (`put_buffer`
+  still returns `False` for a failure.)
+- **Arguments** are checked before anything is stored: keys are C-contiguous
+  1-d `uint8` arrays, each of the `key_size` its buffer was allocated for, and
+  the buffers distinct `PutBuffer`s of this store (a put writes its buffer's
+  header in place, so one buffer serves one put); `ValueError` otherwise.
+- **The window** bounds the calling thread's queue only. A put that waits for
+  space (or for a table grow) is resumed on the store's space-waker thread and
+  issues its I/O from there (`resume_waiters`), into that thread's AIO
+  context, sized at the depth of the store opened last; a wide batch on a
+  store that is out of space can find that context full and fail those puts
+  with `-EAGAIN`, reported like any other failure. Single puts that wait share
+  the waker the same way; a batch makes one thread enough to fill it.
+- **Backends** as `multi_get_into`: on `PosixIO` a batch is serial puts.
 
 ### Zero-copy values from Python
 
