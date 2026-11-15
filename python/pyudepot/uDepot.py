@@ -65,6 +65,7 @@ pygetvalue = libudepot.uDepotGetBufferValue
 pyfreeget = libudepot.uDepotFreeGetBuffer
 pycopies = libudepot.uDepotThreadValueCopies
 pymultiget = libudepot.uDepotMultiGetBuf
+pymultiput = libudepot.uDepotMultiPutBuf
 
 pyallocput.argtypes = [c_void_p, c_uint, c_ulonglong]
 pyallocput.restype = c_void_p
@@ -93,6 +94,9 @@ pycopies.restype = c_ulonglong
 pymultiget.argtypes = [c_void_p, c_uint, c_void_p, c_void_p, c_void_p,
                        c_void_p]
 pymultiget.restype = c_int
+pymultiput.argtypes = [c_void_p, c_uint, c_void_p, c_void_p, c_void_p,
+                       c_void_p]
+pymultiput.restype = c_int
 
 
 def thread_value_copies():
@@ -240,6 +244,20 @@ class MultiGetError(IOError):
     `failed` is the list of (index, rc) of every such key, index into the
     `keys` passed, in batch order, rc a negative errno as the C layer returns
     it. The keys not listed were read or are missing (their buffers say which).
+    """
+
+    def __init__(self, failed, errno_, msg):
+        super().__init__(errno_, msg)
+        self.failed = failed
+
+
+class MultiPutError(IOError):
+    """multi_put_buffers: some puts failed.
+
+    An IOError (OSError) whose errno/strerror are those of the first failure.
+    `failed` is the list of (index, rc) of every failed put, index into the
+    `keys` passed, in batch order, rc a negative errno as the C layer returns
+    it. The keys not listed were stored.
     """
 
     def __init__(self, failed, errno_, msg):
@@ -516,6 +534,69 @@ class uDepot:
                 raise MemoryError('cannot allocate a get buffer')
             owned = _Owned(handle, _free_get)
         return owned
+
+    def multi_put_buffers(self, keys, bufs):
+        """put_buffer for every keys[i] and bufs[i], with the puts in flight
+        together on this thread (one C call, no threads): up to the smaller of
+        the store's queue_depth and this thread's AIO context room at once,
+        each new one starting as another completes, as multi_get_into does.
+        Copies nothing: each put writes from its PutBuffer, as put_buffer.
+        Returns None when every put succeeded. Any failure (-EAGAIN, an I/O
+        error, no space) raises MultiPutError (an IOError) naming the first
+        failed key and its error, after every other put has been processed:
+        the keys not in its `failed` attribute, a list of (index, rc) with
+        indices into `keys` and rc a negative errno, were stored. (put_buffer
+        returns False for a failure; this raises, as multi_get_into does for
+        a get that is not a missing key.)
+
+        Equal keys in one batch are stored in list order, one after another,
+        so the last one wins, as for serial put_buffer calls; a put that
+        fails does not stop the later ones. Different keys overlap.
+
+        keys are C-contiguous uint8 arrays, each of the key_size its buffer
+        was allocated for; bufs are PutBuffers of this store, all different (a
+        buffer serves one put): ValueError otherwise, before anything is
+        stored. The buffers can be filled and put again once this returns.
+        """
+        kv = self._handle()
+        n = len(keys)
+        if len(bufs) != n:
+            raise ValueError('{} keys but {} buffers'.format(n, len(bufs)))
+        if len({id(b) for b in bufs}) != n:
+            raise ValueError(
+                'a PutBuffer appears more than once: one buffer serves one '
+                'put, so each key needs its own')
+        for k in keys:
+            if (not isinstance(k, np.ndarray) or k.dtype != np.uint8
+                    or k.ndim != 1 or not k.flags.c_contiguous):
+                raise ValueError('a key is not a C-contiguous 1-d uint8 array')
+        for b in bufs:
+            self._own(b, PutBuffer)
+        for i in range(n):
+            if keys[i].size != bufs[i].key_size:
+                raise ValueError(
+                    'key {} has {} bytes, its PutBuffer was allocated for {}'
+                    .format(i, keys[i].size, bufs[i].key_size))
+        if n == 0:
+            return None
+        c_keys = (c_void_p * n)(*[k.ctypes.data for k in keys])
+        c_sizes = (c_uint * n)(*[k.size for k in keys])
+        c_bufs = (c_void_p * n)(*[b._owned.handle for b in bufs])
+        results = (c_int * n)()
+        rc = pymultiput(kv, n, c_keys, c_sizes, c_bufs, results)
+        if rc != 0:
+            raise MemoryError('multi_put_buffers: out of memory (rc={})'
+                              .format(rc))
+        failed = [(i, results[i]) for i in range(n) if results[i] != 0]
+        for i, r in failed:
+            logging.info('pymultiput key %d returned=%d', i, r)
+        if failed:
+            i, rc = failed[0]
+            raise MultiPutError(
+                failed, -rc, 'multi_put_buffers: {} of {} puts failed; the '
+                'first, key {}: {}. The others were stored; retry the failed '
+                'ones'.format(len(failed), n, i, os.strerror(-rc)))
+        return None
 
     def multi_get_into(self, keys, bufs):
         """get_into for every keys[i] and bufs[i], with the gets in flight
