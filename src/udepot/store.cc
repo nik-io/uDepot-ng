@@ -2514,14 +2514,17 @@ CoroTask<int> uDepot<IO>::get_record(std::span<const uint8_t> key,
         if (std::memcmp(p + sizeof(hdr), key.data(), key.size()) != 0)
             continue;
 
-#ifndef NDEBUG
-        // Debug-only CRC verification (matches uDepot's _UDEPOT_DATA_DEBUG_VERIFY).
+#ifdef UDEPOT_DATA_DEBUG_VERIFY
+        // Data verification builds only (CMake UDEPOT_DATA_DEBUG_VERIFY, off
+        // by default). Legacy uDepot checks a record's CRC only at recovery,
+        // as this store does (crash_recovery's log scan; GC too); its
+        // _UDEPOT_DATA_DEBUG_VERIFY reads each put back instead
+        // (udepot-lsa.cc:566). This checks the record a get returns.
         {
             KvSuffix suffix;
             std::memcpy(&suffix, p + sizeof(hdr) + hdr.key_size + hdr.val_size,
                         sizeof(suffix));
-            uint16_t expected = compute_crc16(hdr);
-            if (suffix.crc16 != expected) co_return -EIO;
+            if (suffix.crc16 != compute_crc16(hdr)) co_return -EBADMSG;
         }
 #endif
 

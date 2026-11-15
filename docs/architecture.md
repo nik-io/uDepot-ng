@@ -1090,7 +1090,12 @@ segment's timestamp, over the header, then over the device seed, truncated to
 16 bits.
 
 Recovery and GC accept a record only if its header carries its segment's
-timestamp *and* the checksum matches; uDepot checks the checksum alone. The
+timestamp *and* the checksum matches; uDepot checks the checksum alone. A get
+does not check it, as in uDepot, unless the library is built with
+`-DUDEPOT_DATA_DEBUG_VERIFY=ON` (off by default; uDepot's
+`_UDEPOT_DATA_DEBUG_VERIFY` is likewise off): then a get whose record fails it
+returns `-EBADMSG`. `NDEBUG` does not decide it, so a default (no build type)
+or Debug build behaves as Release here. The
 timestamp check is what rejects records left from a segment's previous use:
 CRC32 is linear, so for a given pair of old and new segment timestamps the
 16-bit checksum of every stale record either passes or fails alike (about one

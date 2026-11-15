@@ -12,6 +12,9 @@ option(UDEPOT_BUILD_NET    "Build network/memcache server"  ON)
 option(UDEPOT_BUILD_PYTHON "Build pyudepot shared library"  ON)
 option(UDEPOT_BUILD_JNI    "Build JNI bindings"              OFF)
 option(UDEPOT_BUILD_TESTS  "Build test suite"               ON)
+# Off by default, as legacy uDepot's _UDEPOT_DATA_DEBUG_VERIFY: a data
+# verification build, not something NDEBUG decides.
+option(UDEPOT_DATA_DEBUG_VERIFY "Check each record's CRC on get (-EBADMSG)" OFF)
 
 # Vendored dependencies — built before our warning flags so -Werror
 # doesn't hit vendored code.
@@ -47,6 +50,10 @@ target_include_directories(udepot PUBLIC
 )
 target_compile_features(udepot PUBLIC cxx_std_23)
 set_target_properties(udepot PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# PUBLIC, so the tests know which behaviour the library was built with.
+if(UDEPOT_DATA_DEBUG_VERIFY)
+    target_compile_definitions(udepot PUBLIC UDEPOT_DATA_DEBUG_VERIFY=1)
+endif()
 target_link_libraries(udepot PUBLIC salsa cityhash)
 
 # ── io_uring backend ─────────────────────────────────────────────────────────
