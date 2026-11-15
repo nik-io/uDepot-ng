@@ -183,6 +183,8 @@ class TestClose:
             "get_into": lambda: kv.get_into(key, gb),
             "multi_get_into": lambda: kv.multi_get_into([key], [gb]),
             "multi_get_into (none)": lambda: kv.multi_get_into([], []),
+            "multi_put_buffers": lambda: kv.multi_put_buffers([key], [pb]),
+            "multi_put_buffers (none)": lambda: kv.multi_put_buffers([], []),
         }
         for name, call in calls.items():
             with pytest.raises(ValueError,
@@ -1238,6 +1240,177 @@ class TestMultiGetInto:
                                       queue_depth=W)
             bufs = [deep.alloc_get_buffer(13, 100) for _ in keys]
             assert deep.multi_get_into(keys, bufs) == [True] * n
+        finally:
+            if shallow:
+                shallow.close()
+            deep.close()
+
+
+def _put_bufs(kv, ids, gen=0):
+    """PutBuffers holding _bytes_of(300, 1000 * gen + i) for each i in ids."""
+    bufs = []
+    for i in ids:
+        pb = kv.alloc_put_buffer(13, 300)
+        pb.value[:] = _bytes_of(300, 1000 * gen + i)
+        bufs.append(pb)
+    return bufs
+
+
+def _stored(kv, i):
+    """The value under _mkey(i), or None if it is missing."""
+    gb = kv.alloc_get_buffer(13, 300)
+    return gb.value.copy() if kv.get_into(_mkey(i), gb) else None
+
+
+class TestMultiPutBuffers:
+    @pytest.mark.parametrize("n", [0, 1, 2, W - 1, W, W + 1, 4 * W, 200])
+    def test_each_key_is_stored_with_its_own_value(self, qstore, n):
+        ids = list(range(n))
+        assert qstore.multi_put_buffers([_mkey(i) for i in ids],
+                                        _put_bufs(qstore, ids, n)) is None
+        for i in ids:
+            np.testing.assert_array_equal(_stored(qstore, i),
+                                          _bytes_of(300, 1000 * n + i))
+
+    def test_a_batch_far_past_the_kernels_queue_floor_needs_the_window(
+            self, tmp_path):
+        # As the multi_get_into test: with every put in flight at once,
+        # some would get -EAGAIN.
+        n = max(4096, 16 * (os.cpu_count() or 1) + 1024)
+        kv = pyudepot.uDepot(file_name=str(tmp_path / "wide"),
+                             size=64 * 1024 * 1024, force_destroy=True,
+                             queue_depth=W)
+        try:
+            data = _bytes_of(100, 3)
+            bufs = []
+            for _ in range(n):
+                pb = kv.alloc_put_buffer(13, 100)
+                pb.value[:] = data
+                bufs.append(pb)
+            assert kv.multi_put_buffers([_mkey(i) for i in range(n)],
+                                        bufs) is None
+            for i in range(n):
+                gb = kv.alloc_get_buffer(13, 100)
+                assert kv.get_into(_mkey(i), gb)
+                np.testing.assert_array_equal(gb.value, data)
+        finally:
+            kv.close()
+
+    def test_the_last_of_equal_keys_wins(self, qstore):
+        ids = [k for _ in range(5) for k in range(6)]  # wider than W
+        bufs = []
+        for j, k in enumerate(ids):
+            pb = qstore.alloc_put_buffer(13, 300)
+            pb.value[:] = _bytes_of(300, j)
+            bufs.append(pb)
+        qstore.multi_put_buffers([_mkey(k) for k in ids], bufs)
+        for k in range(6):
+            last = max(j for j, x in enumerate(ids) if x == k)
+            np.testing.assert_array_equal(_stored(qstore, k),
+                                          _bytes_of(300, last))
+
+    def test_a_buffer_passed_twice_is_refused_before_anything_is_stored(
+            self, qstore):
+        a, b = _put_bufs(qstore, [0, 1])
+        with pytest.raises(ValueError, match="more than once"):
+            qstore.multi_put_buffers([_mkey(0), _mkey(1), _mkey(2)], [a, b, a])
+        assert all(_stored(qstore, i) is None for i in range(3))
+
+    def test_bad_arguments_are_refused_before_anything_is_stored(
+            self, qstore, tmp_path):
+        a, b = _put_bufs(qstore, [0, 1])
+        gb = qstore.alloc_get_buffer(13, 300)
+        with pytest.raises(ValueError):
+            qstore.multi_put_buffers([_mkey(0), _mkey(1)], [a])
+        with pytest.raises(ValueError):
+            qstore.multi_put_buffers([_mkey(0), _mkey(1)], [a, gb])
+        with pytest.raises(ValueError):
+            qstore.multi_put_buffers([_mkey(0), _mkey(1).astype(np.int32)],
+                                     [a, b])
+        with pytest.raises(ValueError):
+            qstore.multi_put_buffers([_mkey(0), None], [a, b])
+        with pytest.raises(ValueError, match="allocated for 13"):
+            qstore.multi_put_buffers([_mkey(0), _key("short")], [a, b])
+        foreign = pyudepot.uDepot(file_name=str(tmp_path / "other"),
+                                  size=STORE_SIZE, force_destroy=True)
+        try:
+            with pytest.raises(ValueError):
+                qstore.multi_put_buffers(
+                    [_mkey(0), _mkey(1)],
+                    [a, _put_bufs(foreign, [1])[0]])
+        finally:
+            foreign.close()
+        assert _stored(qstore, 0) is None and _stored(qstore, 1) is None
+
+    def test_copies_no_value(self, qstore):
+        bufs = _put_bufs(qstore, range(30))
+        before = pyudepot.thread_value_copies()
+        qstore.multi_put_buffers([_mkey(i) for i in range(30)], bufs)
+        assert pyudepot.thread_value_copies() == before
+
+    def test_the_buffers_can_be_filled_and_put_again(self, qstore):
+        bufs = _put_bufs(qstore, range(4))
+        keys = [_mkey(i) for i in range(4)]
+        qstore.multi_put_buffers(keys, bufs)
+        for i, pb in enumerate(bufs):
+            pb.value[:] = _bytes_of(300, 7000 + i)
+        qstore.multi_put_buffers(keys, bufs)
+        for i in range(4):
+            np.testing.assert_array_equal(_stored(qstore, i),
+                                          _bytes_of(300, 7000 + i))
+
+    def test_a_failure_raises_with_every_failed_index_and_the_rest_stored(
+            self, tmp_path):
+        # A store too small for the batch: the puts that find no space fail
+        # (-ENOSPC), the others are stored, and every failure is listed.
+        kv = pyudepot.uDepot(file_name=str(tmp_path / "small"),
+                             size=STORE_SIZE, force_destroy=True,
+                             queue_depth=W)
+        try:
+            n = 2 * STORE_SIZE // 4096
+            bufs = []
+            for i in range(n):
+                pb = kv.alloc_put_buffer(13, 300)
+                pb.value[:] = _bytes_of(300, i)
+                bufs.append(pb)
+            with pytest.raises(IOError) as e:
+                kv.multi_put_buffers([_mkey(i) for i in range(n)], bufs)
+            assert isinstance(e.value, pyudepot.MultiPutError)
+            failed = e.value.failed
+            assert failed
+            assert all(rc == -errno.ENOSPC for _, rc in failed), failed
+            assert e.value.errno == errno.ENOSPC
+            assert "key {}".format(failed[0][0]) in str(e.value)
+            assert "{} of {}".format(len(failed), n) in str(e.value)
+            bad = {i for i, _ in failed}
+            assert len(bad) < n
+            for i in range(n):
+                if i not in bad:
+                    gb = kv.alloc_get_buffer(13, 300)
+                    assert kv.get_into(_mkey(i), gb), i
+                    np.testing.assert_array_equal(gb.value, _bytes_of(300, i))
+        finally:
+            kv.close()
+
+    def test_the_window_follows_the_thread_not_the_store(self, tmp_path):
+        # As the multi_get_into test: a shallow store opened on this thread
+        # shrinks the context the deep store's puts run in.
+        n = max(4096, 16 * (os.cpu_count() or 1) + 1024)
+        deep = pyudepot.uDepot(file_name=str(tmp_path / "deep"),
+                               size=64 * 1024 * 1024, force_destroy=True)
+        shallow = None
+        try:
+            data = _bytes_of(100, 4)
+            bufs = []
+            for _ in range(n):
+                pb = deep.alloc_put_buffer(13, 100)
+                pb.value[:] = data
+                bufs.append(pb)
+            shallow = pyudepot.uDepot(file_name=str(tmp_path / "shallow"),
+                                      size=STORE_SIZE, force_destroy=True,
+                                      queue_depth=W)
+            assert deep.multi_put_buffers([_mkey(i) for i in range(n)],
+                                          bufs) is None
         finally:
             if shallow:
                 shallow.close()

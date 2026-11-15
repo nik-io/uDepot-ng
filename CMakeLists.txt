@@ -206,6 +206,7 @@ if(UDEPOT_BUILD_TESTS)
     set_tests_properties(aio_queue_depth_test PROPERTIES TIMEOUT 180
                          RUN_SERIAL TRUE)
     udepot_add_test(multi_get_test test/multi_get_test.cc)
+    udepot_add_test(multi_put_test test/multi_put_test.cc)
     udepot_add_test(net_test test/io/net_test.cc)
 
     if(UDEPOT_BUILD_NET)

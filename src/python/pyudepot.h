@@ -124,6 +124,23 @@ DLLOUT int   uDepotMultiGetBuf(void* kv, uint32_t n,
                                const uint32_t key_sizes[],
                                void* const get_bufs[], int results[]);
 
+// uDepotPutBuf for n keys on the calling thread, in one call: put_bufs[i]
+// is written under keys[i] (of key_sizes[i] bytes), as uDepotPutBuf, and
+// results[i] set to its rc (0, or -errno: -EINVAL for a buffer allocated for
+// another key size). The puts run as coroutines on this thread, as
+// uDepotMultiGetBuf's gets do (same window: no threads, no locks, a new put
+// starting as each completes). A failed put does not stop the others. Puts
+// of equal keys run one after another, in list order, so the last holds the
+// key afterwards, as serial puts would; others overlap. Returns 0, or
+// -ENOMEM (nothing started) if it cannot allocate; on 0 every results[i] has
+// been set. The put_bufs must be distinct, non-null PutBuffers (the Python wrapper
+// refuses a repeat), and everything passed stays alive and untouched until
+// it returns.
+DLLOUT int   uDepotMultiPutBuf(void* kv, uint32_t n,
+                               const uint8_t* const keys[],
+                               const uint32_t key_sizes[],
+                               void* const put_bufs[], int results[]);
+
 // uDepot::thread_value_copies() of the calling thread: the values its
 // operations copied between caller memory and uDepot's buffers.
 DLLOUT uint64_t uDepotThreadValueCopies(void);
