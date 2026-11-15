@@ -289,7 +289,7 @@ public:
                       uint64_t if_version = kAnyVersion);
 
     // Copies the value out of the record it reads; see the zero-copy
-    // overload.
+    // overload, whose errors it shares.
     CoroTask<int> get(std::span<const uint8_t> key,
                       uint8_t* val_out, size_t val_buf_size,
                       size_t* val_size_out,
@@ -322,6 +322,11 @@ public:
     // or an earlier get), so a caller can reuse its buffers; otherwise
     // into a new one, which replaces it. On error value() is empty and the
     // buffer is kept. The buffer must stay alive until the get completes.
+    //
+    // A build with UDEPOT_DATA_DEBUG_VERIFY (CMake option, off by default)
+    // also checks the record's CRC, and fails a get (either overload) whose
+    // record does not match with -EBADMSG, returning nothing of it; other
+    // builds do not check it on get.
     CoroTask<int> get(std::span<const uint8_t> key, GetBuffer* val_out,
                       uint64_t* version_out = nullptr);
 

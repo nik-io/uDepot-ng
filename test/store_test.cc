@@ -235,10 +235,10 @@ TEST_F(StoreTest, DataSurvivesDirectoryGrow) {
 }
 
 // --- CRC integrity ---
-// CRC verification on get is debug-only (matching uDepot's
-// _UDEPOT_DATA_DEBUG_VERIFY), so this test only runs in debug builds.
+// A get checks the record's CRC only in a data verification build
+// (UDEPOT_DATA_DEBUG_VERIFY, off by default); legacy uDepot's get never
+// does. Not NDEBUG: a Debug build without it does not check.
 
-#ifndef NDEBUG
 TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
     ASSERT_EQ(store_.put("crc_key", "crc_val").run_sync(), 0);
 
@@ -274,9 +274,13 @@ TEST_F(StoreTest, CorruptedDataDetectedOnGet) {
     uint8_t val[64];
     size_t val_size = 0;
     int rc = store_.get("crc_key", val, sizeof(val), &val_size).run_sync();
-    EXPECT_NE(rc, 0);  // Should fail due to CRC mismatch.
-}
+#ifdef UDEPOT_DATA_DEBUG_VERIFY
+    EXPECT_EQ(rc, -EBADMSG);
+#else
+    ASSERT_EQ(rc, 0);  // not checked
+    EXPECT_EQ(std::string(reinterpret_cast<char*>(val), val_size), "crc_val");
 #endif
+}
 
 // --- Tag collision tests ---
 // Two keys that hash to the same bucket with the same 8-bit tag but are
@@ -528,6 +532,67 @@ TEST_F(StoreTest, CrcTableMatchesBitwiseForKnownPatterns) {
 
     EXPECT_EQ(suffix.crc16, ref_crc)
         << "On-disk CRC is uDepot's checksum16 over the header and seed";
+}
+
+// A record whose stored CRC does not match its header: a data verification
+// build (UDEPOT_DATA_DEBUG_VERIFY) fails the get with -EBADMSG; any other
+// build, Debug included, does not check it on get and returns the value, as
+// legacy uDepot's get does.
+TEST_F(StoreTest, ABadRecordCrcFailsAGetOnlyInADataVerifyBuild) {
+    const std::string key = "crc_bad_key";
+    const std::string val(300, 'v');
+    ASSERT_EQ(store_.put(key, val).run_sync(), 0);
+
+    auto key_span = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(key.data()), key.size());
+    uint32_t rcu_idx = store_.rcu().read_lock();
+    udepot::HashEntry entry =
+        store_.directory().lookup(store_.hash_key(key_span));
+    store_.rcu().read_unlock(rcu_idx);
+    ASSERT_FALSE(entry.empty());
+
+    // Flip the stored CRC in place: read the record's grains, change the
+    // suffix, write them back.
+    const off_t offset =
+        static_cast<off_t>(entry.pba()) * store_.grain_size();
+    const size_t suffix_at = sizeof(udepot::KvHeader) + key.size() + val.size();
+    const size_t bytes =
+        (suffix_at + sizeof(udepot::KvSuffix) + config_.grain_size - 1) /
+        config_.grain_size * config_.grain_size;
+    std::vector<uint8_t> rec(bytes);
+    ASSERT_EQ(store_.io().pread(rec.data(), bytes, offset).run_sync(),
+              static_cast<ssize_t>(bytes));
+    rec[suffix_at] ^= 0x5a;
+    ASSERT_EQ(store_.io().pwrite(rec.data(), bytes, offset).run_sync(),
+              static_cast<ssize_t>(bytes));
+
+    std::vector<uint8_t> out(val.size(), 0xee);
+    size_t n = 12345;
+    uint64_t version = 67890;
+    const int rc =
+        store_.get(key_span, out.data(), out.size(), &n, &version).run_sync();
+#ifdef UDEPOT_DATA_DEBUG_VERIFY
+    EXPECT_EQ(rc, -EBADMSG);
+    // Nothing of the bad record is returned: the check precedes every output.
+    EXPECT_EQ(n, 12345u);
+    EXPECT_EQ(version, 67890u);
+    EXPECT_EQ(out, std::vector<uint8_t>(val.size(), 0xee));
+#else
+    ASSERT_EQ(rc, 0);
+    EXPECT_EQ(std::string(out.begin(), out.end()), val);
+#endif
+    // The zero-copy get takes the same path.
+    udepot::GetBuffer gb = store_.alloc_get_buffer(key.size(), val.size());
+    ASSERT_TRUE(gb.valid());
+#ifdef UDEPOT_DATA_DEBUG_VERIFY
+    EXPECT_EQ(store_.get(key_span, &gb).run_sync(), -EBADMSG);
+    EXPECT_TRUE(gb.value().empty());
+#else
+    ASSERT_EQ(store_.get(key_span, &gb).run_sync(), 0);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(gb.value().data()),
+                          gb.value().size()),
+              val);
+#endif
 }
 
 TEST_F(StoreTest, PutCreateFailsIfKeyExists) {
